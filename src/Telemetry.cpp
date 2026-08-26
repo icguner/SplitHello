@@ -9,6 +9,7 @@
 #include <chrono>
 #include <filesystem>
 #include <iomanip>
+#include <iterator>
 #include <sstream>
 
 namespace telemetry {
@@ -181,15 +182,96 @@ void pruneDatabase(sqlite3* database, unsigned retentionDays, size_t maxEvents) 
     }
 }
 
-std::string emptyDashboard(const std::string& error, unsigned windowDays) {
+DashboardData emptyDashboard(const std::string& error, unsigned windowDays) {
+    DashboardData data;
+    data.ready = false;
+    data.error = error;
+    data.generatedAt = unixSeconds();
+    data.windowDays = windowDays;
+    return data;
+}
+
+void appendKeyCounts(std::ostringstream& output, const char* key,
+                     const std::vector<DashboardData::KeyCount>& items) {
+    output << ",\"" << key << "\":[";
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i) output << ',';
+        output << "{\"key\":\"" << json::escape(items[i].key)
+               << "\",\"count\":" << items[i].count << '}';
+    }
+    output << ']';
+}
+
+std::string serializeDashboard(const DashboardData& data) {
     std::ostringstream output;
-    output << "{\"ready\":false,\"generatedAt\":" << unixSeconds()
-           << ",\"windowDays\":" << windowDays
-           << ",\"error\":\"" << json::escape(error) << "\""
-           << ",\"summary\":{\"total\":0,\"bypassed\":0,\"normal\":0,"
-              "\"unresolved\":0,\"averageLatencyMs\":0,\"cacheHits\":0}"
-           << ",\"diagnoses\":[],\"profiles\":[],\"signals\":[],"
-              "\"daily\":[],\"recent\":[]}";
+    output << "{\"ready\":" << (data.ready ? "true" : "false")
+           << ",\"generatedAt\":" << data.generatedAt
+           << ",\"windowDays\":" << data.windowDays;
+    if (!data.ready) {
+        output << ",\"error\":\"" << json::escape(data.error) << '"';
+    }
+    output << ",\"summary\":{\"total\":" << data.total
+           << ",\"bypassed\":" << data.bypassed
+           << ",\"normal\":" << data.normal
+           << ",\"unresolved\":" << data.unresolved
+           << ",\"averageLatencyMs\":" << std::fixed << std::setprecision(1)
+           << data.averageLatencyMs << ",\"cacheHits\":" << data.cacheHits << '}';
+
+    appendKeyCounts(output, "diagnoses", data.diagnoses);
+    appendKeyCounts(output, "signals", data.signals);
+
+    output << ",\"profiles\":[";
+    for (size_t i = 0; i < data.profiles.size(); ++i) {
+        const DashboardData::Profile& profile = data.profiles[i];
+        if (i) output << ',';
+        output << "{\"name\":\"" << json::escape(profile.name)
+               << "\",\"count\":" << profile.count
+               << ",\"averageLatencyMs\":" << std::fixed << std::setprecision(1)
+               << profile.averageLatencyMs
+               << ",\"averageAttempts\":" << profile.averageAttempts << '}';
+    }
+    output << "]";
+
+    output << ",\"daily\":[";
+    for (size_t i = 0; i < data.daily.size(); ++i) {
+        const DashboardData::Day& day = data.daily[i];
+        if (i) output << ',';
+        output << "{\"day\":\"" << json::escape(day.day)
+               << "\",\"total\":" << day.total
+               << ",\"bypassed\":" << day.bypassed
+               << ",\"unresolved\":" << day.unresolved << '}';
+    }
+    output << "]";
+
+    output << ",\"recent\":[";
+    for (size_t i = 0; i < data.recent.size(); ++i) {
+        const DashboardData::Event& event = data.recent[i];
+        if (i) output << ',';
+        output << "{\"id\":" << event.id
+               << ",\"timestamp\":" << event.timestamp
+               << ",\"network\":\"" << json::escape(event.network)
+               << "\",\"host\":\"" << json::escape(event.host)
+               << "\",\"baseline\":\"" << json::escape(event.baseline)
+               << "\",\"diagnosis\":\"" << json::escape(event.diagnosis)
+               << "\",\"confidence\":" << event.confidence
+               << ",\"winner\":\"" << json::escape(event.winner)
+               << "\",\"remembered\":\"" << json::escape(event.remembered)
+               << "\",\"success\":" << (event.success ? "true" : "false")
+               << ",\"forced\":" << (event.forced ? "true" : "false")
+               << ",\"attemptCount\":" << event.attemptCount
+               << ",\"totalElapsedMs\":" << event.totalElapsedMs
+               << ",\"cacheHit\":" << (event.cacheHit ? "true" : "false")
+               << ",\"attempts\":[";
+        for (size_t j = 0; j < event.attempts.size(); ++j) {
+            const DashboardData::Attempt& attempt = event.attempts[j];
+            if (j) output << ',';
+            output << "{\"profile\":\"" << json::escape(attempt.profile)
+                   << "\",\"signal\":\"" << json::escape(attempt.signal)
+                   << "\",\"elapsedMs\":" << attempt.elapsedMs << '}';
+        }
+        output << "]}";
+    }
+    output << "]}";
     return output.str();
 }
 
@@ -319,7 +401,8 @@ void Store::writerLoop() {
     sqlite3_close(database);
 }
 
-std::string Store::dashboardJson(const std::string& path, unsigned windowDays) {
+DashboardData Store::dashboardSnapshot(const std::string& path,
+                                       unsigned windowDays) {
     windowDays = std::clamp(windowDays, 1U, 90U);
     if (path.empty() || !std::filesystem::exists(path)) {
         return emptyDashboard("Henüz telemetri kaydı oluşmadı.", windowDays);
@@ -340,9 +423,10 @@ std::string Store::dashboardJson(const std::string& path, unsigned windowDays) {
     const int64_t cutoff = now - static_cast<int64_t>(windowDays) * 86400;
     execute(database, "BEGIN;");
 
-    std::ostringstream output;
-    output << "{\"ready\":true,\"generatedAt\":" << now
-           << ",\"windowDays\":" << windowDays;
+    DashboardData data;
+    data.ready = true;
+    data.generatedAt = now;
+    data.windowDays = windowDays;
 
     Statement summary(database,
         "SELECT COUNT(*),"
@@ -352,151 +436,220 @@ std::string Store::dashboardJson(const std::string& path, unsigned windowDays) {
         " COALESCE(AVG(total_elapsed_ms),0),"
         " COALESCE(SUM(cache_hit),0)"
         " FROM probe_events WHERE occurred_at>=?;");
-    int64_t total = 0, bypassed = 0, normal = 0, unresolved = 0, cacheHits = 0;
-    double averageLatency = 0;
     if (summary) {
         bindCutoff(summary, cutoff);
         if (sqlite3_step(summary.get()) == SQLITE_ROW) {
-            total = sqlite3_column_int64(summary.get(), 0);
-            bypassed = sqlite3_column_int64(summary.get(), 1);
-            normal = sqlite3_column_int64(summary.get(), 2);
-            unresolved = sqlite3_column_int64(summary.get(), 3);
-            averageLatency = sqlite3_column_double(summary.get(), 4);
-            cacheHits = sqlite3_column_int64(summary.get(), 5);
+            data.total = sqlite3_column_int64(summary.get(), 0);
+            data.bypassed = sqlite3_column_int64(summary.get(), 1);
+            data.normal = sqlite3_column_int64(summary.get(), 2);
+            data.unresolved = sqlite3_column_int64(summary.get(), 3);
+            data.averageLatencyMs = sqlite3_column_double(summary.get(), 4);
+            data.cacheHits = sqlite3_column_int64(summary.get(), 5);
         }
     }
-    output << ",\"summary\":{\"total\":" << total
-           << ",\"bypassed\":" << bypassed
-           << ",\"normal\":" << normal
-           << ",\"unresolved\":" << unresolved
-           << ",\"averageLatencyMs\":" << std::fixed << std::setprecision(1)
-           << averageLatency << ",\"cacheHits\":" << cacheHits << "}";
 
-    const auto appendBreakdown = [&](const char* key, const char* sql) {
-        output << ",\"" << key << "\":[";
+    // Previous window of equal length, so the panel can show a real trend
+    // instead of an unanchored number.
+    const int64_t previousCutoff = cutoff - static_cast<int64_t>(windowDays) * 86400;
+    Statement previous(database,
+        "SELECT COUNT(*),"
+        " COALESCE(SUM(success=1 AND winning_profile<>'none'),0),"
+        " COALESCE(SUM(diagnosis_kind='no-interference'),0),"
+        " COALESCE(SUM(success=0),0),"
+        " COALESCE(AVG(total_elapsed_ms),0)"
+        " FROM probe_events WHERE occurred_at>=? AND occurred_at<?;");
+    if (previous) {
+        sqlite3_bind_int64(previous.get(), 1, previousCutoff);
+        sqlite3_bind_int64(previous.get(), 2, cutoff);
+        if (sqlite3_step(previous.get()) == SQLITE_ROW) {
+            data.previous.total = sqlite3_column_int64(previous.get(), 0);
+            data.previous.bypassed = sqlite3_column_int64(previous.get(), 1);
+            data.previous.normal = sqlite3_column_int64(previous.get(), 2);
+            data.previous.unresolved = sqlite3_column_int64(previous.get(), 3);
+            data.previous.averageLatencyMs = sqlite3_column_double(previous.get(), 4);
+        }
+    }
+
+    // Order statistics. OFFSET indexes the sorted latency column directly, so
+    // these are exact percentiles rather than histogram estimates.
+    if (data.total > 0) {
+        Statement quantile(database,
+            "SELECT total_elapsed_ms FROM probe_events WHERE occurred_at>=?"
+            " ORDER BY total_elapsed_ms LIMIT 1 OFFSET ?;");
+        const auto at = [&](double fraction) -> int64_t {
+            if (!quantile) return 0;
+            quantile.reset();
+            const int64_t offset = std::clamp<int64_t>(
+                static_cast<int64_t>(fraction * static_cast<double>(data.total - 1)),
+                0, data.total - 1);
+            sqlite3_bind_int64(quantile.get(), 1, cutoff);
+            sqlite3_bind_int64(quantile.get(), 2, offset);
+            return sqlite3_step(quantile.get()) == SQLITE_ROW
+                       ? sqlite3_column_int64(quantile.get(), 0)
+                       : 0;
+        };
+        data.latency.p50 = at(0.50);
+        data.latency.p90 = at(0.90);
+        data.latency.p99 = at(0.99);
+        data.latency.worst = at(1.0);
+    }
+
+    // Latency histogram over fixed doubling buckets; the last one is open-ended.
+    {
+        static constexpr int64_t kEdges[] = {50, 100, 200, 400, 800, 1600, 3200};
+        constexpr int kBucketCount =
+            static_cast<int>(std::size(kEdges)) + 1;
+        std::vector<int64_t> counts(kBucketCount, 0);
+        Statement histogram(database,
+            "SELECT CASE"
+            "  WHEN total_elapsed_ms<50 THEN 0"
+            "  WHEN total_elapsed_ms<100 THEN 1"
+            "  WHEN total_elapsed_ms<200 THEN 2"
+            "  WHEN total_elapsed_ms<400 THEN 3"
+            "  WHEN total_elapsed_ms<800 THEN 4"
+            "  WHEN total_elapsed_ms<1600 THEN 5"
+            "  WHEN total_elapsed_ms<3200 THEN 6"
+            "  ELSE 7 END AS bucket, COUNT(*)"
+            " FROM probe_events WHERE occurred_at>=? GROUP BY bucket;");
+        if (histogram) {
+            bindCutoff(histogram, cutoff);
+            while (sqlite3_step(histogram.get()) == SQLITE_ROW) {
+                const int index = sqlite3_column_int(histogram.get(), 0);
+                if (index >= 0 && index < kBucketCount) {
+                    counts[static_cast<size_t>(index)] =
+                        sqlite3_column_int64(histogram.get(), 1);
+                }
+            }
+        }
+        for (int i = 0; i < kBucketCount; ++i) {
+            data.latencyHistogram.push_back(
+                {i < static_cast<int>(std::size(kEdges)) ? kEdges[i] : 0,
+                 counts[static_cast<size_t>(i)]});
+        }
+    }
+
+    // Hosts ranked by how often they actually needed intervention.
+    Statement hosts(database,
+        "SELECT host,COUNT(*),"
+        " COALESCE(SUM(success=1 AND winning_profile<>'none'),0),"
+        " COALESCE(SUM(success=0),0),"
+        " COALESCE(AVG(total_elapsed_ms),0)"
+        " FROM probe_events WHERE occurred_at>=? GROUP BY host"
+        " ORDER BY (COALESCE(SUM(success=1 AND winning_profile<>'none'),0)"
+        "           +COALESCE(SUM(success=0),0)) DESC, COUNT(*) DESC LIMIT 8;");
+    if (hosts) {
+        bindCutoff(hosts, cutoff);
+        while (sqlite3_step(hosts.get()) == SQLITE_ROW) {
+            data.topHosts.push_back({columnText(hosts.get(), 0),
+                                     sqlite3_column_int64(hosts.get(), 1),
+                                     sqlite3_column_int64(hosts.get(), 2),
+                                     sqlite3_column_int64(hosts.get(), 3),
+                                     sqlite3_column_double(hosts.get(), 4)});
+        }
+    }
+
+    const auto collectBreakdown = [&](const char* sql) {
+        std::vector<DashboardData::KeyCount> items;
         Statement statement(database, sql);
-        bool first = true;
         if (statement) {
             bindCutoff(statement, cutoff);
             while (sqlite3_step(statement.get()) == SQLITE_ROW) {
-                if (!first) output << ',';
-                first = false;
-                output << "{\"key\":\""
-                       << json::escape(columnText(statement.get(), 0))
-                       << "\",\"count\":" << sqlite3_column_int64(statement.get(), 1)
-                       << "}";
+                items.push_back({columnText(statement.get(), 0),
+                                 sqlite3_column_int64(statement.get(), 1)});
             }
         }
-        output << ']';
+        return items;
     };
 
-    appendBreakdown("diagnoses",
+    data.diagnoses = collectBreakdown(
         "SELECT diagnosis_kind,COUNT(*) FROM probe_events"
         " WHERE occurred_at>=? GROUP BY diagnosis_kind ORDER BY COUNT(*) DESC;");
-    appendBreakdown("signals",
+    data.signals = collectBreakdown(
         "SELECT COALESCE(baseline_signal,'not-tested'),COUNT(*) FROM probe_events"
         " WHERE occurred_at>=? GROUP BY COALESCE(baseline_signal,'not-tested')"
         " ORDER BY COUNT(*) DESC;");
 
-    output << ",\"profiles\":[";
     Statement profiles(database,
         "SELECT winning_profile,COUNT(*),COALESCE(AVG(total_elapsed_ms),0),"
         " COALESCE(AVG(attempt_count),0) FROM probe_events"
         " WHERE occurred_at>=? AND success=1 AND winning_profile IS NOT NULL"
         " GROUP BY winning_profile ORDER BY COUNT(*) DESC LIMIT 16;");
-    bool first = true;
     if (profiles) {
         bindCutoff(profiles, cutoff);
         while (sqlite3_step(profiles.get()) == SQLITE_ROW) {
-            if (!first) output << ',';
-            first = false;
-            output << "{\"name\":\"" << json::escape(columnText(profiles.get(), 0))
-                   << "\",\"count\":" << sqlite3_column_int64(profiles.get(), 1)
-                   << ",\"averageLatencyMs\":" << std::fixed << std::setprecision(1)
-                   << sqlite3_column_double(profiles.get(), 2)
-                   << ",\"averageAttempts\":" << sqlite3_column_double(profiles.get(), 3)
-                   << "}";
+            data.profiles.push_back({
+                columnText(profiles.get(), 0),
+                sqlite3_column_int64(profiles.get(), 1),
+                sqlite3_column_double(profiles.get(), 2),
+                sqlite3_column_double(profiles.get(), 3)});
         }
     }
-    output << ']';
 
-    output << ",\"daily\":[";
     Statement daily(database,
         "SELECT strftime('%Y-%m-%d',occurred_at,'unixepoch','localtime'),"
         " COUNT(*),COALESCE(SUM(success=1 AND winning_profile<>'none'),0),"
         " COALESCE(SUM(success=0),0) FROM probe_events"
         " WHERE occurred_at>=? GROUP BY 1 ORDER BY 1;");
-    first = true;
     if (daily) {
         bindCutoff(daily, cutoff);
         while (sqlite3_step(daily.get()) == SQLITE_ROW) {
-            if (!first) output << ',';
-            first = false;
-            output << "{\"day\":\"" << json::escape(columnText(daily.get(), 0))
-                   << "\",\"total\":" << sqlite3_column_int64(daily.get(), 1)
-                   << ",\"bypassed\":" << sqlite3_column_int64(daily.get(), 2)
-                   << ",\"unresolved\":" << sqlite3_column_int64(daily.get(), 3)
-                   << "}";
+            data.daily.push_back({
+                columnText(daily.get(), 0),
+                sqlite3_column_int64(daily.get(), 1),
+                sqlite3_column_int64(daily.get(), 2),
+                sqlite3_column_int64(daily.get(), 3)});
         }
     }
-    output << ']';
 
-    output << ",\"recent\":[";
     Statement recent(database,
         "SELECT id,occurred_at,network_id,host,COALESCE(baseline_signal,''),"
         " diagnosis_kind,confidence,COALESCE(winning_profile,''),"
         " COALESCE(remembered_profile,''),success,forced,attempt_count,"
         " total_elapsed_ms,cache_hit FROM probe_events"
-        " WHERE occurred_at>=? ORDER BY id DESC LIMIT 60;");
+        " WHERE occurred_at>=? ORDER BY id DESC LIMIT 250;");
     Statement attempts(database,
         "SELECT profile,signal,elapsed_ms FROM probe_attempts"
         " WHERE event_id=? ORDER BY ordinal;");
-    first = true;
     if (recent) {
         bindCutoff(recent, cutoff);
         while (sqlite3_step(recent.get()) == SQLITE_ROW) {
-            if (!first) output << ',';
-            first = false;
-            const sqlite3_int64 eventId = sqlite3_column_int64(recent.get(), 0);
-            output << "{\"id\":" << eventId
-                   << ",\"timestamp\":" << sqlite3_column_int64(recent.get(), 1)
-                   << ",\"network\":\"" << json::escape(columnText(recent.get(), 2))
-                   << "\",\"host\":\"" << json::escape(columnText(recent.get(), 3))
-                   << "\",\"baseline\":\"" << json::escape(columnText(recent.get(), 4))
-                   << "\",\"diagnosis\":\"" << json::escape(columnText(recent.get(), 5))
-                   << "\",\"confidence\":" << sqlite3_column_int(recent.get(), 6)
-                   << ",\"winner\":\"" << json::escape(columnText(recent.get(), 7))
-                   << "\",\"remembered\":\"" << json::escape(columnText(recent.get(), 8))
-                   << "\",\"success\":" << (sqlite3_column_int(recent.get(), 9) ? "true" : "false")
-                   << ",\"forced\":" << (sqlite3_column_int(recent.get(), 10) ? "true" : "false")
-                   << ",\"attemptCount\":" << sqlite3_column_int(recent.get(), 11)
-                   << ",\"totalElapsedMs\":" << sqlite3_column_int64(recent.get(), 12)
-                   << ",\"cacheHit\":" << (sqlite3_column_int(recent.get(), 13) ? "true" : "false")
-                   << ",\"attempts\":[";
+            DashboardData::Event event;
+            event.id = sqlite3_column_int64(recent.get(), 0);
+            event.timestamp = sqlite3_column_int64(recent.get(), 1);
+            event.network = columnText(recent.get(), 2);
+            event.host = columnText(recent.get(), 3);
+            event.baseline = columnText(recent.get(), 4);
+            event.diagnosis = columnText(recent.get(), 5);
+            event.confidence = sqlite3_column_int(recent.get(), 6);
+            event.winner = columnText(recent.get(), 7);
+            event.remembered = columnText(recent.get(), 8);
+            event.success = sqlite3_column_int(recent.get(), 9) != 0;
+            event.forced = sqlite3_column_int(recent.get(), 10) != 0;
+            event.attemptCount = sqlite3_column_int(recent.get(), 11);
+            event.totalElapsedMs = sqlite3_column_int64(recent.get(), 12);
+            event.cacheHit = sqlite3_column_int(recent.get(), 13) != 0;
 
-            bool firstAttempt = true;
             if (attempts) {
                 attempts.reset();
-                sqlite3_bind_int64(attempts.get(), 1, eventId);
+                sqlite3_bind_int64(attempts.get(), 1, event.id);
                 while (sqlite3_step(attempts.get()) == SQLITE_ROW) {
-                    if (!firstAttempt) output << ',';
-                    firstAttempt = false;
-                    output << "{\"profile\":\""
-                           << json::escape(columnText(attempts.get(), 0))
-                           << "\",\"signal\":\""
-                           << json::escape(columnText(attempts.get(), 1))
-                           << "\",\"elapsedMs\":"
-                           << sqlite3_column_int64(attempts.get(), 2) << "}";
+                    event.attempts.push_back({
+                        columnText(attempts.get(), 0),
+                        columnText(attempts.get(), 1),
+                        sqlite3_column_int64(attempts.get(), 2)});
                 }
             }
-            output << "]}";
+            data.recent.push_back(std::move(event));
         }
     }
-    output << "]}";
 
     execute(database, "COMMIT;");
     sqlite3_close(database);
-    return output.str();
+    return data;
+}
+
+std::string Store::dashboardJson(const std::string& path, unsigned windowDays) {
+    return serializeDashboard(dashboardSnapshot(path, windowDays));
 }
 
 } // namespace telemetry

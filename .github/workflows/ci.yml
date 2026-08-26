@@ -41,8 +41,6 @@ jobs:
             build/Release/WinDivert.dll
             build/Release/WinDivert64.sys
             build/Release/WinDivert-LICENSE.txt
-            build/Release/WebView2-LICENSE.txt
-            build/Release/WebView2-NOTICE.txt
 
   parser-fuzz-smoke:
     name: Parser fuzz smoke (Clang ASan)
