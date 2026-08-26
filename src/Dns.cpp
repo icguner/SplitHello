@@ -66,7 +66,7 @@ Resolver::Resolver(const std::string& workerUrl, std::string sharedSecret,
         return;
     }
 
-    // Bootstrap before WinDivert starts. Later WinHTTP requests still ask the
+    // Bootstrap before WFP starts. Later WinHTTP requests still ask the
     // system resolver for this hostname; the transparent DNS proxy answers
     // those requests from this cache, preventing a recursive DoH lookup.
     addrinfo hints{};

@@ -2,12 +2,12 @@
 
 #include "DirectRelay.hpp"
 #include "TcpConnect.hpp"
+#include "WfpInterceptor.hpp"
 
 #include <spdlog/spdlog.h>
 
 #include <charconv>
 #include <format>
-#include <optional>
 #include <vector>
 
 // SOCKS5 constants (RFC 1928)
@@ -39,40 +39,11 @@ bool parsePort(std::string_view text, uint16_t& out) {
     return true;
 }
 
-bool peerEndpoint(SOCKET socket, std::string& address, uint16_t& port) {
-    sockaddr_storage peer{};
-    int peerLength = sizeof(peer);
-    if (getpeername(socket, reinterpret_cast<sockaddr*>(&peer), &peerLength) == SOCKET_ERROR) {
-        return false;
-    }
-
-    char text[INET6_ADDRSTRLEN] = {};
-    if (peer.ss_family == AF_INET) {
-        const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(&peer);
-        if (!inet_ntop(AF_INET, &ipv4->sin_addr, text, sizeof(text))) return false;
-        port = ntohs(ipv4->sin_port);
-    } else if (peer.ss_family == AF_INET6) {
-        const auto* ipv6 = reinterpret_cast<const sockaddr_in6*>(&peer);
-        if (IN6_IS_ADDR_V4MAPPED(&ipv6->sin6_addr)) {
-            const uint8_t* bytes = ipv6->sin6_addr.u.Byte;
-            if (!inet_ntop(AF_INET, bytes + 12, text, sizeof(text))) return false;
-        } else if (!inet_ntop(AF_INET6, &ipv6->sin6_addr, text, sizeof(text))) {
-            return false;
-        }
-        port = ntohs(ipv6->sin6_port);
-    } else {
-        return false;
-    }
-
-    address = text;
-    return port != 0;
-}
-
 } // namespace
 
 SocksProxy::SocksProxy(RelayContext context, uint16_t port,
-                       transparent::FlowRegistry* transparentFlows)
-    : context_(std::move(context)), port_(port), transparentFlows_(transparentFlows)
+                       bool wfpRedirects)
+    : context_(std::move(context)), port_(port), wfpRedirects_(wfpRedirects)
 {}
 
 SocksProxy::~SocksProxy() {
@@ -105,7 +76,7 @@ std::string SocksProxy::recvLine(SOCKET sock) {
 }
 
 bool SocksProxy::run() {
-    const int family = transparentFlows_ ? AF_INET6 : AF_INET;
+    const int family = wfpRedirects_ ? AF_INET6 : AF_INET;
     listenSock_ = socket(family, SOCK_STREAM, IPPROTO_TCP);
     if (listenSock_ == INVALID_SOCKET) {
         spdlog::error("Listen socket olusturulamadi: {}", WSAGetLastError());
@@ -117,7 +88,7 @@ bool SocksProxy::run() {
                reinterpret_cast<char*>(&exclusive), sizeof(exclusive));
 
     int bindResult = SOCKET_ERROR;
-    if (transparentFlows_) {
+    if (wfpRedirects_) {
         int ipv6Only = 0;
         setsockopt(listenSock_, IPPROTO_IPV6, IPV6_V6ONLY,
                    reinterpret_cast<char*>(&ipv6Only), sizeof(ipv6Only));
@@ -150,7 +121,7 @@ bool SocksProxy::run() {
     }
 
     running_ = true;
-    if (transparentFlows_) {
+    if (wfpRedirects_) {
         spdlog::info("Transparent relay dinliyor: [::]:{} (IPv4 + IPv6)", port_);
     } else {
         spdlog::info("Manuel proxy dinliyor: 127.0.0.1:{} (SOCKS5 + HTTP CONNECT)", port_);
@@ -183,25 +154,20 @@ void SocksProxy::stop() {
 }
 
 void SocksProxy::handleClient(SOCKET clientSock) {
-    if (transparentFlows_) {
-        std::string peerAddress;
-        uint16_t peerPort = 0;
-        if (peerEndpoint(clientSock, peerAddress, peerPort)) {
-            const std::optional<transparent::Target> target =
-                transparentFlows_->claim(peerAddress, peerPort);
-            if (target) {
-                spdlog::trace("Transparent CONNECT {}:{}", target->address, target->targetPort);
-                auto* relay = new DirectRelay(clientSock, context_, target->address,
-                                              target->targetPort, target->address,
-                                              target->connectPort);
-                relay->start();
-                return;
-            }
+    if (wfpRedirects_) {
+        WfpInterceptor::RedirectedConnection connection;
+        if (WfpInterceptor::queryRedirectedConnection(clientSock, connection)) {
+            spdlog::trace("WFP CONNECT {}:{}", connection.targetAddress,
+                          connection.targetPort);
+            auto* relay = new DirectRelay(
+                clientSock, context_, connection.targetAddress,
+                connection.targetPort, connection.targetAddress,
+                connection.targetPort, std::move(connection.redirectRecords),
+                connection.addressFamily);
+            relay->start();
+            return;
         }
-
-        // A listener bound to all local interfaces must never become an open
-        // proxy. Only a SYN previously observed by WinDivert is accepted.
-        spdlog::warn("Yetkisiz transparent relay baglantisi reddedildi");
+        spdlog::warn("WFP redirect baglami olmayan relay baglantisi reddedildi");
         closesocket(clientSock);
         return;
     }

@@ -5,13 +5,9 @@
 
 namespace recovery {
 
-inline constexpr unsigned kMaxWinDivertReadRetries = 3;
 inline constexpr uint64_t kRestartWindowMs = 10 * 60 * 1000;
 inline constexpr unsigned kMaxAutomaticRestarts = 3;
 
-bool isTransientWinDivertReadError(uint32_t error);
-bool shouldRetryWinDivertRead(uint32_t error, unsigned completedRetries);
-unsigned winDivertRetryDelayMs(unsigned completedRetries);
 unsigned automaticRestartDelayMs(unsigned attemptNumber);
 
 // Sliding-window restart budget. `consume` returns a one-based attempt number,

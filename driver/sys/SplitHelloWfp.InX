@@ -1,0 +1,44 @@
+[Version]
+Signature   = "$Windows NT$"
+Class       = WFPCALLOUTS
+ClassGuid   = {57465043-616C-6C6F-7574-5F636C617373}
+Provider    = %ProviderName%
+CatalogFile = SplitHelloWfp.cat
+DriverVer   =
+PnpLockdown = 1
+
+[SourceDisksNames.$ARCH$]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles.$ARCH$]
+SplitHelloWfp.sys = 1,,
+
+[DestinationDirs]
+DriverCopyFiles = 12
+
+[DefaultInstall.nt$ARCH$]
+OptionDesc = %DriverDescription%
+CopyFiles  = DriverCopyFiles
+
+[DefaultInstall.nt$ARCH$.Services]
+AddService = SplitHelloWfp,0x00000002,DriverService
+
+[DriverCopyFiles]
+SplitHelloWfp.sys,,,0x00000040
+
+[DriverService]
+DisplayName    = %ServiceName%
+Description    = %ServiceDescription%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\SplitHelloWfp.sys
+LoadOrderGroup = NDIS
+Dependencies   = TCPIP
+
+[Strings]
+ProviderName       = "SplitHello"
+DriverDescription  = "SplitHello WFP callout driver"
+ServiceName        = "SplitHello WFP"
+ServiceDescription = "SplitHello TCP redirect and packet-policy WFP callout"
+DiskName           = "SplitHello WFP installation media"

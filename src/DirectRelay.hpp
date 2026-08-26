@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -17,7 +18,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
-namespace packet_strategy { class PolicyRegistry; }
+namespace packet_strategy { struct Policy; }
 namespace telemetry { class Store; }
 
 // Shared, read-only state handed to every connection.
@@ -27,7 +28,8 @@ struct RelayContext {
     std::string networkId = "network-default";
     dns::Resolver* resolver = nullptr;
     strategy::Store* strategies = nullptr;
-    packet_strategy::PolicyRegistry* packetPolicies = nullptr;
+    std::function<bool(const std::string&, uint16_t,
+                       const packet_strategy::Policy&)> armPacketPolicy;
     std::shared_ptr<telemetry::Store> telemetry;
     std::shared_ptr<live_stats::Publisher> liveStats;
     unsigned splitDelayMs = 20;
@@ -56,7 +58,9 @@ public:
     DirectRelay(SOCKET clientSock, const RelayContext& context,
                 std::string targetHost, uint16_t targetPort,
                 std::string originalTargetAddress = {},
-                uint16_t connectPort = 0);
+                uint16_t connectPort = 0,
+                std::vector<uint8_t> redirectRecords = {},
+                int redirectRecordFamily = AF_UNSPEC);
     ~DirectRelay();
 
     DirectRelay(const DirectRelay&) = delete;
@@ -74,6 +78,8 @@ private:
     uint16_t targetPort_;
     std::string originalTargetAddress_;
     uint16_t connectPort_;
+    std::vector<uint8_t> redirectRecords_;
+    int redirectRecordFamily_ = AF_UNSPEC;
 
     std::vector<std::string> candidates_;   // resolved addresses, in connect order
     std::string connectedAddress_;

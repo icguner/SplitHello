@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -29,7 +30,9 @@ SOCKET connectAny(const std::vector<std::string>& addresses,
                   uint16_t port,
                   unsigned attemptDelayMs,
                   unsigned totalTimeoutMs,
-                  std::string& chosenAddress);
+                  std::string& chosenAddress,
+                  std::span<const uint8_t> redirectRecords = {},
+                  int redirectRecordFamily = AF_UNSPEC);
 
 // True if the string is a bare IPv4/IPv6 literal rather than a hostname.
 bool isIpLiteral(const std::string& value);

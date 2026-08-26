@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(splithello LANGUAGES C CXX)
 
+if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "SplitHello native WFP backend requires 64-bit Windows")
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -65,32 +69,6 @@ set_target_properties(webview2_loader PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${webview2_SOURCE_DIR}/build/native/include"
 )
 
-# WinDivert ships signed WFP drivers and import libraries in its official
-# binary archive. Pin both the version and archive hash so a build can never
-# silently consume different driver bytes.
-FetchContent_Declare(
-    windivert
-    URL      https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip
-    URL_HASH SHA256=63CB41763BB4B20F600B6DE04E991A9C2BE73279E317D4D82F237B150C5F3F15
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-)
-FetchContent_MakeAvailable(windivert)
-
-if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    set(WINDIVERT_ARCH_DIR x64)
-    set(WINDIVERT_DRIVER WinDivert64.sys)
-else()
-    set(WINDIVERT_ARCH_DIR x86)
-    set(WINDIVERT_DRIVER WinDivert32.sys)
-endif()
-
-add_library(windivert_import SHARED IMPORTED GLOBAL)
-set_target_properties(windivert_import PROPERTIES
-    IMPORTED_IMPLIB "${windivert_SOURCE_DIR}/${WINDIVERT_ARCH_DIR}/WinDivert.lib"
-    IMPORTED_LOCATION "${windivert_SOURCE_DIR}/${WINDIVERT_ARCH_DIR}/WinDivert.dll"
-    INTERFACE_INCLUDE_DIRECTORIES "${windivert_SOURCE_DIR}/include"
-)
-
 # ---- Worker source is embedded from worker/src/index.js at build time ----
 # There is exactly one copy of the Worker in this repo. `wrangler deploy` and
 # `splithello --setup` therefore always ship identical code.
@@ -145,7 +123,6 @@ add_library(splithello_core STATIC
     src/TcpConnect.cpp
     src/Telemetry.cpp
     src/TlsHello.cpp
-    src/TransparentFlow.cpp
     src/Wrangler.cpp
 )
 
@@ -171,7 +148,7 @@ add_executable(splithello
     src/Setup.cpp
     src/TransparentDnsProxy.cpp
     src/TrayApp.cpp
-    src/WinDivertInterceptor.cpp
+    src/WfpInterceptor.cpp
     src/WsClient.cpp
     ${WORKER_HEADER}
     ${DASHBOARD_HEADER}
@@ -180,34 +157,53 @@ add_executable(splithello
 target_include_directories(splithello PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}/generated
     ${webview2_SOURCE_DIR}/build/native/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/driver/shared
 )
 target_link_libraries(splithello PRIVATE
     splithello_core
-    windivert_import
     webview2_loader
+    fwpuclnt
     shell32
     advapi32
     shlwapi
     version
 )
 
+set(SPLITHELLO_WFP_DRIVER
+    "${CMAKE_CURRENT_SOURCE_DIR}/driver/out/Release/x64/SplitHelloWfp.sys")
+if(NOT EXISTS "${SPLITHELLO_WFP_DRIVER}")
+    set(SPLITHELLO_WFP_DRIVER
+        "${CMAKE_CURRENT_SOURCE_DIR}/driver/out/Debug/x64/SplitHelloWfp.sys")
+endif()
+
+if(EXISTS "${SPLITHELLO_WFP_DRIVER}")
+    add_custom_command(TARGET splithello POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${SPLITHELLO_WFP_DRIVER}"
+                "$<TARGET_FILE_DIR:splithello>/SplitHelloWfp.sys"
+        COMMENT "SplitHello WFP surucusu kopyalaniyor"
+    )
+else()
+    message(WARNING "SplitHelloWfp.sys bulunamadi; once driver/build.ps1 calistirin")
+endif()
+
 add_custom_command(TARGET splithello POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${windivert_SOURCE_DIR}/${WINDIVERT_ARCH_DIR}/WinDivert.dll"
+    COMMAND ${CMAKE_COMMAND} -E rm -f
             "$<TARGET_FILE_DIR:splithello>/WinDivert.dll"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${windivert_SOURCE_DIR}/${WINDIVERT_ARCH_DIR}/${WINDIVERT_DRIVER}"
-            "$<TARGET_FILE_DIR:splithello>/${WINDIVERT_DRIVER}"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${windivert_SOURCE_DIR}/LICENSE"
+            "$<TARGET_FILE_DIR:splithello>/WinDivert32.sys"
+            "$<TARGET_FILE_DIR:splithello>/WinDivert64.sys"
             "$<TARGET_FILE_DIR:splithello>/WinDivert-LICENSE.txt"
+    COMMENT "Eski WinDivert runtime dosyalari temizleniyor"
+)
+
+add_custom_command(TARGET splithello POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${webview2_SOURCE_DIR}/LICENSE.txt"
             "$<TARGET_FILE_DIR:splithello>/WebView2-LICENSE.txt"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${webview2_SOURCE_DIR}/NOTICE.txt"
             "$<TARGET_FILE_DIR:splithello>/WebView2-NOTICE.txt"
-    COMMENT "WinDivert runtime ve imzali surucu kopyalaniyor"
+    COMMENT "WebView2 lisanslari kopyalaniyor"
 )
 
 enable_testing()

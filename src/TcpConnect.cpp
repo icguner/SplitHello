@@ -3,6 +3,8 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <limits>
+#include <mstcpip.h>
 
 namespace tcp {
 namespace {
@@ -18,7 +20,9 @@ struct Attempt {
 
 // Kick off a non-blocking connect. Returns INVALID_SOCKET if the address is
 // unusable or the socket could not be created.
-SOCKET beginConnect(const std::string& address, uint16_t port) {
+SOCKET beginConnect(const std::string& address, uint16_t port,
+                    std::span<const uint8_t> redirectRecords,
+                    int redirectRecordFamily) {
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -35,6 +39,21 @@ SOCKET beginConnect(const std::string& address, uint16_t port) {
     if (sock == INVALID_SOCKET) {
         freeaddrinfo(resolved);
         return INVALID_SOCKET;
+    }
+
+    if (!redirectRecords.empty() &&
+        (redirectRecordFamily == AF_UNSPEC ||
+         redirectRecordFamily == resolved->ai_family)) {
+        DWORD returned = 0;
+        if (redirectRecords.size() > std::numeric_limits<DWORD>::max() ||
+            WSAIoctl(sock, SIO_SET_WFP_CONNECTION_REDIRECT_RECORDS,
+                     const_cast<uint8_t*>(redirectRecords.data()),
+                     static_cast<DWORD>(redirectRecords.size()), nullptr, 0,
+                     &returned, nullptr, nullptr) == SOCKET_ERROR) {
+            closesocket(sock);
+            freeaddrinfo(resolved);
+            return INVALID_SOCKET;
+        }
     }
 
     u_long nonBlocking = 1;
@@ -102,7 +121,9 @@ SOCKET connectAny(const std::vector<std::string>& addresses,
                   uint16_t port,
                   unsigned attemptDelayMs,
                   unsigned totalTimeoutMs,
-                  std::string& chosenAddress) {
+                  std::string& chosenAddress,
+                  std::span<const uint8_t> redirectRecords,
+                  int redirectRecordFamily) {
     chosenAddress.clear();
     if (addresses.empty()) return INVALID_SOCKET;
 
@@ -121,7 +142,8 @@ SOCKET connectAny(const std::vector<std::string>& addresses,
         const bool candidatesLeft = nextCandidate < addresses.size();
         if (candidatesLeft && inFlight.size() < kMaxParallelAttempts && now >= nextStartAt) {
             const std::string& address = addresses[nextCandidate++];
-            SOCKET sock = beginConnect(address, port);
+            SOCKET sock = beginConnect(address, port, redirectRecords,
+                                       redirectRecordFamily);
             if (sock != INVALID_SOCKET) {
                 inFlight.push_back({sock, address});
             } else {

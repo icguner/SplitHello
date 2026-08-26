@@ -1,7 +1,6 @@
 #pragma once
 
 #include "DirectRelay.hpp"
-#include "TransparentFlow.hpp"
 
 #include <string>
 #include <cstdint>
@@ -12,13 +11,13 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
-// Local relay listener. Connections reflected by WinDivert are authenticated
-// against FlowRegistry and need no application-level handshake. Explicit
+// Local relay listener. WFP-redirected connections carry kernel-owned redirect
+// context and need no application-level handshake. Explicit
 // SOCKS5 and HTTP CONNECT remain available as a recovery/debugging path.
 class SocksProxy {
 public:
     explicit SocksProxy(RelayContext context, uint16_t port = 1080,
-                        transparent::FlowRegistry* transparentFlows = nullptr);
+                        bool wfpRedirects = false);
     ~SocksProxy();
 
     SocksProxy(const SocksProxy&) = delete;
@@ -33,7 +32,7 @@ public:
 private:
     RelayContext context_;
     uint16_t port_;
-    transparent::FlowRegistry* transparentFlows_;
+    bool wfpRedirects_ = false;
     SOCKET listenSock_ = INVALID_SOCKET;
     std::atomic<bool> running_{false};
 

@@ -12,9 +12,8 @@
 #include "SystemProxy.hpp"
 #include "Telemetry.hpp"
 #include "TransparentDnsProxy.hpp"
-#include "TransparentFlow.hpp"
 #include "TrayApp.hpp"
-#include "WinDivertInterceptor.hpp"
+#include "WfpInterceptor.hpp"
 
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/rotating_file_sink.h>
@@ -44,7 +43,7 @@ constexpr int kEngineFailOpenExitCode = 2;
 
 SocksProxy* g_proxy = nullptr;
 TransparentDnsProxy* g_dnsProxy = nullptr;
-WinDivertInterceptor* g_interceptor = nullptr;
+WfpInterceptor* g_interceptor = nullptr;
 HANDLE g_elevationShutdownEvent = nullptr;
 
 void cleanup(int = 0) {
@@ -77,7 +76,7 @@ void printUsage(const char* exe) {
         << "  --split-delay <ms>   TLS kayit parcalari arasi bekleme (varsayilan: 20)\n"
         << "  --strategy <ad>      Tanilama: profile sabitle ve ogrenmeyi kapat\n"
         << "  --tunnel-fallback    Tum profiller basarisizsa Worker tunelini kullan\n"
-        << "  --manual-proxy       WinDivert olmadan SOCKS5/CONNECT dinle\n"
+        << "  --manual-proxy       WFP olmadan SOCKS5/CONNECT dinle\n"
         << "  --quic-mode <mod>    allow (varsayilan), adaptive veya block\n"
         << "  --allow-quic         Eski ad; --quic-mode allow ile ayni\n"
         << "  --include-process <desen>  Yalniz eslesen exe yollarini isle (tekrarlanabilir)\n"
@@ -93,7 +92,7 @@ void printUsage(const char* exe) {
         << "  " << exe << " --setup\n\n"
         << "Sonraki kullanimlar:\n"
         << "  " << exe << "\n"
-        << "    WinDivert baslar ve tum uygulamalarin TCP/443 trafigi otomatik yakalanir.\n"
+        << "    WFP surucusu baslar ve TCP/443 trafigi otomatik yakalanir.\n"
         << "    Yonetici yetkisi gerekir; varsayilan yonetim sistem tepsisindedir.\n"
         << "    --console modunda Ctrl+C filtreyi tamamen kaldirir.\n";
 }
@@ -520,7 +519,7 @@ int main(int argc, char* argv[]) {
     const bool exitsWithoutInterception = options.restoreProxy || options.forgetToken ||
         options.forgetStrategies || options.redeploy;
     if (!options.manualProxy && !exitsWithoutInterception && !isElevated()) {
-        spdlog::info("WinDivert icin yonetici izni isteniyor");
+        spdlog::info("WFP surucusu icin yonetici izni isteniyor");
         const int elevatedExitCode = relaunchElevated(!trayMode);
         if (elevatedExitCode < 0) {
             spdlog::error("Yonetici olarak yeniden baslatma reddedildi veya basarisiz oldu");
@@ -639,20 +638,15 @@ int main(int argc, char* argv[]) {
                                  options.processExclude.end());
 
     // Full interception no longer needs Internet Options. Undo a setting left
-    // by older builds before opening WinDivert.
+    // by older builds before opening WFP.
     SystemProxy::restoreLeftovers(Config::proxyBackupPath());
 
-    constexpr uint16_t kPreferredConnectPort = 65534;
-    constexpr uint16_t kAlternateConnectPort = 65533;
     constexpr uint16_t kPreferredDnsProxyPort = 1053;
     constexpr uint16_t kAlternateDnsProxyPort = 1054;
-    const uint16_t connectPort = options.port == kPreferredConnectPort
-        ? kAlternateConnectPort : kPreferredConnectPort;
     const uint16_t dnsProxyPort = options.port == kPreferredDnsProxyPort
         ? kAlternateDnsProxyPort : kPreferredDnsProxyPort;
 
-    dns::Resolver resolver(workerUrl, config.sharedSecret,
-                           options.manualProxy ? 0 : connectPort);
+    dns::Resolver resolver(workerUrl, config.sharedSecret, 0);
     strategy::Store strategies(Config::strategyPath());
     auto telemetryStore = std::make_shared<telemetry::Store>(Config::telemetryPath());
     std::shared_ptr<live_stats::Publisher> liveStats;
@@ -664,9 +658,10 @@ int main(int argc, char* argv[]) {
             spdlog::warn("Canli tray istatistik kanali acilamadi");
         }
     }
-    packet_strategy::PolicyRegistry packetPolicies;
-    process_filter::Filter processFilter(process_filter::Rules(
-        config.processInclude, config.processExclude));
+    const process_filter::Rules processRules(
+        config.processInclude, config.processExclude);
+    WfpInterceptor interceptor(options.port, dnsProxyPort, options.quicMode,
+                               processRules.includes(), processRules.excludes());
     strategies.load();
     if (!telemetryStore->start()) {
         spdlog::warn("Yerel telemetri baslatilamadi; ag motoru istatistiksiz devam ediyor");
@@ -683,13 +678,19 @@ int main(int argc, char* argv[]) {
     context.networkId = networkId;
     context.resolver = &resolver;
     context.strategies = &strategies;
-    context.packetPolicies = options.manualProxy ? nullptr : &packetPolicies;
+    if (!options.manualProxy) {
+        context.armPacketPolicy = [&interceptor](
+            const std::string& address, uint16_t port,
+            const packet_strategy::Policy& policy) {
+            return interceptor.armPolicy(address, port, policy);
+        };
+    }
     context.telemetry = telemetryStore;
     context.liveStats = liveStats;
     context.splitDelayMs = config.splitDelayMs;
     context.probeTimeoutMs = config.probeTimeoutMs;
     context.tunnelFallback = config.tunnelFallback;
-    context.bypassConnectPort = options.manualProxy ? 0 : connectPort;
+    context.bypassConnectPort = 0;
     context.forcedProfile = options.forcedStrategy;
 
     spdlog::info("SplitHello baslatiliyor");
@@ -697,16 +698,14 @@ int main(int argc, char* argv[]) {
     spdlog::info("Ag profili: {}", networkId);
     spdlog::info("Relay portu: {} | split-delay: {} ms | ogrenilen alan adi: {}",
                  options.port, config.splitDelayMs, strategies.size());
-    if (processFilter.enabled()) {
+    if (processRules.enabled()) {
         spdlog::info("Surec filtresi: {} include, {} exclude kurali",
-                     processFilter.rules().includeCount(),
-                     processFilter.rules().excludeCount());
+                     processRules.includeCount(),
+                     processRules.excludeCount());
     }
 
-    transparent::FlowRegistry flows;
-    transparent::DatagramRegistry datagrams;
-    SocksProxy proxy(context, options.port, options.manualProxy ? nullptr : &flows);
-    TransparentDnsProxy dnsProxy(resolver, datagrams, dnsProxyPort);
+    SocksProxy proxy(context, options.port, !options.manualProxy);
+    TransparentDnsProxy dnsProxy(resolver, dnsProxyPort, !options.manualProxy);
     g_proxy = &proxy;
     g_dnsProxy = options.manualProxy ? nullptr : &dnsProxy;
 
@@ -726,7 +725,7 @@ int main(int argc, char* argv[]) {
             proxyExited = true;
         });
 
-        // WinDivert must never reflect into a listener that has not bound yet.
+        // WFP must never redirect into a listener that has not bound yet.
         for (unsigned waited = 0; waited < 2000 && !proxy.running() && !proxyExited;
              waited += 10) {
             Sleep(10);
@@ -747,9 +746,6 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        WinDivertInterceptor interceptor(flows, datagrams, packetPolicies, options.port,
-                                         dnsProxyPort, connectPort,
-                                         options.quicMode, &processFilter);
         g_interceptor = &interceptor;
         if (!interceptor.start()) {
             dnsProxy.stop();
@@ -762,24 +758,24 @@ int main(int argc, char* argv[]) {
 
         signalReadyEvent(options.readyEventName);
 
-        // Do not block only on the relay. If the packet reader dies, its
-        // WinDivert handle closes first (fail-open), then this loop tears down
+        // Do not block only on the relay. If the WFP owner dies, its device
+        // handle closes first (fail-open), then this loop tears down
         // the remaining local listeners so the tray can restart a clean engine.
         while (!proxyExited && interceptor.running()) {
             Sleep(50);
         }
 
-        const DWORD fatalWinDivertError = interceptor.fatalErrorCode();
+        const DWORD fatalWfpError = interceptor.fatalErrorCode();
         const bool relayExitedUnexpectedly = proxyExited && interceptor.running();
-        if (fatalWinDivertError != ERROR_SUCCESS) {
+        if (fatalWfpError != ERROR_SUCCESS) {
             runtimeExitCode = kEngineFailOpenExitCode;
             spdlog::error(
-                "Ag motoru fail-open ile kapandi: WinDivert hata={}; tray yeniden baslatabilir",
-                fatalWinDivertError);
+                "Ag motoru fail-open ile kapandi: WFP hata={}; tray yeniden baslatabilir",
+                fatalWfpError);
         } else if (relayExitedUnexpectedly) {
             runtimeExitCode = kEngineFailOpenExitCode;
             spdlog::error(
-                "Transparent relay beklenmedik sekilde durdu; WinDivert fail-open kapatiliyor");
+                "Transparent relay beklenmedik sekilde durdu; WFP fail-open kapatiliyor");
         }
 
         interceptor.stop();

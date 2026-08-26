@@ -1,7 +1,6 @@
 #pragma once
 
 #include "Dns.hpp"
-#include "TransparentFlow.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -15,15 +14,14 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
-// Receives UDP/53 datagrams reflected by WinDivert, resolves their single DNS
+// Receives UDP/53 datagrams reflected by the WFP callout, resolves their single DNS
 // question through the Cloudflare Worker, and sends a compact DNS answer back
 // through the same reflected tuple. Several workers are required because a
 // WinHTTP request can itself trigger a DNS query for the Worker hostname.
 class TransparentDnsProxy {
 public:
-    TransparentDnsProxy(dns::Resolver& resolver,
-                        transparent::DatagramRegistry& datagrams,
-                        uint16_t port);
+    TransparentDnsProxy(dns::Resolver& resolver, uint16_t port,
+                        bool trustWfpLoopback = false);
     ~TransparentDnsProxy();
 
     TransparentDnsProxy(const TransparentDnsProxy&) = delete;
@@ -42,8 +40,8 @@ private:
     };
 
     dns::Resolver& resolver_;
-    transparent::DatagramRegistry& datagrams_;
     uint16_t port_;
+    bool trustWfpLoopback_ = false;
     std::atomic<SOCKET> socket_{INVALID_SOCKET};
     std::atomic<bool> running_{false};
     std::thread receiver_;

@@ -74,13 +74,17 @@ std::vector<std::string> systemResolve(const std::string& host, uint16_t port) {
 DirectRelay::DirectRelay(SOCKET clientSock, const RelayContext& context,
                          std::string targetHost, uint16_t targetPort,
                          std::string originalTargetAddress,
-                         uint16_t connectPort)
+                         uint16_t connectPort,
+                         std::vector<uint8_t> redirectRecords,
+                         int redirectRecordFamily)
     : clientSock_(clientSock)
     , context_(context)
     , targetHost_(std::move(targetHost))
     , targetPort_(targetPort)
     , originalTargetAddress_(std::move(originalTargetAddress))
-    , connectPort_(connectPort == 0 ? targetPort : connectPort) {}
+    , connectPort_(connectPort == 0 ? targetPort : connectPort)
+    , redirectRecords_(std::move(redirectRecords))
+    , redirectRecordFamily_(redirectRecordFamily) {}
 
 DirectRelay::~DirectRelay() {
     stop();
@@ -129,7 +133,8 @@ bool DirectRelay::prepareCandidates() {
 
 bool DirectRelay::connectTarget() {
     targetSock_ = tcp::connectAny(candidates_, connectPort_, kConnectAttemptDelayMs,
-                                  kConnectTimeoutMs, connectedAddress_);
+                                  kConnectTimeoutMs, connectedAddress_, redirectRecords_,
+                                  redirectRecordFamily_);
     if (targetSock_ == INVALID_SOCKET) {
         spdlog::error("Baglanti kurulamadi: {}:{}", targetHost_, targetPort_);
         return false;
@@ -396,7 +401,7 @@ bool DirectRelay::deliverHello() {
         attempts++;
 
         packet_strategy::Policy packetPolicy;
-        if (context_.packetPolicies &&
+        if (context_.armPacketPolicy &&
             packet_strategy::policyForProfile(profile, hello_, packetPolicy)) {
             sockaddr_storage local{};
             int localLength = sizeof(local);
@@ -409,7 +414,7 @@ bool DirectRelay::deliverHello() {
                     localPort = ntohs(reinterpret_cast<sockaddr_in6*>(&local)->sin6_port);
                 }
             }
-            context_.packetPolicies->arm(connectedAddress_, localPort, packetPolicy);
+            context_.armPacketPolicy(connectedAddress_, localPort, packetPolicy);
         }
 
         const ULONGLONG probeStarted = GetTickCount64();

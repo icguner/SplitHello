@@ -31,25 +31,24 @@ downgraded after one failure and evicted after two; if the untouched baseline
 works again, the stale mapping is removed immediately. Entries expire after
 seven days so the engine periodically relearns changed network behavior.
 
-### Transparent WinDivert interception
+### Native WFP interception
 
-SplitHello no longer depends on the Windows system-proxy setting. Its signed
-WinDivert driver reflects every non-loopback outbound TCP/443 connection into
-the local relay, including connections from applications that ignore Internet
-Options. IPv4 and IPv6 are handled. Only the HTTPS port family is diverted;
-unrelated game, voice and LAN traffic stays on the normal Windows path.
+SplitHello no longer depends on the Windows system-proxy setting or WinDivert.
+Its own WFP callout driver redirects selected outbound TCP/443 connections at
+the ALE layer and keeps exact packet transformations in narrowly scoped IP
+packet callouts. IPv4 and IPv6 are handled. Unrelated game, voice and LAN
+traffic stays on the normal Windows path.
 
-The reflector records the original destination when it sees the TCP SYN. The
-local listener accepts a reflected socket only if that exact server-address +
-client-port tuple is present in the short-lived registry, so binding the relay
-on all local interfaces does not create an open proxy.
+The redirect callout attaches the original destination to WFP redirect context.
+The local listener accepts only sockets carrying that context and passes WFP's
+redirect records to same-family replacement sockets. Cross-family Happy
+Eyeballs attempts rely on the relay process's ALE bypass, preventing loops
+without applying incompatible redirect records.
 
-UDP/443 passes unchanged by default, keeping HTTP/3 media and other already
-working QUIC traffic on its native fast path. Optional adaptive mode precedes a
-new QUIC Initial with a deliberately non-QUIC datagram and temporarily forces an
-unresponsive target to TCP; `--quic-mode allow|adaptive|block` selects the
-behavior. Other UDP traffic, including Discord voice ports, is not redirected
-or blocked.
+UDP/443 passes unchanged by default. Adaptive mode gives a new QUIC flow a
+bounded response window and temporarily forces an unresponsive target to TCP;
+`--quic-mode allow|adaptive|block` selects the behavior. Other UDP traffic,
+including Discord voice ports, is not redirected or blocked.
 
 ### DNS Bypass
 
@@ -67,7 +66,8 @@ Eyeballs.
 
 ### Packet and TLS transformation
 
-WinDivert is also used as a packet rewriter on the relay's direct connection.
+The native packet callout rewrites the relay's direct connection only when a
+one-shot policy has been armed.
 When the untouched baseline fails, the learning pool can try reverse-order TCP
 segments, fake cover ClientHellos with bad sequence/checksum/AutoTTL disposal,
 sequence overlap, IPv4 fragmentation, and valid TLS record fragmentation. IPv6
@@ -194,13 +194,9 @@ command line or stored in `%APPDATA%\splithello\config.json`:
 }
 ```
 
-WinDivert's network layer deliberately has no PID field, so SplitHello resolves
-the owning process only when a new TCP tuple or UDP socket first appears and
-caches that decision. Later packets perform only a bounded hash lookup; they do
-not enumerate processes or connection tables. A missing/ambiguous owner is
-fail-open and bypasses interception. With no process rules configured, the
-lookup path is completely disabled. See the
-[WinDivert layer capability table](https://github.com/basil00/WinDivert/wiki/WinDivert-Documentation#51-windivert_layer).
+Process identity is evaluated at WFP's ALE authorization/redirect layers. Later
+UDP packets perform only a bounded tuple lookup and never enumerate processes
+or connection tables. A missing application identity is fail-open.
 
 ## Architecture
 
@@ -208,8 +204,8 @@ lookup path is completely disabled. See the
 Application (Discord, Browser, etc.)
     | Normal TCP/443 connection; no proxy configuration
     v
-[WinDivert - signed WFP driver]
-    | Reflects the flow and preserves its original destination
+[SplitHello WFP callout driver]
+    | ALE redirect + original-target context; bounded packet policies
     v
 [SplitHello - Local Relay] ([::]:1080)
     | 1. Reassembles ClientHello and recovers SNI
@@ -230,7 +226,7 @@ Tray controller
 - No VPN, no tunnel, no external relay server on the data path
 - Direct connection to the target; learned winners avoid repeated profile scans
 - All applications' TCP/443 flows are covered without per-app proxy settings
-- SplitHello's own Worker traffic uses a private bypass port to avoid recursion
+- SplitHello's own Worker traffic is excluded by ALE process identity to avoid recursion
 - The Cloudflare Worker normally handles DNS only; payload relay is used only
   when the explicit `--tunnel-fallback` option is enabled
 
@@ -253,13 +249,11 @@ Tray controller
   encrypted with Windows DPAPI. API-token fields written by older releases are
   removed automatically on first run; `--forget-token` remains as a compatible
   manual cleanup command.
-- **Driver provenance.** CMake downloads the official WinDivert 2.2.2 binary
-  archive with a pinned SHA-256 hash. The signed driver, DLL and WinDivert
-  license are copied beside the executable. A mismatched archive fails the
-  configure step.
-- **Fail-closed listener.** Transparent sockets are authorized by a short-lived
-  SYN registry. Unsolicited connections to the relay port are rejected before
-  any proxy protocol or payload is processed.
+- **Driver provenance.** The in-tree callout driver uses pinned official WDK/SDK
+  packages. Release artifacts are hash-manifested; production distribution
+  still requires a Microsoft-trusted production signature.
+- **Fail-closed listener.** Transparent sockets must carry valid WFP redirect
+  context. Unsolicited connections are rejected before payload processing.
 - **Legacy cleanup.** Builds before transparent mode changed Internet Options.
   A leftover backup is restored on startup; `--restore-proxy` remains available
   solely for migration/recovery.
@@ -267,20 +261,24 @@ Tray controller
 ## Quick Start
 
 ### Prerequisites
-- Windows 10/11
+- 64-bit Windows 10 version 2004 or newer, or 64-bit Windows 11
 - [CMake](https://cmake.org/download/) 3.20+
 - [Visual Studio](https://visualstudio.microsoft.com/) with C++ workload (or Build Tools)
 - [Node.js](https://nodejs.org/) 20+ with npm/npx (used to run Wrangler 4)
 - [Microsoft Edge WebView2 Runtime](https://learn.microsoft.com/microsoft-edge/webview2/concepts/distribution) (normally already present on Windows 10/11)
 - A free [Cloudflare](https://dash.cloudflare.com/sign-up) account
-- Administrator permission at runtime (required to load WinDivert's signed WFP driver)
+- Administrator permission at runtime (required to manage the WFP driver/service)
 
 ### Build
 ```bash
+pwsh -File driver/build.ps1 -Configuration Release -Rebuild
 cmake -B build -S .
 cmake --build build --config Release
 ctest --test-dir build -C Release
 ```
+
+The WDK output is test-signed for development. Load it only in a disposable VM
+with the test certificate trusted; public releases need production signing.
 
 Note: with the Ninja generator, configure and build from a Developer Command
 Prompt so the MSVC include paths are set. The Visual Studio generator (the
@@ -332,18 +330,17 @@ splithello.exe
 ```
 
 The first normal run displays a Windows UAC prompt and then lives in the system
-tray. Start/Stop controls remove or restore the WinDivert path without closing
+tray. Start/Stop controls remove or restore the WFP path without closing
 the tray controller. Double-clicking the icon opens the local diagnostics
 dashboard. TCP DPI learning is always adaptive unless `--strategy`
 pins a diagnostic profile. QUIC is a separate policy: it passes unchanged by
 default so working HTTP/3 services such as YouTube keep their native fast path;
 adaptive and block modes remain available through `--quic-mode`.
 
-The network path is fail-open. Transient WinDivert resource errors are retried
-three times with short backoff; a persistent reader or relay failure closes the
-WinDivert handle before engine teardown, immediately restoring the normal
-Internet path. The tray then restarts the engine automatically, capped at three
-attempts in ten minutes to avoid a crash loop.
+The network path is fail-open. The owner first disables the driver, then closes
+its dynamic WFP session; an unexpected control-handle close also disables
+classification, and filters permit traffic if callouts are absent. The tray
+restart budget remains capped at three attempts in ten minutes.
 
 Persistent diagnostics rotate at 512 KiB with two backups and SplitHello log
 archives older than seven days are removed during startup.
@@ -357,7 +354,7 @@ archives older than seven days are removed during startup.
 --split-delay <ms>   Pause between TLS record fragments (default: 20)
 --strategy <name>    Diagnostic: pin one profile and disable learning
 --tunnel-fallback    Fall back to the Worker tunnel when every profile fails
---manual-proxy       Disable WinDivert; listen for explicit SOCKS5/CONNECT
+--manual-proxy       Disable WFP; listen for explicit SOCKS5/CONNECT
 --quic-mode <mode>   allow (default), adaptive or block
 --allow-quic         Backward-compatible alias for --quic-mode allow
 --include-process <pattern>  Process allow-list rule; repeat as needed
@@ -390,21 +387,21 @@ to keep both sides in sync is to let `--setup` do it.
 
 | | GoodbyeDPI | SplitHello |
 |---|---|---|
-| **Level** | Packet (WinDivert kernel driver) | Packet rewriting + stateful TLS relay (WinDivert) |
+| **Level** | Packet (WinDivert kernel driver) | ALE redirect + packet callouts + stateful TLS relay |
 | **Technique** | Fake packets, TCP segmentation, TTL tricks | Differential baseline + learned fake/disorder/overlap/AutoTTL/IP-fragment/TLS-record profiles |
 | **DNS** | Doesn't handle DNS poisoning | Transparent raw DNS wire forwarding via authenticated DoH |
 | **Scope** | Filter-dependent TCP traffic | All non-loopback TCP/443; UDP/443 unchanged by default |
-| **Dependencies** | WinDivert driver | WinDivert 2.2.2 + SQLite + WebView2 Runtime + Windows WinHTTP |
+| **Dependencies** | WinDivert driver | Native SplitHello WFP driver + SQLite + WebView2 Runtime + Windows WinHTTP |
 | **Admin required** | Yes | Yes, only for transparent mode |
 | **Gaming impact** | Can affect broad traffic | Non-443 game/voice traffic bypasses the filter |
 
 ## Technical Details
 
 - **Language:** C++20
-- **Dependencies:** spdlog, the pinned official SQLite amalgamation and pinned
-  Microsoft WebView2 SDK loader, plus pinned WinDivert 2.2.2 (auto-fetched);
+- **Dependencies:** spdlog, the pinned official SQLite amalgamation, pinned
+  Microsoft WebView2 SDK loader, and the in-tree pinned-WDK WFP driver;
   WebView2 Runtime, WinHTTP / IP Helper / ws2_32 / crypt32 / bcrypt / ole32 are supplied by Windows
-- **Ingress:** WinDivert transparent TCP/443 reflection; pass-through UDP/443 by default (IPv4 + IPv6)
+- **Ingress:** WFP ALE TCP/443 redirect; pass-through UDP/443 by default (IPv4 + IPv6)
 - **Manual recovery:** HTTP CONNECT + SOCKS5 (`--manual-proxy`)
 - **Worker:** authenticated raw DNS, direct-resolution and optional tunnel endpoints
 - **Config:** `%APPDATA%\splithello\config.json`
@@ -420,7 +417,7 @@ to keep both sides in sync is to let `--setup` do it.
 - **Tests:** `ctest --test-dir build -C Release` (ClientHello/server response
   parsing, DPI diagnosis, strategy planning, SQLite telemetry snapshots,
   live-session counters, process-rule matching and live PID ownership,
-  transparent routing and SYN authorization, JSON)
+  WFP packet parsing/rewrites, JSON)
 
 ## Not Yet Implemented
 
@@ -431,8 +428,6 @@ to keep both sides in sync is to let `--setup` do it.
 
 ## License
 
-SplitHello is MIT licensed. WinDivert is distributed separately under its
-LGPLv3/GPLv2 dual license; `WinDivert-LICENSE.txt` is copied beside every build.
-SQLite is in the public domain. The Microsoft WebView2 SDK license and notices
+SplitHello is MIT licensed. SQLite is in the public domain. The Microsoft WebView2 SDK license and notices
 are copied beside every build as `WebView2-LICENSE.txt` and
 `WebView2-NOTICE.txt`.

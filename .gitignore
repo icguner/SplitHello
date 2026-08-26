@@ -6,3 +6,5 @@ out/
 CMakeSettings.json
 node_modules/
 .wrangler/
+driver/packages/
+driver/.tools/

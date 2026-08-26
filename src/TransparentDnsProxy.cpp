@@ -41,9 +41,9 @@ bool endpoint(const sockaddr_storage& peer, std::string& address,
 } // namespace
 
 TransparentDnsProxy::TransparentDnsProxy(
-    dns::Resolver& resolver, transparent::DatagramRegistry& datagrams,
-    uint16_t port)
-    : resolver_(resolver), datagrams_(datagrams), port_(port) {}
+    dns::Resolver& resolver, uint16_t port, bool trustWfpLoopback)
+    : resolver_(resolver), port_(port),
+      trustWfpLoopback_(trustWfpLoopback) {}
 
 TransparentDnsProxy::~TransparentDnsProxy() {
     stop();
@@ -105,7 +105,6 @@ void TransparentDnsProxy::stop() {
         if (worker.joinable()) worker.join();
     }
     workers_.clear();
-    datagrams_.clear();
 }
 
 void TransparentDnsProxy::receiveLoop() {
@@ -129,8 +128,12 @@ void TransparentDnsProxy::receiveLoop() {
 
         std::string peerAddress;
         uint16_t peerPort = 0;
-        if (!endpoint(job.peer, peerAddress, peerPort) ||
-            !datagrams_.claim(peerAddress, peerPort)) {
+        if (!endpoint(job.peer, peerAddress, peerPort)) {
+            spdlog::debug("Gecersiz transparent DNS datagrami reddedildi");
+            continue;
+        }
+        const bool loopback = peerAddress == "127.0.0.1" || peerAddress == "::1";
+        if (!trustWfpLoopback_ || !loopback) {
             spdlog::debug("Yetkisiz transparent DNS datagrami reddedildi");
             continue;
         }
