@@ -62,15 +62,15 @@ BOOL WINAPI consoleHandler(DWORD event) {
 
 void printUsage(const char* exe) {
     std::cout
-        << "SplitHello - TLS ClientHello fragmentation for censorship bypass\n\n"
+        << "SplitHello - adaptive DPI diagnosis and direct-path bypass\n\n"
         << "Kullanim: " << exe << " [secenekler]\n\n"
         << "Secenekler:\n"
         << "  --setup              Cloudflare hesabini bagla ve worker deploy et\n"
         << "  --redeploy           Worker kodunu guncelle, gizli anahtari yenile\n"
         << "  --worker <url>       Worker URL (config yerine manuel belirt)\n"
         << "  --port <port>        Transparent relay portu (varsayilan: 1080)\n"
-        << "  --split-delay <ms>   Parcalar arasi bekleme (varsayilan: 20)\n"
-        << "  --strategy <ad>      Otomatik secim yerine tek profili zorla\n"
+        << "  --split-delay <ms>   TLS kayit parcalari arasi bekleme (varsayilan: 20)\n"
+        << "  --strategy <ad>      Tanilama: profile sabitle ve ogrenmeyi kapat\n"
         << "  --tunnel-fallback    Tum profiller basarisizsa Worker tunelini kullan\n"
         << "  --manual-proxy       WinDivert olmadan SOCKS5/CONNECT dinle\n"
         << "  --quic-mode <mod>    allow (varsayilan), adaptive veya block\n"
@@ -78,7 +78,7 @@ void printUsage(const char* exe) {
         << "  --restore-proxy      Cokme sonrasi kalan proxy yedegini geri yukle ve cik\n"
         << "  --forget-token       Kayitli Cloudflare token'ini sil ve cik\n"
         << "  --forget-strategies  Ogrenilen alan adi stratejilerini sifirla ve cik\n"
-        << "  --list-strategies    Parcalama profillerini listele ve cik\n"
+        << "  --list-strategies    DPI uyarlama profillerini listele ve cik\n"
         << "  --console            Tray yerine konsolda calistir\n"
         << "  --verbose            Debug loglama (konsol modunu acar)\n"
         << "  --help               Bu yardimi goster\n\n"
@@ -87,7 +87,8 @@ void printUsage(const char* exe) {
         << "Sonraki kullanimlar:\n"
         << "  " << exe << "\n"
         << "    WinDivert baslar ve tum uygulamalarin TCP/443 trafigi otomatik yakalanir.\n"
-        << "    Yonetici yetkisi gerekir; Ctrl+C ile filtre tamamen kaldirilir.\n";
+        << "    Yonetici yetkisi gerekir; varsayilan yonetim sistem tepsisindedir.\n"
+        << "    --console modunda Ctrl+C filtreyi tamamen kaldirir.\n";
 }
 
 void printStrategies() {
@@ -600,8 +601,8 @@ int main(int argc, char* argv[]) {
     }
 
     if (config.sharedSecret.empty()) {
-        spdlog::warn("Worker gizli anahtari yok. Eski bir deploy kullaniyorsunuz: "
-                     "'--redeploy' calistirin, aksi halde worker herkese acik kalir.");
+        spdlog::warn("Worker gizli anahtari yok. Worker istekleri guvenli bicimde "
+                     "reddeder; kullanmak icin '--redeploy' calistirin.");
     }
 
     if (options.splitDelaySet) config.splitDelayMs = options.splitDelayMs;

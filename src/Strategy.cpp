@@ -175,6 +175,7 @@ void Store::load() {
     std::lock_guard<std::mutex> lock(mutex_);
     entries_.clear();
 
+    const uint64_t loadedAt = nowSeconds();
     size_t pos = 1; // just past '{'
     while (pos < domains.size()) {
         pos = json::skipWs(domains, pos);
@@ -193,7 +194,10 @@ void Store::load() {
         pos = end;
 
         const std::vector<std::string> fields = splitFields(encoded);
-        if (key.empty() || fields.empty() || !findProfile(fields[0])) continue;
+        if (key.empty() || fields.empty() || !findProfile(fields[0]) ||
+            fields[0] == "none") {
+            continue;
+        }
 
         // Version 1 used a bare hostname key and a bare profile value.
         if (key.find('|') == std::string::npos) key = scopeKey(kDefaultNetwork, key);
@@ -202,13 +206,16 @@ void Store::load() {
         entry.profile = fields[0];
         entry.kind = fields.size() > 1 ? parseKind(fields[1]) : diagnosis::Kind::Unknown;
         entry.confidence = 50;
-        entry.expiresAt = nowSeconds() + kLearningTtlSeconds;
+        entry.expiresAt = loadedAt + kLearningTtlSeconds;
 
         if (fields.size() > 2) parseUnsigned32(fields[2], entry.confidence);
         if (fields.size() > 3) parseUnsigned64(fields[3], entry.expiresAt);
         if (fields.size() > 4) parseUnsigned32(fields[4], entry.failures);
+        entry.confidence = std::min(entry.confidence, 100U);
 
-        if (entry.expiresAt > nowSeconds()) entries_[key] = std::move(entry);
+        if (entry.expiresAt > loadedAt && entries_.size() < kMaxRememberedHosts) {
+            entries_[key] = std::move(entry);
+        }
     }
 }
 
@@ -235,6 +242,12 @@ void Store::remember(const std::string& networkId, const std::string& host,
     if (normalizedHost.empty() || !findProfile(profile)) return;
 
     const std::string key = scopeKey(networkId, normalizedHost);
+    if (profile == "none") {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (entries_.erase(key) != 0) saveLocked();
+        return;
+    }
+
     Entry replacement;
     replacement.profile = profile;
     replacement.kind = kind;
@@ -328,6 +341,7 @@ std::vector<std::string> Store::probeOrder(const std::string& networkId,
     if (hello.spansRecords) return {"none"};
 
     std::vector<std::string> order;
+    order.reserve(profileTable().size());
     const std::string remembered = lookup(networkId, host);
 
     if (!remembered.empty()) order.push_back(remembered);
@@ -344,9 +358,11 @@ bool Store::saveLocked() const {
     if (path_.empty()) return false;
 
     std::string content = "{\n  \"version\": 2,\n  \"domains\": {\n";
+    content.reserve(content.size() + entries_.size() * 96);
+    const uint64_t now = nowSeconds();
     bool first = true;
     for (const auto& [key, entry] : entries_) {
-        if (entry.expiresAt <= nowSeconds()) continue;
+        if (entry.expiresAt <= now) continue;
         if (!first) content += ",\n";
         first = false;
         const std::string encoded = entry.profile + ";" + diagnosis::name(entry.kind) + ";" +

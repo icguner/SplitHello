@@ -29,6 +29,14 @@ TEST(AdaptiveQuicPrimesThenKeepsAResponsiveFlow) {
           quic_strategy::Decision::Pass);
 }
 
+TEST(AdaptiveQuicIgnoresPreInitialTrafficUntilTheRealProbe) {
+    quic_strategy::AdaptiveRegistry registry(900, 5000);
+    CHECK(registry.outbound("203.0.113.3", 50000, false, 1000) ==
+          quic_strategy::Decision::Pass);
+    CHECK(registry.outbound("203.0.113.3", 50000, true, 1100) ==
+          quic_strategy::Decision::PrimeAndPass);
+}
+
 TEST(AdaptiveQuicFallsBackAfterNoResponse) {
     quic_strategy::AdaptiveRegistry registry(900, 5000);
     CHECK(registry.outbound("203.0.113.2", 50000, true, 1000) ==

@@ -1,9 +1,11 @@
 #pragma once
 
 #include <cstdint>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // DNS resolution through the Worker's /resolve endpoint (DNS-over-HTTPS
@@ -52,7 +54,9 @@ private:
     uint16_t connectPort_ = 0;
 
     mutable std::mutex mutex_;
+    std::condition_variable cacheReady_;
     std::unordered_map<std::string, Entry> cache_;
+    std::unordered_set<std::string> inFlight_;
 
     Result query(const std::string& host) const;
 };

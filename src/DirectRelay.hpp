@@ -37,15 +37,15 @@ struct RelayContext {
 
 // One proxied TCP connection.
 //
-// Resolves the target through the Worker (the ISP resolver is poisoned),
-// connects straight to it, and splits the TLS ClientHello across several valid
-// TLS records so SNI-based DPI never sees the hostname in one piece.
+// Reuses the transparently resolved target when available, connects straight
+// to it, and runs an untouched differential baseline before trying bounded
+// packet/TLS transformations. A learned winner is promoted on later flows.
 //
 // The ClientHello is buffered until it is *complete* before anything is cut:
 // a browser can deliver it across several reads, and post-quantum key shares
-// push it well past a single segment. If the first profile does not get a
-// reply, the connection is retried with the next one and the winner is
-// remembered for that domain.
+// push it well past a single segment. If a profile does not get a reply, the
+// connection is retried with the next one and a proven bypass winner is
+// remembered for that network and domain.
 class DirectRelay {
 public:
     DirectRelay(SOCKET clientSock, const RelayContext& context,

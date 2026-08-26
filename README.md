@@ -1,6 +1,8 @@
 # SplitHello
 
-TLS ClientHello fragmentation tool for bypassing internet censorship in Turkey.
+Adaptive, direct-path DPI diagnosis and bypass for Windows. SplitHello learns
+the least invasive profile that works for each network and hostname, while
+leaving already healthy HTTPS and QUIC traffic on their native paths.
 
 ## How It Works
 
@@ -9,7 +11,25 @@ Turkish ISPs block websites (Discord, etc.) using two techniques:
 1. **DNS Poisoning** - ISP returns fake IP addresses for blocked domains
 2. **SNI Inspection** - DPI (Deep Packet Inspection) reads the Server Name Indication field in TLS ClientHello to identify and block connections
 
-SplitHello defeats both:
+SplitHello handles both without a VPN or a remote payload relay on the normal
+data path.
+
+### Default operating mode: adaptive learning
+
+Adaptive learning is the default; no strategy flag is required:
+
+1. Intercept the application's outbound TCP/443 flow and recover its hostname.
+2. Try the original ClientHello unchanged as a differential baseline.
+3. Only if that baseline fails, probe the bounded TLS-record and packet-level
+   profile set on fresh direct connections.
+4. Accept a profile only after a complete ServerHello or HelloRetryRequest.
+5. Persist only the successful bypass profile for the current Windows network
+   identity and hostname. Healthy destinations require no learned record.
+
+On later connections, a learned winner is tried first. A stale winner is
+downgraded after one failure and evicted after two; if the untouched baseline
+works again, the stale mapping is removed immediately. Entries expire after
+seven days so the engine periodically relearns changed network behavior.
 
 ### Transparent WinDivert interception
 
@@ -32,6 +52,7 @@ behavior. Other UDP traffic, including Discord voice ports, is not redirected
 or blocked.
 
 ### DNS Bypass
+
 SplitHello transparently captures UDP/53. A/AAAA lookups warm one shared
 dual-stack cache so the relay can race IPv4 and IPv6; other query types preserve
 the original wire message through an authenticated Cloudflare Worker endpoint.
@@ -47,14 +68,16 @@ Eyeballs.
 ### Packet and TLS transformation
 
 WinDivert is also used as a packet rewriter on the relay's direct connection.
-The adaptive pool includes reverse-order TCP segments, fake cover ClientHellos
-with bad sequence/checksum/AutoTTL disposal, sequence overlap, IPv4
-fragmentation, and valid TLS record fragmentation. IPv6 uses the reverse-order
-fallback for the IP-fragment profile because IPv6 needs a Fragment extension
-header rather than the IPv4 fragment fields.
+When the untouched baseline fails, the learning pool can try reverse-order TCP
+segments, fake cover ClientHellos with bad sequence/checksum/AutoTTL disposal,
+sequence overlap, IPv4 fragmentation, and valid TLS record fragmentation. IPv6
+uses the reverse-order fallback for the IP-fragment profile because IPv6 needs
+a Fragment extension header rather than the IPv4 fragment fields.
 
-### TLS Record Fragmentation
-Instead of sending the TLS ClientHello as a single record, SplitHello splits it into **multiple valid TLS records**, cutting the SNI hostname apart:
+### TLS record fragmentation (one profile family)
+
+This profile family splits one TLS ClientHello into **multiple valid TLS
+records**, cutting the SNI hostname apart:
 
 ```
 Original (blocked):
@@ -66,31 +89,33 @@ SplitHello (passes through):
                                                  --> Connection established!
 ```
 
-This is a completely valid TLS operation - the RFC allows handshake messages to span multiple records. The server reassembles them normally, but the DPI system fails to extract the SNI.
+This is a valid TLS operation: the RFC allows handshake messages to span
+multiple records. The server reassembles them normally; DPI implementations
+that do not perform equivalent reassembly fail to extract the complete SNI.
 
-### Strategy Engine
+### DPI diagnosis and profile learning
 
 One split point does not defeat every DPI box: some reassemble TLS records, some
-only inspect the first TCP segment, some key on the record boundary. SplitHello
-ships several profiles and performs a differential probe. An unknown path is
-first tried untouched; only a failure advances to fragmentation profiles. The
-winner is remembered per Windows network profile and domain in
-`%APPDATA%\splithello\strategies.json`.
+only inspect the first TCP segment, and some key on the record boundary. The
+engine therefore compares several profiles, but pays that discovery cost only
+for an unknown or changed blocked path. Learned bypass winners are kept in
+`%APPDATA%\splithello\strategies.json`, scoped by Windows network identity and
+hostname (maximum 1,000 live entries, seven-day TTL).
 
 | Profile | What it does |
 |---|---|
+| `none` | Untouched ClientHello; the baseline for an unknown path and never persisted as a bypass winner |
+| `sni-mid` | One cut in the middle of the SNI hostname |
+| `record-1` | Cut after the first payload byte (splits the handshake header) |
 | `packet-reverse` | Send the second ClientHello segment before the first |
 | `packet-ipfrag` | Fragment below TCP on IPv4; reverse disorder fallback on IPv6 |
 | `packet-fake-badseq` | Prepend an out-of-window cover-SNI ClientHello |
 | `packet-autottl` | Infer path hops and expire the cover before the server |
 | `packet-seqovl` | Use sequence overlap so DPI and the server see different bytes |
-| `packet-fake-badsum` | Prepend a bad-checksum cover-SNI ClientHello |
-| `sni-mid` | One cut in the middle of the SNI hostname |
-| `record-1` | Cut after the first payload byte (splits the handshake header) |
 | `sni-pre` | Cut immediately before the hostname starts |
 | `sni-multi` | Four cuts: header, before, inside and after the hostname |
+| `packet-fake-badsum` | Prepend a bad-checksum cover-SNI ClientHello |
 | `sni-mid-slow` | SNI cut plus 4-byte writes and a longer pause |
-| `none` | Send the ClientHello untouched |
 
 A profile only "worked" after a complete TLS ServerHello or HelloRetryRequest.
 TLS Alerts, non-TLS block pages, partial records, silent drops, FIN and RST are
@@ -106,7 +131,8 @@ proof of censorship.
 
 ClientHello can be followed by TLS 1.3 0-RTT data. During diagnosis only the
 ClientHello is replayed; pipelined data is sent exactly once to the winning
-connection. `--strategy <name>` still pins a profile for controlled testing.
+connection. `--strategy <name>` pins a profile for controlled testing and
+disables learning for that run; it is not needed for normal operation.
 
 The **ECH** extension (RFC 9849) is not treated as proof that the inner hello is
 encrypted: Chromium also sends GREASE ECH when the DNS HTTPS record has no ECH
@@ -125,16 +151,16 @@ Application (Discord, Browser, etc.)
     v
 [SplitHello - Local Relay] ([::]:1080)
     | 1. Reassembles ClientHello and recovers SNI
-    | 2. DNS resolution via Cloudflare Worker (bypasses poisoning)
-    | 3. Direct TCP connection to the real IP (Happy Eyeballs)
-    | 4. Differential probe (packet rewriting + TLS fragmentation)
-    | 5. Strategy learned per network + domain with expiry
+    | 2. Reuses the application's validated IP and shared DNS cache
+    | 3. Opens a direct TCP connection (dual-stack Happy Eyeballs)
+    | 4. Tries learned winner, or untouched baseline before bounded probes
+    | 5. Persists only a proven bypass winner per network + hostname
     v
 [Target Server] (e.g., Discord 162.159.x.x)
 ```
 
 - No VPN, no tunnel, no external relay server on the data path
-- Direct connection to the target - minimal latency impact
+- Direct connection to the target; learned winners avoid repeated profile scans
 - All applications' TCP/443 flows are covered without per-app proxy settings
 - SplitHello's own Worker traffic uses a private bypass port to avoid recursion
 - The Cloudflare Worker normally handles DNS only; payload relay is used only
@@ -207,9 +233,10 @@ splithello.exe
 
 The first normal run displays a Windows UAC prompt and then lives in the system
 tray. Start/Stop controls remove or restore the WinDivert path without closing
-the tray controller. QUIC is passed through unchanged by default so already
-working HTTP/3 services such as YouTube keep their native fast path; adaptive
-and block modes remain available through `--quic-mode`.
+the tray controller. TCP DPI learning is always adaptive unless `--strategy`
+pins a diagnostic profile. QUIC is a separate policy: it passes unchanged by
+default so working HTTP/3 services such as YouTube keep their native fast path;
+adaptive and block modes remain available through `--quic-mode`.
 
 The network path is fail-open. Transient WinDivert resource errors are retried
 three times with short backoff; a persistent reader or relay failure closes the
@@ -226,8 +253,8 @@ archives older than seven days are removed during startup.
 --redeploy           Redeploy Worker code and rotate the shared secret
 --worker <url>       Override Worker URL manually
 --port <port>        Transparent relay port (default: 1080)
---split-delay <ms>   Pause between fragments (default: 20)
---strategy <name>    Force one profile instead of auto-selection
+--split-delay <ms>   Pause between TLS record fragments (default: 20)
+--strategy <name>    Diagnostic: pin one profile and disable learning
 --tunnel-fallback    Fall back to the Worker tunnel when every profile fails
 --manual-proxy       Disable WinDivert; listen for explicit SOCKS5/CONNECT
 --quic-mode <mode>   allow (default), adaptive or block
@@ -235,7 +262,7 @@ archives older than seven days are removed during startup.
 --restore-proxy      Restore a proxy backup left by a crash, then exit
 --forget-token       Delete the stored Cloudflare token, then exit
 --forget-strategies  Reset learned per-domain strategies, then exit
---list-strategies    List fragmentation profiles, then exit
+--list-strategies    List DPI adaptation profiles, then exit
 --console            Run in a console instead of the system tray
 --verbose            Enable console-mode debug logging
 ```
@@ -260,7 +287,7 @@ to keep both sides in sync is to let `--setup` do it.
 | | GoodbyeDPI | SplitHello |
 |---|---|---|
 | **Level** | Packet (WinDivert kernel driver) | Packet rewriting + stateful TLS relay (WinDivert) |
-| **Technique** | Fake packets, TCP segmentation, TTL tricks | Fake/disorder/overlap/AutoTTL/IP-fragment + TLS records |
+| **Technique** | Fake packets, TCP segmentation, TTL tricks | Differential baseline + learned fake/disorder/overlap/AutoTTL/IP-fragment/TLS-record profiles |
 | **DNS** | Doesn't handle DNS poisoning | Transparent raw DNS wire forwarding via authenticated DoH |
 | **Scope** | Filter-dependent TCP traffic | All non-loopback TCP/443; UDP/443 unchanged by default |
 | **Dependencies** | WinDivert driver | WinDivert 2.2.2 + Windows WinHTTP |
@@ -275,7 +302,7 @@ to keep both sides in sync is to let `--setup` do it.
 - **Manual recovery:** HTTP CONNECT + SOCKS5 (`--manual-proxy`)
 - **Worker:** authenticated raw DNS, direct-resolution and optional tunnel endpoints
 - **Config:** `%APPDATA%\splithello\config.json`
-- **Learned strategies:** `%APPDATA%\splithello\strategies.json` (network-scoped, seven-day TTL)
+- **Learned strategies:** `%APPDATA%\splithello\strategies.json` (proven bypass winners only; network-scoped, maximum 1,000 live entries, seven-day TTL)
 - **Runtime log:** `%APPDATA%\splithello\splithello.log` (512 KiB plus two backups; no secrets; seven-day archive retention).
   It records startup/shutdown, learned bypasses, profile changes, QUIC fallback,
   slow paths and failures; ordinary DNS and successful `none` traffic is omitted.
@@ -284,13 +311,14 @@ to keep both sides in sync is to let `--setup` do it.
 
 ## Not Yet Implemented
 
-- Tray application (on/off, connection test, active strategy, proxy status)
+- Tray connection test and live active-strategy/flow statistics (Start/Stop,
+  startup control, automatic recovery and log access are implemented)
 - `wrangler login --use-keyring` OAuth instead of pasting an API token
 - Fuzzing, GitHub Actions CI, signed releases, auto-update
 - Full QUIC Initial decryption/re-encryption and CRYPTO-frame fragmentation. The
   current adaptive QUIC mode implements the lower-risk pre-Initial prime and a
   measured TCP fallback; it does not alter encrypted QUIC CRYPTO frames.
-- Per-process include/exclude UI and live flow statistics.
+- Per-process include/exclude controls.
 
 ## License
 

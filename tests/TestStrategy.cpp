@@ -202,10 +202,33 @@ TEST(StoreRemembersAcrossReloads) {
     std::filesystem::remove(path);
 }
 
+TEST(UntouchedBaselineIsNotPersistedAsLearnedState) {
+    const std::string path = tempStorePath("splithello_test_clean_baseline.json");
+    std::filesystem::remove(path);
+
+    {
+        strategy::Store store(path);
+        store.remember("home-network", "discord.com", "sni-mid",
+                       diagnosis::Kind::SniInterferenceLikely, 92);
+        CHECK_EQ(store.size(), (size_t)1);
+
+        store.remember("home-network", "discord.com", "none",
+                       diagnosis::Kind::NoInterference, 95);
+        CHECK_EQ(store.size(), (size_t)0);
+        CHECK_EQ(store.lookup("home-network", "discord.com"), std::string());
+    }
+
+    strategy::Store reloaded(path);
+    reloaded.load();
+    CHECK_EQ(reloaded.size(), (size_t)0);
+
+    std::filesystem::remove(path);
+}
+
 TEST(StoreDropsProfilesThisBuildDoesNotKnow) {
     const std::string path = tempStorePath("splithello_test_unknown_profile.json");
     const std::string content =
-        R"({"version":1,"domains":{"a.test":"sni-mid","b.test":"retired-profile"}})";
+        R"({"version":1,"domains":{"a.test":"sni-mid","b.test":"retired-profile","c.test":"none"}})";
 
     std::filesystem::remove(path);
     {
@@ -221,6 +244,7 @@ TEST(StoreDropsProfilesThisBuildDoesNotKnow) {
     CHECK_EQ(store.size(), (size_t)1);
     CHECK_EQ(store.lookup("a.test"), std::string("sni-mid"));
     CHECK_EQ(store.lookup("b.test"), std::string());
+    CHECK_EQ(store.lookup("c.test"), std::string());
 
     std::filesystem::remove(path);
 }

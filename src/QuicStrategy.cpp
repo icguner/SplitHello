@@ -56,7 +56,10 @@ std::string AdaptiveRegistry::flowKey(const std::string& server,
     return server + "|" + std::to_string(localPort);
 }
 
-void AdaptiveRegistry::purge(uint64_t nowMs) {
+void AdaptiveRegistry::purgeIfDue(uint64_t nowMs) {
+    if (nowMs < nextPurgeAtMs_) return;
+    nextPurgeAtMs_ = nowMs + std::min<uint64_t>(responseTimeoutMs_, 1000);
+
     for (auto it = flows_.begin(); it != flows_.end();) {
         if (nowMs - it->second.touchedMs > fallbackMs_) {
             it = flows_.erase(it);
@@ -77,12 +80,18 @@ Decision AdaptiveRegistry::outbound(const std::string& server,
                                     uint16_t localPort, bool initial,
                                     uint64_t nowMs) {
     std::lock_guard lock(mutex_);
-    purge(nowMs);
+    purgeIfDue(nowMs);
 
     const auto blocked = blockedUntil_.find(server);
-    if (blocked != blockedUntil_.end() && blocked->second > nowMs) {
-        return Decision::Drop;
+    if (blocked != blockedUntil_.end()) {
+        if (blocked->second > nowMs) return Decision::Drop;
+        blockedUntil_.erase(blocked);
     }
+
+    // Only Initial packets participate in learning. Tracking every UDP/443
+    // datagram put a global lock, string allocation and map scan on QUIC's hot
+    // data path, and a pre-Initial datagram could suppress the real probe.
+    if (!initial) return Decision::Pass;
 
     const std::string key = flowKey(server, localPort);
     auto [it, inserted] = flows_.try_emplace(key, Flow{nowMs, nowMs, false});
@@ -101,7 +110,7 @@ Decision AdaptiveRegistry::outbound(const std::string& server,
 void AdaptiveRegistry::inbound(const std::string& server, uint16_t localPort,
                                uint64_t nowMs) {
     std::lock_guard lock(mutex_);
-    purge(nowMs);
+    purgeIfDue(nowMs);
     const auto it = flows_.find(flowKey(server, localPort));
     if (it == flows_.end()) return;
     it->second.answered = true;
@@ -113,6 +122,7 @@ void AdaptiveRegistry::clear() {
     std::lock_guard lock(mutex_);
     flows_.clear();
     blockedUntil_.clear();
+    nextPurgeAtMs_ = 0;
 }
 
 } // namespace quic_strategy

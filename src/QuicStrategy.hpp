@@ -44,10 +44,11 @@ private:
     };
 
     std::string flowKey(const std::string& server, uint16_t localPort) const;
-    void purge(uint64_t nowMs);
+    void purgeIfDue(uint64_t nowMs);
 
     uint64_t responseTimeoutMs_;
     uint64_t fallbackMs_;
+    uint64_t nextPurgeAtMs_ = 0;
     std::mutex mutex_;
     std::unordered_map<std::string, Flow> flows_;
     std::unordered_map<std::string, uint64_t> blockedUntil_;

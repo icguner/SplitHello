@@ -7,6 +7,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
 
 namespace {
 
@@ -150,7 +151,7 @@ bool DirectRelay::collectClientHello() {
     clientBuffer_.clear();
     helloComplete_ = false;
 
-    std::vector<uint8_t> chunk(16384);
+    std::array<uint8_t, 16384> chunk;
     unsigned timeoutMs = kClientFirstByteTimeoutMs;
 
     while (true) {
@@ -271,8 +272,9 @@ bool DirectRelay::writePlan(const strategy::FragmentPlan& plan) {
 }
 
 diagnosis::ProbeSignal DirectRelay::awaitResponse(std::vector<uint8_t>& out) {
-    std::vector<uint8_t> buffer(kProbeReadBufferSize);
+    std::array<uint8_t, kProbeReadBufferSize> buffer;
     out.clear();
+    if (out.capacity() < kProbeReadBufferSize) out.reserve(kProbeReadBufferSize);
 
     const ULONGLONG deadline = GetTickCount64() + context_.probeTimeoutMs;
     while (out.size() < kMaxProbeResponse) {
@@ -343,6 +345,7 @@ bool DirectRelay::deliverHello() {
 
     size_t attempts = 0;
     std::vector<diagnosis::Attempt> evidence;
+    evidence.reserve(std::min(order.size(), kMaxProbeAttempts));
     for (const std::string& profile : order) {
         if (attempts >= kMaxProbeAttempts) break;
 
@@ -392,8 +395,12 @@ bool DirectRelay::deliverHello() {
             if (!context_.forcedProfile.empty()) {
                 spdlog::debug("{}: '{}' (zorlanan)", targetHost_, profile);
             } else {
-                context_.strategies->remember(context_.networkId, targetHost_, profile,
-                                              verdict.kind, verdict.confidence);
+                // A healthy baseline has no state to learn. Only touch the
+                // store when recording a bypass or removing a stale winner.
+                if (profile != "none" || !remembered.empty()) {
+                    context_.strategies->remember(context_.networkId, targetHost_, profile,
+                                                  verdict.kind, verdict.confidence);
+                }
                 const bool newlyLearned = profile != remembered || attempts > 1;
                 if (verdict.kind == diagnosis::Kind::NoInterference) {
                     spdlog::trace("{}: normal TLS, sure={}ms", targetHost_,
@@ -483,7 +490,7 @@ void DirectRelay::run() {
 }
 
 void DirectRelay::pumpClientToTarget() {
-    std::vector<uint8_t> buffer(kPumpBufferSize);
+    std::array<uint8_t, kPumpBufferSize> buffer;
 
     while (running_) {
         const int received = recv(clientSock_, (char*)buffer.data(), (int)buffer.size(), 0);
@@ -494,7 +501,7 @@ void DirectRelay::pumpClientToTarget() {
 }
 
 void DirectRelay::pumpTargetToClient() {
-    std::vector<uint8_t> buffer(kPumpBufferSize);
+    std::array<uint8_t, kPumpBufferSize> buffer;
 
     while (running_) {
         const int received = recv(targetSock_, (char*)buffer.data(), (int)buffer.size(), 0);
