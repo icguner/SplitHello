@@ -145,9 +145,30 @@ left untouched.
 Double-click the SplitHello tray icon, or choose **Teşhis panelini aç**, to see
 the current engine session and the last 1, 7 or 30 days of completed TLS
 decisions. The live strip reports active and still-unclassified flows, session
-decisions and active/used strategies. The dashboard keeps the differential
-evidence together instead of reducing every failure to a generic "blocked"
-counter:
+decisions and active/used strategies. It is drawn natively with Direct2D and
+DirectWrite (no embedded browser), is DPI- and dark-mode-aware, and exposes its
+time-range selector, host search, outcome/sort filters, refresh, connection test
+and process-scope editor as real Win32 controls so keyboard and screen-reader
+users can operate it.
+
+The panel is laid out as a technical bulletin rather than a widget dashboard:
+there are no cards or shadows, content sits on a warm paper ground, and numbered
+sections separated by hairline rules carry the hierarchy. Colour is reserved for
+meaning and is never decorative — exactly four signals are used, and each means
+the same thing wherever it appears:
+
+| signal | meaning |
+|---|---|
+| quiet grey | untouched baseline; nothing was done, so it recedes |
+| prussian | SplitHello intervened and a profile won |
+| vermillion | unresolved; no successful counter-experiment |
+| amber | caution: a slow duration or a qualified test result |
+
+A window with no incidents therefore shows almost no colour, and a single
+vermillion mark in the ledger margin is enough to find the one flow that failed.
+
+The dashboard keeps the differential evidence together instead of reducing every
+failure to a generic "blocked" counter:
 
 - untouched baseline result (`ServerHello`, timeout, RST, TLS Alert, FIN or an
   unexpected response),
@@ -155,10 +176,31 @@ counter:
 - winning profile, diagnosis and confidence,
 - learned-profile cache hits, unresolved decisions and daily totals.
 
+Beyond the raw counters it reports the statistics that make those counters
+actionable:
+
+- **Trend.** Each summary card compares the selected window against the
+  immediately preceding window of equal length and shows the signed change,
+  coloured by whether that direction is good for the metric.
+- **Latency order statistics.** Averages hide the tail that actually hurts, so
+  the panel reports p50/p90/p99 (exact, not histogram estimates) beside a
+  duration histogram banded at 200 ms and 800 ms.
+- **Daily volume.** A stacked clean/bypassed/unresolved chart with real
+  gridlines and axis labels; hovering a day reads out its exact breakdown.
+- **Most-affected hosts.** Ranked by how often a host actually needed
+  intervention, with the bypassed-vs-unresolved mix shown per host.
+- **Ledger filtering.** Free-text host search, an outcome filter
+  (all/bypassed/clean/unresolved) and ordering by newest, slowest or most
+  attempts.
+
 The panel deliberately labels a timeout/reset-only sequence as a transport
 failure, not confirmed censorship. "SNI interference likely" requires a
 successful transformed counter-test, or is shown at lower confidence when a
 previously learned winner succeeds without repeating the baseline.
+
+The palette follows the system light/dark setting. Set `SPLITHELLO_THEME` to
+`light` or `dark` to force one, which is useful when reproducing a rendering
+report without changing the machine's appearance.
 
 Events are stored only in `%APPDATA%\splithello\telemetry.db`. SQLite writes
 run on one background writer thread in WAL mode; the relay hot path only moves
@@ -169,7 +211,7 @@ block with atomic integer updates, so the one-second dashboard refresh neither
 scans SQLite nor adds per-packet I/O. Historical data refreshes every ten
 seconds.
 
-The embedded dashboard has no external assets and normally makes no network
+The native dashboard has no external assets and normally makes no network
 requests. **Bağlantıyı test et** is the only exception: when explicitly clicked,
 it sends one HTTPS `HEAD` request to `www.example.com` through the normal
 transparent relay. A successful result verifies the local relay chain; by
@@ -224,7 +266,7 @@ Application (Discord, Browser, etc.)
 Tray controller
     | Reads the same WAL database without blocking the engine
     v
-[Local WebView2 diagnostics panel]
+[Local native Direct2D diagnostics panel]
 ```
 
 - No VPN, no tunnel, no external relay server on the data path
@@ -271,7 +313,6 @@ Tray controller
 - [CMake](https://cmake.org/download/) 3.20+
 - [Visual Studio](https://visualstudio.microsoft.com/) with C++ workload (or Build Tools)
 - [Node.js](https://nodejs.org/) 20+ with npm/npx (used to run Wrangler 4)
-- [Microsoft Edge WebView2 Runtime](https://learn.microsoft.com/microsoft-edge/webview2/concepts/distribution) (normally already present on Windows 10/11)
 - A free [Cloudflare](https://dash.cloudflare.com/sign-up) account
 - Administrator permission at runtime (required to load WinDivert's signed WFP driver)
 
@@ -394,16 +435,17 @@ to keep both sides in sync is to let `--setup` do it.
 | **Technique** | Fake packets, TCP segmentation, TTL tricks | Differential baseline + learned fake/disorder/overlap/AutoTTL/IP-fragment/TLS-record profiles |
 | **DNS** | Doesn't handle DNS poisoning | Transparent raw DNS wire forwarding via authenticated DoH |
 | **Scope** | Filter-dependent TCP traffic | All non-loopback TCP/443; UDP/443 unchanged by default |
-| **Dependencies** | WinDivert driver | WinDivert 2.2.2 + SQLite + WebView2 Runtime + Windows WinHTTP |
+| **Dependencies** | WinDivert driver | WinDivert 2.2.2 + SQLite + Windows Direct2D/DirectWrite + WinHTTP |
 | **Admin required** | Yes | Yes, only for transparent mode |
 | **Gaming impact** | Can affect broad traffic | Non-443 game/voice traffic bypasses the filter |
 
 ## Technical Details
 
 - **Language:** C++20
-- **Dependencies:** spdlog, the pinned official SQLite amalgamation and pinned
-  Microsoft WebView2 SDK loader, plus pinned WinDivert 2.2.2 (auto-fetched);
-  WebView2 Runtime, WinHTTP / IP Helper / ws2_32 / crypt32 / bcrypt / ole32 are supplied by Windows
+- **Dependencies:** spdlog and the pinned official SQLite amalgamation, plus
+  pinned WinDivert 2.2.2 (auto-fetched); the native dashboard uses
+  Direct2D / DirectWrite, and DWM / UxTheme / WinHTTP / IP Helper / ws2_32 /
+  crypt32 / bcrypt / ole32 are supplied by Windows
 - **Ingress:** WinDivert transparent TCP/443 reflection; pass-through UDP/443 by default (IPv4 + IPv6)
 - **Manual recovery:** HTTP CONNECT + SOCKS5 (`--manual-proxy`)
 - **Worker:** authenticated raw DNS, direct-resolution and optional tunnel endpoints
@@ -433,6 +475,6 @@ to keep both sides in sync is to let `--setup` do it.
 
 SplitHello is MIT licensed. WinDivert is distributed separately under its
 LGPLv3/GPLv2 dual license; `WinDivert-LICENSE.txt` is copied beside every build.
-SQLite is in the public domain. The Microsoft WebView2 SDK license and notices
-are copied beside every build as `WebView2-LICENSE.txt` and
-`WebView2-NOTICE.txt`.
+SQLite is in the public domain. The diagnostics dashboard renders with the
+Direct2D and DirectWrite components that ship with Windows, so no third-party UI
+runtime is bundled.

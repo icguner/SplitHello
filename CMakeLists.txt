@@ -42,28 +42,8 @@ if(MSVC)
     target_compile_options(sqlite3 PRIVATE /W0)
 endif()
 
-# The panel uses the Evergreen WebView2 Runtime already present on supported
-# Windows versions. Statically link Microsoft's loader so no loader DLL is
-# required beside splithello.exe.
-FetchContent_Declare(
-    webview2
-    URL      https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/1.0.4129.50/microsoft.web.webview2.1.0.4129.50.nupkg
-    URL_HASH SHA256=D3934F482D484B89FB4825DF720C710664E1143A1E90F7B3A60794EF33F473D2
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-)
-FetchContent_MakeAvailable(webview2)
-
-if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    set(WEBVIEW2_ARCH_DIR x64)
-else()
-    set(WEBVIEW2_ARCH_DIR x86)
-endif()
-
-add_library(webview2_loader STATIC IMPORTED GLOBAL)
-set_target_properties(webview2_loader PROPERTIES
-    IMPORTED_LOCATION "${webview2_SOURCE_DIR}/build/native/${WEBVIEW2_ARCH_DIR}/WebView2LoaderStatic.lib"
-    INTERFACE_INCLUDE_DIRECTORIES "${webview2_SOURCE_DIR}/build/native/include"
-)
+# The diagnostics panel renders natively with Direct2D/DirectWrite (see
+# src/DashboardPanel.cpp). Those are OS components, so no package is fetched.
 
 # WinDivert ships signed WFP drivers and import libraries in its official
 # binary archive. Pin both the version and archive hash so a build can never
@@ -105,23 +85,6 @@ add_custom_command(
             -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedWorker.cmake
     DEPENDS ${WORKER_SOURCE} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedWorker.cmake
     COMMENT "worker/src/index.js gomuluyor"
-    VERBATIM
-)
-
-# ---- Local dashboard source, embedded into the Win32 panel ----
-set(DASHBOARD_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/ui/dashboard.html)
-set(DASHBOARD_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/DashboardSource.g.hpp)
-
-add_custom_command(
-    OUTPUT ${DASHBOARD_HEADER}
-    COMMAND ${CMAKE_COMMAND}
-            -DINPUT=${DASHBOARD_SOURCE}
-            -DOUTPUT=${DASHBOARD_HEADER}
-            -DVARIABLE=kDashboardHtml
-            -DRAW_DELIMITER=SHDASH
-            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedText.cmake
-    DEPENDS ${DASHBOARD_SOURCE} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedText.cmake
-    COMMENT "Yerel teshis paneli gomuluyor"
     VERBATIM
 )
 
@@ -174,21 +137,23 @@ add_executable(splithello
     src/WinDivertInterceptor.cpp
     src/WsClient.cpp
     ${WORKER_HEADER}
-    ${DASHBOARD_HEADER}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/splithello.manifest
 )
 
 target_include_directories(splithello PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}/generated
-    ${webview2_SOURCE_DIR}/build/native/include
 )
 target_link_libraries(splithello PRIVATE
     splithello_core
     windivert_import
-    webview2_loader
     shell32
     advapi32
     shlwapi
     version
+    d2d1
+    dwrite
+    dwmapi
+    uxtheme
 )
 
 add_custom_command(TARGET splithello POST_BUILD
@@ -201,12 +166,6 @@ add_custom_command(TARGET splithello POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${windivert_SOURCE_DIR}/LICENSE"
             "$<TARGET_FILE_DIR:splithello>/WinDivert-LICENSE.txt"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${webview2_SOURCE_DIR}/LICENSE.txt"
-            "$<TARGET_FILE_DIR:splithello>/WebView2-LICENSE.txt"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${webview2_SOURCE_DIR}/NOTICE.txt"
-            "$<TARGET_FILE_DIR:splithello>/WebView2-NOTICE.txt"
     COMMENT "WinDivert runtime ve imzali surucu kopyalaniyor"
 )
 

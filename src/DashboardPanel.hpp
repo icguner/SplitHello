@@ -4,8 +4,9 @@
 #include <memory>
 #include <string>
 
-// Lazy WebView2 host for the local diagnostics dashboard. The implementation
-// lives behind a pimpl so WebView2 headers do not leak into the tray code.
+// Native Direct2D/DirectWrite host for the local diagnostics dashboard. The
+// implementation lives behind a pimpl so the Win32/Direct2D headers do not leak
+// into the tray code.
 class DashboardPanel {
 public:
     DashboardPanel(std::string telemetryPath, std::wstring liveStatsName,
