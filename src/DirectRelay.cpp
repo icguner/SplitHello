@@ -3,6 +3,7 @@
 #include "PacketStrategy.hpp"
 #include "Relay.hpp"
 #include "TcpConnect.hpp"
+#include "Telemetry.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -314,6 +315,33 @@ bool DirectRelay::flushTrailingClientData() {
                         clientBuffer_.size() - hello_.recordTotalLength);
 }
 
+void DirectRelay::recordTelemetry(
+    const std::vector<diagnosis::Attempt>& evidence,
+    const diagnosis::Verdict& verdict,
+    const std::string& rememberedProfile,
+    bool success,
+    uint64_t totalElapsedMs) {
+    if (success && !verdict.winningProfile.empty()) {
+        liveFlow_.setProfile(verdict.winningProfile);
+    }
+    liveFlow_.decision(
+        success, success && verdict.winningProfile != "none");
+
+    if (!context_.telemetry) return;
+
+    telemetry::ProbeRecord record;
+    record.networkId = context_.networkId;
+    record.host = targetHost_;
+    record.rememberedProfile = rememberedProfile;
+    record.verdict = verdict;
+    record.attempts = evidence;
+    record.totalElapsedMs = static_cast<unsigned>(
+        std::min<uint64_t>(totalElapsedMs, 0xFFFFFFFFULL));
+    record.success = success;
+    record.forced = !context_.forcedProfile.empty();
+    context_.telemetry->record(std::move(record));
+}
+
 bool DirectRelay::deliverHello() {
     if (clientBuffer_.empty()) return true; // server-first protocol: nothing to send yet
 
@@ -342,6 +370,7 @@ bool DirectRelay::deliverHello() {
                    ? std::vector<std::string>{"none"}
                    : std::vector<std::string>{context_.forcedProfile, "none"});
     const std::string remembered = context_.strategies->lookup(context_.networkId, targetHost_);
+    const ULONGLONG decisionStarted = GetTickCount64();
 
     size_t attempts = 0;
     std::vector<diagnosis::Attempt> evidence;
@@ -357,7 +386,12 @@ bool DirectRelay::deliverHello() {
         // blackholed, and the server has already seen a partial handshake.
         if (attempts > 0) {
             Sleep(kRetryPauseMs);
-            if (!reconnect()) return false;
+            if (!reconnect()) {
+                const diagnosis::Verdict verdict = diagnosis::infer(evidence);
+                recordTelemetry(evidence, verdict, remembered, false,
+                                GetTickCount64() - decisionStarted);
+                return false;
+            }
         }
         attempts++;
 
@@ -414,6 +448,8 @@ bool DirectRelay::deliverHello() {
                                   targetHost_, profile, evidence.back().elapsedMs);
                 }
             }
+            recordTelemetry(evidence, verdict, remembered, true,
+                            GetTickCount64() - decisionStarted);
             return true;
         }
 
@@ -426,6 +462,8 @@ bool DirectRelay::deliverHello() {
     }
 
     const diagnosis::Verdict verdict = diagnosis::infer(evidence);
+    recordTelemetry(evidence, verdict, remembered, false,
+                    GetTickCount64() - decisionStarted);
     spdlog::warn("{}:{} icin sonuc yok; teshis={} guven={}%",
                  targetHost_, targetPort_, diagnosis::name(verdict.kind), verdict.confidence);
     return false;
@@ -450,6 +488,7 @@ bool DirectRelay::handOffToTunnel() {
 
 void DirectRelay::run() {
     running_ = true;
+    liveFlow_.begin(context_.liveStats.get());
 
     // Transparent connections initially carry only an IP address. Buffering
     // first lets us recover SNI, resolve it over the Worker, and keep adaptive

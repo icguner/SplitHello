@@ -2,6 +2,7 @@
 
 #include "TransparentFlow.hpp"
 #include "PacketStrategy.hpp"
+#include "ProcessFilter.hpp"
 #include "QuicStrategy.hpp"
 
 #include <atomic>
@@ -16,7 +17,8 @@
 // Transparent network ingress for HTTPS and DNS. TCP/443 is reflected into the
 // TLS relay, UDP/53 into the local Worker-backed resolver, and the relay's
 // private connect port is mapped back to TCP/443. UDP/443 is optionally dropped
-// in-kernel so HTTP/3 clients fall back to the diagnosable TCP path.
+// so HTTP/3 clients fall back to the diagnosable TCP path. Process rules are
+// resolved once per new tuple and cached; the packet loop never opens a process.
 class WinDivertInterceptor {
 public:
     WinDivertInterceptor(transparent::FlowRegistry& flows,
@@ -24,7 +26,8 @@ public:
                          packet_strategy::PolicyRegistry& packetPolicies,
                          uint16_t proxyPort, uint16_t dnsProxyPort,
                          uint16_t connectPort,
-                         quic_strategy::Mode quicMode = quic_strategy::Mode::Allow);
+                         quic_strategy::Mode quicMode = quic_strategy::Mode::Allow,
+                         process_filter::Filter* processFilter = nullptr);
     ~WinDivertInterceptor();
 
     WinDivertInterceptor(const WinDivertInterceptor&) = delete;
@@ -43,6 +46,7 @@ private:
     uint16_t dnsProxyPort_;
     uint16_t connectPort_;
     quic_strategy::Mode quicMode_;
+    process_filter::Filter* processFilter_;
     quic_strategy::AdaptiveRegistry quicRegistry_;
 
     HANDLE packetHandle_ = INVALID_HANDLE_VALUE;

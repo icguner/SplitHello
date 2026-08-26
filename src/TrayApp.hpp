@@ -2,12 +2,15 @@
 
 #include "RecoveryPolicy.hpp"
 
+#include <memory>
 #include <string>
 #include <vector>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <shellapi.h>
+
+class DashboardPanel;
 
 class TrayApp {
 public:
@@ -21,6 +24,7 @@ public:
 
     TrayApp(std::vector<std::wstring> engineArguments,
             std::wstring logDirectory,
+            std::string telemetryPath,
             bool canStart);
     ~TrayApp();
 
@@ -54,13 +58,19 @@ private:
     bool setStartupEnabled(bool enabled) const;
     void toggleStartup();
     void openLogDirectory() const;
+    void openDashboard();
+    void restartEngineForConfiguration();
 
     std::vector<std::wstring> engineArguments_;
     std::wstring logDirectory_;
+    std::wstring liveStatsName_;
+    std::string telemetryPath_;
+    std::unique_ptr<DashboardPanel> dashboard_;
     bool canStart_ = false;
     bool startupEnabled_ = false;
     bool exiting_ = false;
     bool restartPending_ = false;
+    bool configurationRestartPending_ = false;
     uint64_t restartAtMs_ = 0;
     recovery::RestartBudget restartBudget_;
     EngineState state_ = EngineState::Stopped;

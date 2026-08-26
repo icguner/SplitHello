@@ -1,0 +1,7 @@
+record_handshake="\x16\x03\x01"
+client_hello="\x01"
+server_hello="\x02"
+change_cipher_spec="\x14\x03\x03"
+alert="\x15\x03\x03"
+sni_extension="\x00\x00"
+ech_extension="\xfe\x0d"

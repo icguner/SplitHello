@@ -2,11 +2,13 @@
 
 #include "Diagnosis.hpp"
 #include "Dns.hpp"
+#include "LiveStats.hpp"
 #include "Strategy.hpp"
 #include "TlsHello.hpp"
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -16,6 +18,7 @@
 #include <ws2tcpip.h>
 
 namespace packet_strategy { class PolicyRegistry; }
+namespace telemetry { class Store; }
 
 // Shared, read-only state handed to every connection.
 struct RelayContext {
@@ -25,6 +28,8 @@ struct RelayContext {
     dns::Resolver* resolver = nullptr;
     strategy::Store* strategies = nullptr;
     packet_strategy::PolicyRegistry* packetPolicies = nullptr;
+    std::shared_ptr<telemetry::Store> telemetry;
+    std::shared_ptr<live_stats::Publisher> liveStats;
     unsigned splitDelayMs = 20;
     unsigned probeTimeoutMs = 3000;
     bool tunnelFallback = false;
@@ -64,6 +69,7 @@ private:
     SOCKET clientSock_;
     SOCKET targetSock_ = INVALID_SOCKET;
     RelayContext context_;
+    live_stats::Flow liveFlow_;
     std::string targetHost_;
     uint16_t targetPort_;
     std::string originalTargetAddress_;
@@ -95,6 +101,10 @@ private:
 
     // Applies profiles in order until one draws a reply. False if none did.
     bool deliverHello();
+    void recordTelemetry(const std::vector<diagnosis::Attempt>& evidence,
+                         const diagnosis::Verdict& verdict,
+                         const std::string& rememberedProfile,
+                         bool success, uint64_t totalElapsedMs);
 
     bool writePlan(const strategy::FragmentPlan& plan);
     bool writeFragmented(const strategy::FragmentPlan& plan);

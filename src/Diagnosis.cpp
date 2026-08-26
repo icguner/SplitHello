@@ -92,6 +92,18 @@ const char* name(Kind kind) {
     return "unknown";
 }
 
+const char* signalName(ProbeSignal signal) {
+    switch (signal) {
+    case ProbeSignal::ServerHello: return "server-hello";
+    case ProbeSignal::Alert:       return "tls-alert";
+    case ProbeSignal::Timeout:     return "timeout";
+    case ProbeSignal::Reset:       return "reset";
+    case ProbeSignal::Closed:      return "closed";
+    case ProbeSignal::Unexpected:  return "unexpected";
+    }
+    return "unexpected";
+}
+
 const char* describe(ProbeSignal signal) {
     switch (signal) {
     case ProbeSignal::ServerHello: return "ServerHello";

@@ -52,6 +52,31 @@ uint8_t packetTtl(const WINDIVERT_IPHDR* ipv4,
     return ipv6 ? ipv6->HopLimit : 0;
 }
 
+process_filter::Endpoint processEndpoint(const WINDIVERT_IPHDR* ipv4,
+                                         const WINDIVERT_IPV6HDR* ipv6,
+                                         uint16_t sourcePort,
+                                         uint16_t destinationPort,
+                                         process_filter::Protocol protocol,
+                                         bool outbound) {
+    process_filter::Endpoint endpoint;
+    endpoint.ipv6 = ipv6 != nullptr;
+    endpoint.protocol = protocol;
+    endpoint.localPort = outbound ? sourcePort : destinationPort;
+    endpoint.remotePort = outbound ? destinationPort : sourcePort;
+    const void* sourceAddress = ipv4
+        ? static_cast<const void*>(&ipv4->SrcAddr)
+        : static_cast<const void*>(ipv6->SrcAddr);
+    const void* destinationAddress = ipv4
+        ? static_cast<const void*>(&ipv4->DstAddr)
+        : static_cast<const void*>(ipv6->DstAddr);
+    const size_t addressLength = ipv4 ? 4 : 16;
+    std::memcpy(endpoint.localAddress.data(),
+                outbound ? sourceAddress : destinationAddress, addressLength);
+    std::memcpy(endpoint.remoteAddress.data(),
+                outbound ? destinationAddress : sourceAddress, addressLength);
+    return endpoint;
+}
+
 std::vector<uint8_t> buildTcpVariant(
     const uint8_t* packet, UINT packetLength, const void* payload,
     const std::vector<uint8_t>& replacement, int32_t sequenceOffset,
@@ -168,14 +193,16 @@ WinDivertInterceptor::WinDivertInterceptor(transparent::FlowRegistry& flows,
                                            uint16_t proxyPort,
                                            uint16_t dnsProxyPort,
                                            uint16_t connectPort,
-                                           quic_strategy::Mode quicMode)
+                                           quic_strategy::Mode quicMode,
+                                           process_filter::Filter* processFilter)
     : flows_(flows)
     , datagrams_(datagrams)
     , packetPolicies_(packetPolicies)
     , proxyPort_(proxyPort)
     , dnsProxyPort_(dnsProxyPort)
     , connectPort_(connectPort)
-    , quicMode_(quicMode) {}
+    , quicMode_(quicMode)
+    , processFilter_(processFilter) {}
 
 WinDivertInterceptor::~WinDivertInterceptor() {
     stop();
@@ -194,7 +221,11 @@ bool WinDivertInterceptor::start() {
     }
 
     char filter[640] = {};
-    const char* adaptiveQuic = quicMode_ == quic_strategy::Mode::Adaptive
+    const bool processAwareQuicBlock =
+        quicMode_ == quic_strategy::Mode::Block && processFilter_ &&
+        processFilter_->enabled();
+    const char* capturedQuic =
+        quicMode_ == quic_strategy::Mode::Adaptive || processAwareQuicBlock
         ? " or (udp and ((outbound and udp.DstPort == 443) or "
           "(inbound and udp.SrcPort == 443)))"
         : "";
@@ -205,7 +236,7 @@ bool WinDivertInterceptor::start() {
         "(inbound and tcp.SrcPort == %u))) or "
         "(udp and outbound and (udp.DstPort == %u or udp.SrcPort == %u))%s)",
         kHttpsPort, connectPort_, proxyPort_, kHttpsPort,
-        kDnsPort, dnsProxyPort_, adaptiveQuic);
+        kDnsPort, dnsProxyPort_, capturedQuic);
     if (written <= 0 || written >= (int)sizeof(filter)) return false;
 
     std::array<char, 4096> compiledFilter{};
@@ -233,7 +264,7 @@ bool WinDivertInterceptor::start() {
     WinDivertSetParam(packetHandle_, WINDIVERT_PARAM_QUEUE_SIZE, 8 * 1024 * 1024);
     WinDivertSetParam(packetHandle_, WINDIVERT_PARAM_QUEUE_TIME, 1000);
 
-    if (quicMode_ == quic_strategy::Mode::Block) {
+    if (quicMode_ == quic_strategy::Mode::Block && !processAwareQuicBlock) {
         static constexpr const char* kQuicFilter =
             "udp and !loopback and ((outbound and udp.DstPort == 443) or "
             "(inbound and udp.SrcPort == 443))";
@@ -261,7 +292,9 @@ bool WinDivertInterceptor::start() {
     spdlog::info("WinDivert aktif: TCP/443 -> localhost:{}, DNS/53 -> localhost:{}",
                  proxyPort_, dnsProxyPort_);
     if (quicMode_ == quic_strategy::Mode::Block) {
-        spdlog::info("QUIC modu=block: UDP/443 istemcileri TCP'ye dusecek");
+        spdlog::info(processAwareQuicBlock
+            ? "QUIC modu=block: yalniz surec kuraliyla secilen UDP/443 akislari dusurulecek"
+            : "QUIC modu=block: UDP/443 istemcileri TCP'ye dusecek");
     } else if (quicMode_ == quic_strategy::Mode::Adaptive) {
         spdlog::info("QUIC modu=adaptive: Initial prime, yanitsiz hedefte otomatik TCP fallback");
     } else {
@@ -285,6 +318,7 @@ void WinDivertInterceptor::stop() {
     datagrams_.clear();
     packetPolicies_.clear();
     quicRegistry_.clear();
+    if (processFilter_) processFilter_->clear();
 }
 
 void WinDivertInterceptor::closeHandles() {
@@ -372,15 +406,25 @@ void WinDivertInterceptor::run() {
             if (parsed && tcp && (ipv4 || ipv6) && packetLength > 0) {
                 const uint16_t sourcePort = ntohs(tcp->SrcPort);
                 const uint16_t destinationPort = ntohs(tcp->DstPort);
+                const bool outbound = addresses[index].Outbound != 0;
                 const transparent::PacketRoute route = transparent::routePacket(
-                    addresses[index].Outbound != 0, sourcePort, destinationPort,
+                    outbound, sourcePort, destinationPort,
                     kHttpsPort, proxyPort_, connectPort_);
                 const std::string targetAddress =
                     route == transparent::PacketRoute::RedirectProxyToTarget
                         ? addressText(ipv4, ipv6, true)
                         : std::string{};
+                const bool processScoped = processFilter_ && processFilter_->enabled() &&
+                    (route == transparent::PacketRoute::ReflectClientToProxy ||
+                     (route == transparent::PacketRoute::RedirectTargetToProxy &&
+                      destinationPort != connectPort_));
+                const bool processBypass = processScoped &&
+                    !processFilter_->shouldIntercept(
+                        processEndpoint(ipv4, ipv6, sourcePort, destinationPort,
+                                        process_filter::Protocol::Tcp, outbound),
+                        outbound, outbound && tcp->Syn && !tcp->Ack);
 
-                switch (route) {
+                if (!processBypass) switch (route) {
                 case transparent::PacketRoute::ReflectClientToProxy:
                     if (tcp->Syn && !tcp->Ack) {
                         flows_.observe(addressText(ipv4, ipv6, true), sourcePort,
@@ -412,10 +456,13 @@ void WinDivertInterceptor::run() {
                     break;
                 }
 
-                WinDivertHelperCalcChecksums(packet, packetLength,
-                                              &addresses[index], 0);
+                if (!processBypass) {
+                    WinDivertHelperCalcChecksums(packet, packetLength,
+                                                  &addresses[index], 0);
+                }
 
-                if (route == transparent::PacketRoute::RedirectProxyToTarget &&
+                if (!processBypass &&
+                    route == transparent::PacketRoute::RedirectProxyToTarget &&
                     payload && payloadLength >= 2 &&
                     tls::looksLikeTlsRecord(static_cast<const uint8_t*>(payload),
                                             payloadLength)) {
@@ -504,8 +551,17 @@ void WinDivertInterceptor::run() {
                 const transparent::DatagramRoute route = transparent::routeDatagram(
                     addresses[index].Outbound != 0, sourcePort, destinationPort,
                     kDnsPort, dnsProxyPort_);
+                const bool processScoped = processFilter_ && processFilter_->enabled() &&
+                    ((outbound && (destinationPort == kDnsPort ||
+                                   destinationPort == kHttpsPort)) ||
+                     (!outbound && sourcePort == kHttpsPort));
+                const bool processBypass = processScoped &&
+                    !processFilter_->shouldIntercept(
+                        processEndpoint(ipv4, ipv6, sourcePort, destinationPort,
+                                        process_filter::Protocol::Udp, outbound),
+                        outbound, false);
 
-                switch (route) {
+                if (!processBypass) switch (route) {
                 case transparent::DatagramRoute::ReflectDnsToProxy:
                     datagrams_.observe(addressText(ipv4, ipv6, true), sourcePort);
                     udp->DstPort = htons(dnsProxyPort_);
@@ -523,11 +579,19 @@ void WinDivertInterceptor::run() {
                     break;
                 }
 
-                WinDivertHelperCalcChecksums(packet, packetLength,
-                                              &addresses[index], 0);
+                if (!processBypass) {
+                    WinDivertHelperCalcChecksums(packet, packetLength,
+                                                  &addresses[index], 0);
+                }
 
                 bool drop = false;
-                if (quicMode_ == quic_strategy::Mode::Adaptive &&
+                if (!processBypass && quicMode_ == quic_strategy::Mode::Block &&
+                    route == transparent::DatagramRoute::Pass &&
+                    ((outbound && destinationPort == kHttpsPort) ||
+                     (!outbound && sourcePort == kHttpsPort))) {
+                    drop = true;
+                } else if (!processBypass &&
+                    quicMode_ == quic_strategy::Mode::Adaptive &&
                     route == transparent::DatagramRoute::Pass) {
                     const uint64_t nowMs = GetTickCount64();
                     if (outbound && destinationPort == kHttpsPort) {

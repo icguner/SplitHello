@@ -140,6 +140,68 @@ configuration. SplitHello keeps safe profiles available and uses the visible
 outer SNI for scoping; a ClientHello that already spans TLS records is still
 left untouched.
 
+### Local diagnostics dashboard
+
+Double-click the SplitHello tray icon, or choose **Teşhis panelini aç**, to see
+the current engine session and the last 1, 7 or 30 days of completed TLS
+decisions. The live strip reports active and still-unclassified flows, session
+decisions and active/used strategies. The dashboard keeps the differential
+evidence together instead of reducing every failure to a generic "blocked"
+counter:
+
+- untouched baseline result (`ServerHello`, timeout, RST, TLS Alert, FIN or an
+  unexpected response),
+- every attempted profile and its elapsed time,
+- winning profile, diagnosis and confidence,
+- learned-profile cache hits, unresolved decisions and daily totals.
+
+The panel deliberately labels a timeout/reset-only sequence as a transport
+failure, not confirmed censorship. "SNI interference likely" requires a
+successful transformed counter-test, or is shown at lower confidence when a
+previously learned winner succeeds without repeating the baseline.
+
+Events are stored only in `%APPDATA%\splithello\telemetry.db`. SQLite writes
+run on one background writer thread in WAL mode; the relay hot path only moves
+a small record into a bounded 4,096-item queue. A saturated queue drops panel
+events instead of delaying network traffic. Data is pruned after 30 days and
+capped at 50,000 decisions. Live session counters use a versioned named-memory
+block with atomic integer updates, so the one-second dashboard refresh neither
+scans SQLite nor adds per-packet I/O. Historical data refreshes every ten
+seconds.
+
+The embedded dashboard has no external assets and normally makes no network
+requests. **Bağlantıyı test et** is the only exception: when explicitly clicked,
+it sends one HTTPS `HEAD` request to `www.example.com` through the normal
+transparent relay. A successful result verifies the local relay chain; by
+itself it is not proof that a site is or is not subject to DPI interference.
+The test also checks that the live opened-flow counter advanced; an ordinary
+HTTPS response without a relay observation is reported separately instead of
+as a false-positive relay success.
+
+### Per-process scope
+
+The **Süreç kapsamı** section in the dashboard persists include/exclude rules
+and restarts only the network-engine child process to apply them. Rules accept
+case-insensitive executable names, full paths, `*` and `?` wildcards. Exclude
+rules always win; if the include list is non-empty, unmatched processes stay on
+the normal Windows path. The same rules can be supplied repeatedly on the
+command line or stored in `%APPDATA%\splithello\config.json`:
+
+```json
+{
+  "process_include": ["chrome.exe", "firefox*.exe"],
+  "process_exclude": ["steam*.exe", "C:\\Games\\Legacy\\*"]
+}
+```
+
+WinDivert's network layer deliberately has no PID field, so SplitHello resolves
+the owning process only when a new TCP tuple or UDP socket first appears and
+caches that decision. Later packets perform only a bounded hash lookup; they do
+not enumerate processes or connection tables. A missing/ambiguous owner is
+fail-open and bypasses interception. With no process rules configured, the
+lookup path is completely disabled. See the
+[WinDivert layer capability table](https://github.com/basil00/WinDivert/wiki/WinDivert-Documentation#51-windivert_layer).
+
 ## Architecture
 
 ```
@@ -155,8 +217,14 @@ Application (Discord, Browser, etc.)
     | 3. Opens a direct TCP connection (dual-stack Happy Eyeballs)
     | 4. Tries learned winner, or untouched baseline before bounded probes
     | 5. Persists only a proven bypass winner per network + hostname
+    | 6. Queues completed evidence for local SQLite statistics
     v
 [Target Server] (e.g., Discord 162.159.x.x)
+
+Tray controller
+    | Reads the same WAL database without blocking the engine
+    v
+[Local WebView2 diagnostics panel]
 ```
 
 - No VPN, no tunnel, no external relay server on the data path
@@ -178,11 +246,13 @@ Application (Discord, Browser, etc.)
   rate-limiting binding, falling back to a per-isolate counter where that
   binding is unavailable. `/tunnel` only accepts ports 80, 443 and 853, validates
   the hostname, and refuses to open sockets to private or loopback addresses.
-- **Secrets at rest.** The Cloudflare API token and the shared secret are
-  encrypted with Windows DPAPI before being written to `config.json`, so only
-  the same Windows user on the same machine can read them. Configs written by
-  older versions are migrated on first run. `--forget-token` deletes the token
-  entirely; the Worker keeps running without it.
+- **Secrets at rest.** Cloudflare authentication is handled by
+  `wrangler login --use-keyring`: Wrangler keeps an encrypted credential file
+  whose key lives in Windows Credential Manager. SplitHello never reads or
+  stores that OAuth token. Only the Worker shared secret enters `config.json`,
+  encrypted with Windows DPAPI. API-token fields written by older releases are
+  removed automatically on first run; `--forget-token` remains as a compatible
+  manual cleanup command.
 - **Driver provenance.** CMake downloads the official WinDivert 2.2.2 binary
   archive with a pinned SHA-256 hash. The signed driver, DLL and WinDivert
   license are copied beside the executable. A mismatched archive fails the
@@ -200,6 +270,8 @@ Application (Discord, Browser, etc.)
 - Windows 10/11
 - [CMake](https://cmake.org/download/) 3.20+
 - [Visual Studio](https://visualstudio.microsoft.com/) with C++ workload (or Build Tools)
+- [Node.js](https://nodejs.org/) 20+ with npm/npx (used to run Wrangler 4)
+- [Microsoft Edge WebView2 Runtime](https://learn.microsoft.com/microsoft-edge/webview2/concepts/distribution) (normally already present on Windows 10/11)
 - A free [Cloudflare](https://dash.cloudflare.com/sign-up) account
 - Administrator permission at runtime (required to load WinDivert's signed WFP driver)
 
@@ -214,17 +286,45 @@ Note: with the Ninja generator, configure and build from a Developer Command
 Prompt so the MSVC include paths are set. The Visual Studio generator (the
 default) needs no special shell.
 
+### Fuzzing and CI
+
+The standalone `fuzz/` build keeps production Windows dependencies out of the
+sanitizer binaries and targets the three untrusted-input surfaces directly:
+TLS records, DNS messages and JSON. With Clang and Ninja installed:
+
+```bash
+cmake -S fuzz -B build-fuzz -G Ninja \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=clang++
+cmake --build build-fuzz --parallel
+./build-fuzz/fuzz_tls -max_total_time=60 -dict=fuzz/tls.dict
+./build-fuzz/fuzz_dns -max_total_time=60 -dict=fuzz/dns.dict
+./build-fuzz/fuzz_json -max_total_time=60 -dict=fuzz/json.dict
+```
+
+`.github/workflows/ci.yml` runs the full Windows Release build/tests and a
+Clang AddressSanitizer fuzz smoke job on every push and pull request. Crashing
+inputs are uploaded as short-lived workflow artifacts; successful Windows
+builds publish an explicitly **unsigned** seven-day artifact until release
+signing is configured.
+
 ### First Run (Setup)
 ```bash
 build\Release\splithello.exe --setup
 ```
 
 This will:
-1. Open your browser to create a Cloudflare API token
-2. Ask you to paste the token (input is hidden)
-3. Generate a random shared secret and deploy the Worker to your account
-4. Verify the deployment end to end
-5. Save config to `%APPDATA%\splithello\config.json` (secrets DPAPI-encrypted)
+1. Run Wrangler 4 and open Cloudflare's browser OAuth flow
+2. Store the OAuth session through Wrangler's Windows keyring backend
+3. Generate a random shared secret and pipe it to `wrangler secret put`
+4. Deploy the embedded Worker and verify it end to end
+5. Save only the DPAPI-encrypted Worker secret to
+   `%APPDATA%\splithello\config.json`
+
+`--setup` and `--redeploy` explicitly remove API-token environment variables
+from the Wrangler child process and force the keyring backend. The shared
+secret is passed over an anonymous stdin pipe; it is never written to a
+temporary file, command line or deployment log. `npx` may download/cache the
+latest compatible Wrangler 4 release on its first run.
 
 ### Usage
 ```bash
@@ -233,7 +333,8 @@ splithello.exe
 
 The first normal run displays a Windows UAC prompt and then lives in the system
 tray. Start/Stop controls remove or restore the WinDivert path without closing
-the tray controller. TCP DPI learning is always adaptive unless `--strategy`
+the tray controller. Double-clicking the icon opens the local diagnostics
+dashboard. TCP DPI learning is always adaptive unless `--strategy`
 pins a diagnostic profile. QUIC is a separate policy: it passes unchanged by
 default so working HTTP/3 services such as YouTube keep their native fast path;
 adaptive and block modes remain available through `--quic-mode`.
@@ -259,8 +360,10 @@ archives older than seven days are removed during startup.
 --manual-proxy       Disable WinDivert; listen for explicit SOCKS5/CONNECT
 --quic-mode <mode>   allow (default), adaptive or block
 --allow-quic         Backward-compatible alias for --quic-mode allow
+--include-process <pattern>  Process allow-list rule; repeat as needed
+--exclude-process <pattern>  Process bypass rule; repeat as needed
 --restore-proxy      Restore a proxy backup left by a crash, then exit
---forget-token       Delete the stored Cloudflare token, then exit
+--forget-token       Remove a legacy API-token config field, then exit
 --forget-strategies  Reset learned per-domain strategies, then exit
 --list-strategies    List DPI adaptation profiles, then exit
 --console            Run in a console instead of the system tray
@@ -276,8 +379,9 @@ the client binary at build time by `cmake/EmbedWorker.cmake`, so
 Deploying by hand:
 ```bash
 cd worker
-wrangler secret put SHARED_SECRET
-wrangler deploy
+npx wrangler login --use-keyring
+npx wrangler secret put SHARED_SECRET
+npx wrangler deploy
 ```
 The same secret must be in `%APPDATA%\splithello\config.json`; the simplest way
 to keep both sides in sync is to let `--setup` do it.
@@ -290,37 +394,45 @@ to keep both sides in sync is to let `--setup` do it.
 | **Technique** | Fake packets, TCP segmentation, TTL tricks | Differential baseline + learned fake/disorder/overlap/AutoTTL/IP-fragment/TLS-record profiles |
 | **DNS** | Doesn't handle DNS poisoning | Transparent raw DNS wire forwarding via authenticated DoH |
 | **Scope** | Filter-dependent TCP traffic | All non-loopback TCP/443; UDP/443 unchanged by default |
-| **Dependencies** | WinDivert driver | WinDivert 2.2.2 + Windows WinHTTP |
+| **Dependencies** | WinDivert driver | WinDivert 2.2.2 + SQLite + WebView2 Runtime + Windows WinHTTP |
 | **Admin required** | Yes | Yes, only for transparent mode |
 | **Gaming impact** | Can affect broad traffic | Non-443 game/voice traffic bypasses the filter |
 
 ## Technical Details
 
 - **Language:** C++20
-- **Dependencies:** spdlog and pinned WinDivert 2.2.2 (auto-fetched), WinHTTP / ws2_32 / crypt32 / bcrypt / ole32 (Windows built-in)
+- **Dependencies:** spdlog, the pinned official SQLite amalgamation and pinned
+  Microsoft WebView2 SDK loader, plus pinned WinDivert 2.2.2 (auto-fetched);
+  WebView2 Runtime, WinHTTP / IP Helper / ws2_32 / crypt32 / bcrypt / ole32 are supplied by Windows
 - **Ingress:** WinDivert transparent TCP/443 reflection; pass-through UDP/443 by default (IPv4 + IPv6)
 - **Manual recovery:** HTTP CONNECT + SOCKS5 (`--manual-proxy`)
 - **Worker:** authenticated raw DNS, direct-resolution and optional tunnel endpoints
 - **Config:** `%APPDATA%\splithello\config.json`
 - **Learned strategies:** `%APPDATA%\splithello\strategies.json` (proven bypass winners only; network-scoped, maximum 1,000 live entries, seven-day TTL)
+- **Local telemetry:** `%APPDATA%\splithello\telemetry.db` (SQLite WAL; completed
+  TLS evidence only; 30-day / 50,000-decision retention; never uploaded)
+- **Live telemetry:** a per-tray-session named-memory block (atomic active-flow,
+  decision and profile counters; recreated on engine restart; never uploaded)
 - **Runtime log:** `%APPDATA%\splithello\splithello.log` (512 KiB plus two backups; no secrets; seven-day archive retention).
   It records startup/shutdown, learned bypasses, profile changes, QUIC fallback,
   slow paths and failures; ordinary DNS and successful `none` traffic is omitted.
   `--verbose` adds detail to the console without bloating the persistent log.
-- **Tests:** `ctest --test-dir build -C Release` (ClientHello/server response parsing, DPI diagnosis, strategy planning, transparent routing and SYN authorization, JSON)
+- **Tests:** `ctest --test-dir build -C Release` (ClientHello/server response
+  parsing, DPI diagnosis, strategy planning, SQLite telemetry snapshots,
+  live-session counters, process-rule matching and live PID ownership,
+  transparent routing and SYN authorization, JSON)
 
 ## Not Yet Implemented
 
-- Tray connection test and live active-strategy/flow statistics (Start/Stop,
-  startup control, automatic recovery and log access are implemented)
-- `wrangler login --use-keyring` OAuth instead of pasting an API token
-- Fuzzing, GitHub Actions CI, signed releases, auto-update
+- Signed releases and auto-update
 - Full QUIC Initial decryption/re-encryption and CRYPTO-frame fragmentation. The
   current adaptive QUIC mode implements the lower-risk pre-Initial prime and a
   measured TCP fallback; it does not alter encrypted QUIC CRYPTO frames.
-- Per-process include/exclude controls.
 
 ## License
 
 SplitHello is MIT licensed. WinDivert is distributed separately under its
 LGPLv3/GPLv2 dual license; `WinDivert-LICENSE.txt` is copied beside every build.
+SQLite is in the public domain. The Microsoft WebView2 SDK license and notices
+are copied beside every build as `WebView2-LICENSE.txt` and
+`WebView2-NOTICE.txt`.

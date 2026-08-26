@@ -2,11 +2,11 @@
 
 #include "Config.hpp"
 
-// Interactive setup: opens browser for Cloudflare API token,
-// verifies it, deploys the worker, saves config.
+// Interactive setup: starts Wrangler OAuth with OS-keyring storage, deploys
+// the Worker, rotates its shared secret and saves config.
 // Returns true on success.
 bool runSetup(Config& config);
 
-// Re-deploy the worker code using existing config.
-// Useful after updating the worker JS.
+// Re-deploy using the existing keyring-backed Wrangler session. If the OAuth
+// session expired, the browser login is started again automatically.
 bool redeployWorker(Config& config);
