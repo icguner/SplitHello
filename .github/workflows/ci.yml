@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-release:
+    name: Windows Release build and tests
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Upload unsigned build
+        uses: actions/upload-artifact@v4
+        with:
+          name: splithello-windows-x64-unsigned
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            build/Release/splithello.exe
+            build/Release/WinDivert.dll
+            build/Release/WinDivert64.sys
+            build/Release/WinDivert-LICENSE.txt
+            build/Release/WebView2-LICENSE.txt
+            build/Release/WebView2-NOTICE.txt
+
+  parser-fuzz-smoke:
+    name: Parser fuzz smoke (Clang ASan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Configure fuzz targets
+        run: >-
+          cmake -S fuzz -B build-fuzz -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build fuzz targets
+        run: cmake --build build-fuzz --parallel
+
+      - name: Run TLS parser fuzz smoke
+        run: |
+          mkdir -p fuzz-artifacts tls-corpus
+          ./build-fuzz/fuzz_tls tls-corpus -dict=fuzz/tls.dict -max_total_time=20 -timeout=2 -max_len=65536 -artifact_prefix=fuzz-artifacts/tls-
+
+      - name: Run DNS parser fuzz smoke
+        run: |
+          mkdir -p dns-corpus
+          ./build-fuzz/fuzz_dns dns-corpus -dict=fuzz/dns.dict -max_total_time=20 -timeout=2 -max_len=65536 -artifact_prefix=fuzz-artifacts/dns-
+
+      - name: Run JSON parser fuzz smoke
+        run: |
+          mkdir -p json-corpus
+          ./build-fuzz/fuzz_json json-corpus -dict=fuzz/json.dict -max_total_time=20 -timeout=2 -max_len=65536 -artifact_prefix=fuzz-artifacts/json-
+
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parser-fuzz-crashes
+          if-no-files-found: ignore
+          retention-days: 14
+          path: fuzz-artifacts/

@@ -1,12 +1,16 @@
 #include "Config.hpp"
 #include "Dns.hpp"
 #include "DirectRelay.hpp"
+#include "LiveStats.hpp"
 #include "NetworkIdentity.hpp"
 #include "PacketStrategy.hpp"
+#include "ProcessFilter.hpp"
+#include "Secure.hpp"
 #include "Setup.hpp"
 #include "SocksProxy.hpp"
 #include "Strategy.hpp"
 #include "SystemProxy.hpp"
+#include "Telemetry.hpp"
 #include "TransparentDnsProxy.hpp"
 #include "TransparentFlow.hpp"
 #include "TrayApp.hpp"
@@ -22,6 +26,7 @@
 #include <csignal>
 #include <iostream>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -75,8 +80,10 @@ void printUsage(const char* exe) {
         << "  --manual-proxy       WinDivert olmadan SOCKS5/CONNECT dinle\n"
         << "  --quic-mode <mod>    allow (varsayilan), adaptive veya block\n"
         << "  --allow-quic         Eski ad; --quic-mode allow ile ayni\n"
+        << "  --include-process <desen>  Yalniz eslesen exe yollarini isle (tekrarlanabilir)\n"
+        << "  --exclude-process <desen>  Eslesen exe yollarini atla (tekrarlanabilir)\n"
         << "  --restore-proxy      Cokme sonrasi kalan proxy yedegini geri yukle ve cik\n"
-        << "  --forget-token       Kayitli Cloudflare token'ini sil ve cik\n"
+        << "  --forget-token       Eski surumden kalan API token alanini sil ve cik\n"
         << "  --forget-strategies  Ogrenilen alan adi stratejilerini sifirla ve cik\n"
         << "  --list-strategies    DPI uyarlama profillerini listele ve cik\n"
         << "  --console            Tray yerine konsolda calistir\n"
@@ -95,7 +102,7 @@ void printStrategies() {
     std::cout << "Parcalama profilleri (deneme sirasiyla):\n\n";
     for (const strategy::Profile& profile : strategy::profiles()) {
         std::cout << "  " << profile.name;
-        for (size_t i = profile.name.size(); i < 16; ++i) std::cout << ' ';
+        for (size_t i = profile.name.size(); i < 22; ++i) std::cout << ' ';
         std::cout << profile.description;
         if (profile.requiresSni) std::cout << " (SNI gerektirir)";
         std::cout << "\n";
@@ -320,6 +327,8 @@ private:
 struct Options {
     std::string workerUrl;
     std::string forcedStrategy;
+    std::vector<std::string> processInclude;
+    std::vector<std::string> processExclude;
     uint16_t port = 1080;
     unsigned splitDelayMs = 0;
     bool splitDelaySet = false;
@@ -337,6 +346,7 @@ struct Options {
     bool engine = false;
     std::string shutdownEventName;
     std::string readyEventName;
+    std::string liveStatsName;
     DWORD parentPid = 0;
 };
 
@@ -393,6 +403,10 @@ bool parseArgs(int argc, char* argv[], Options& options, int& exitCode) {
             }
         } else if (arg == "--tunnel-fallback") {
             options.tunnelFallback = true;
+        } else if (arg == "--include-process" && hasValue) {
+            options.processInclude.push_back(argv[++i]);
+        } else if (arg == "--exclude-process" && hasValue) {
+            options.processExclude.push_back(argv[++i]);
         } else if (arg == "--restore-proxy") {
             options.restoreProxy = true;
         } else if (arg == "--forget-token") {
@@ -413,6 +427,8 @@ bool parseArgs(int argc, char* argv[], Options& options, int& exitCode) {
             options.shutdownEventName = argv[++i];
         } else if (arg == "--ready-event" && hasValue) {
             options.readyEventName = argv[++i];
+        } else if (arg == "--live-stats" && hasValue) {
+            options.liveStatsName = argv[++i];
         } else if (arg == "--parent-pid" && hasValue) {
             unsigned parentPid = 0;
             if (!parseUnsigned(argv[++i], parentPid)) {
@@ -453,7 +469,8 @@ std::vector<std::wstring> collectEngineArguments() {
     for (int i = 1; i < argumentCount; ++i) {
         const std::wstring argument = arguments[i];
         const bool internalValue = argument == L"--shutdown-event" ||
-            argument == L"--ready-event" || argument == L"--parent-pid";
+            argument == L"--ready-event" || argument == L"--parent-pid" ||
+            argument == L"--live-stats";
         if (internalValue) {
             if (i + 1 < argumentCount) ++i;
             continue;
@@ -480,6 +497,7 @@ void signalReadyEvent(const std::string& eventName) {
 } // namespace
 
 int main(int argc, char* argv[]) {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     spdlog::set_pattern("[%H:%M:%S.%e] [%^%l%$] %v");
 
     Options options;
@@ -531,7 +549,8 @@ int main(int argc, char* argv[]) {
             !trayConfig.workerUrl.empty();
         const std::wstring logDirectory =
             std::filesystem::path(Config::logPath()).parent_path().wstring();
-        TrayApp tray(collectEngineArguments(), logDirectory, configured);
+        TrayApp tray(collectEngineArguments(), logDirectory,
+                     Config::telemetryPath(), configured);
         const int trayExitCode = tray.run();
         ReleaseMutex(instanceMutex);
         CloseHandle(instanceMutex);
@@ -554,8 +573,13 @@ int main(int argc, char* argv[]) {
     Config config;
     config.load();
 
-    // An older build stored the token in clear text; rewrite it encrypted.
-    if (config.migratedFromPlaintext) config.save();
+    // Current releases delegate Cloudflare OAuth storage to Wrangler's OS
+    // keyring. Rewrite old configs once to remove every legacy API-token field
+    // while retaining/migrating the Worker shared secret.
+    if (config.migratedFromPlaintext || config.legacyApiTokenPresent) {
+        secure::wipe(config.apiToken);
+        config.save();
+    }
 
     if (options.restoreProxy) {
         const bool restored = SystemProxy::restoreLeftovers(Config::proxyBackupPath(), true);
@@ -566,8 +590,8 @@ int main(int argc, char* argv[]) {
 
     if (options.forgetToken) {
         const bool ok = config.forgetToken();
-        std::cout << (ok ? "Cloudflare token silindi. Worker calismaya devam eder;\n"
-                           "yeniden deploy icin --setup veya --redeploy gerekir.\n"
+        std::cout << (ok ? "Eski Cloudflare API token alani silindi.\n"
+                           "Wrangler OAuth oturumu etkilenmedi.\n"
                          : "Token silinemedi.\n");
         return ok ? 0 : 1;
     }
@@ -607,6 +631,12 @@ int main(int argc, char* argv[]) {
 
     if (options.splitDelaySet) config.splitDelayMs = options.splitDelayMs;
     if (options.tunnelFallback) config.tunnelFallback = true;
+    config.processInclude.insert(config.processInclude.end(),
+                                 options.processInclude.begin(),
+                                 options.processInclude.end());
+    config.processExclude.insert(config.processExclude.end(),
+                                 options.processExclude.begin(),
+                                 options.processExclude.end());
 
     // Full interception no longer needs Internet Options. Undo a setting left
     // by older builds before opening WinDivert.
@@ -624,8 +654,23 @@ int main(int argc, char* argv[]) {
     dns::Resolver resolver(workerUrl, config.sharedSecret,
                            options.manualProxy ? 0 : connectPort);
     strategy::Store strategies(Config::strategyPath());
+    auto telemetryStore = std::make_shared<telemetry::Store>(Config::telemetryPath());
+    std::shared_ptr<live_stats::Publisher> liveStats;
+    if (!options.liveStatsName.empty()) {
+        const std::wstring mappingName(options.liveStatsName.begin(),
+                                       options.liveStatsName.end());
+        liveStats = std::make_shared<live_stats::Publisher>(mappingName);
+        if (!liveStats->available()) {
+            spdlog::warn("Canli tray istatistik kanali acilamadi");
+        }
+    }
     packet_strategy::PolicyRegistry packetPolicies;
+    process_filter::Filter processFilter(process_filter::Rules(
+        config.processInclude, config.processExclude));
     strategies.load();
+    if (!telemetryStore->start()) {
+        spdlog::warn("Yerel telemetri baslatilamadi; ag motoru istatistiksiz devam ediyor");
+    }
     const std::string networkId = network_identity::current();
 
     if (!options.forcedStrategy.empty()) {
@@ -639,6 +684,8 @@ int main(int argc, char* argv[]) {
     context.resolver = &resolver;
     context.strategies = &strategies;
     context.packetPolicies = options.manualProxy ? nullptr : &packetPolicies;
+    context.telemetry = telemetryStore;
+    context.liveStats = liveStats;
     context.splitDelayMs = config.splitDelayMs;
     context.probeTimeoutMs = config.probeTimeoutMs;
     context.tunnelFallback = config.tunnelFallback;
@@ -650,6 +697,11 @@ int main(int argc, char* argv[]) {
     spdlog::info("Ag profili: {}", networkId);
     spdlog::info("Relay portu: {} | split-delay: {} ms | ogrenilen alan adi: {}",
                  options.port, config.splitDelayMs, strategies.size());
+    if (processFilter.enabled()) {
+        spdlog::info("Surec filtresi: {} include, {} exclude kurali",
+                     processFilter.rules().includeCount(),
+                     processFilter.rules().excludeCount());
+    }
 
     transparent::FlowRegistry flows;
     transparent::DatagramRegistry datagrams;
@@ -697,7 +749,7 @@ int main(int argc, char* argv[]) {
 
         WinDivertInterceptor interceptor(flows, datagrams, packetPolicies, options.port,
                                          dnsProxyPort, connectPort,
-                                         options.quicMode);
+                                         options.quicMode, &processFilter);
         g_interceptor = &interceptor;
         if (!interceptor.start()) {
             dnsProxy.stop();

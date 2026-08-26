@@ -42,6 +42,29 @@ unsigned readUnsigned(const std::string& json, const std::string& key,
     return (unsigned)value;
 }
 
+std::vector<std::string> readProcessRules(const std::string& content,
+                                          const std::string& key) {
+    constexpr size_t kMaximumRules = 128;
+    constexpr size_t kMaximumRuleLength = 1024;
+    std::vector<std::string> result;
+    for (std::string rule : json::getStringArray(content, key)) {
+        if (rule.empty() || rule.size() > kMaximumRuleLength) continue;
+        result.push_back(std::move(rule));
+        if (result.size() == kMaximumRules) break;
+    }
+    return result;
+}
+
+std::string stringArrayJson(const std::vector<std::string>& values) {
+    std::string result = "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i != 0) result += ", ";
+        result += "\"" + json::escape(values[i]) + "\"";
+    }
+    result += "]";
+    return result;
+}
+
 } // namespace
 
 std::string Config::configDir() {
@@ -61,6 +84,11 @@ std::string Config::strategyPath() {
     return dir.empty() ? std::string{} : (fs::path(dir) / "strategies.json").string();
 }
 
+std::string Config::telemetryPath() {
+    const std::string dir = configDir();
+    return dir.empty() ? std::string{} : (fs::path(dir) / "telemetry.db").string();
+}
+
 std::string Config::logPath() {
     const std::string dir = configDir();
     return dir.empty() ? std::string{} : (fs::path(dir) / "splithello.log").string();
@@ -78,6 +106,8 @@ bool Config::load() {
     std::string json;
     if (!fileutil::readAll(path, json)) return false;
 
+    legacyApiTokenPresent = !json::getString(json, "api_token_dpapi").empty() ||
+                            !json::getString(json, "api_token").empty();
     apiToken     = readSecret(json, "api_token_dpapi", "api_token", migratedFromPlaintext);
     sharedSecret = readSecret(json, "shared_secret_dpapi", "shared_secret", migratedFromPlaintext);
     accountId    = json::getString(json, "account_id");
@@ -89,6 +119,8 @@ bool Config::load() {
     splitDelayMs   = readUnsigned(json, "split_delay_ms", splitDelayMs, 0, 2000);
     probeTimeoutMs = readUnsigned(json, "probe_timeout_ms", probeTimeoutMs, 250, 30000);
     tunnelFallback = json::getBool(json, "tunnel_fallback");
+    processInclude = readProcessRules(json, "process_include");
+    processExclude = readProcessRules(json, "process_exclude");
 
     if (migratedFromPlaintext) {
         spdlog::warn("Config: duz metin sirlar bulundu, DPAPI ile yeniden sifreleniyor");
@@ -112,15 +144,8 @@ bool Config::save() const {
     }
 
     // If encryption fails we drop the secret rather than fall back to writing
-    // it in the clear - losing a token is recoverable, leaking one is not.
-    std::string protectedToken;
-    if (!apiToken.empty()) {
-        protectedToken = secure::protect(apiToken);
-        if (protectedToken.empty()) {
-            spdlog::error("API token sifrelenemedi, kaydedilmiyor. --setup tekrar gerekebilir.");
-        }
-    }
-
+    // it in the clear. Wrangler owns OAuth credentials; config never stores a
+    // Cloudflare access token anymore.
     std::string protectedSecret;
     if (!sharedSecret.empty()) {
         protectedSecret = secure::protect(sharedSecret);
@@ -131,14 +156,15 @@ bool Config::save() const {
 
     std::string content;
     content += "{\n";
-    content += "  \"api_token_dpapi\": \"" + json::escape(protectedToken) + "\",\n";
     content += "  \"shared_secret_dpapi\": \"" + json::escape(protectedSecret) + "\",\n";
     content += "  \"account_id\": \"" + json::escape(accountId) + "\",\n";
     content += "  \"worker_name\": \"" + json::escape(workerName) + "\",\n";
     content += "  \"worker_url\": \"" + json::escape(workerUrl) + "\",\n";
     content += "  \"split_delay_ms\": " + std::to_string(splitDelayMs) + ",\n";
     content += "  \"probe_timeout_ms\": " + std::to_string(probeTimeoutMs) + ",\n";
-    content += "  \"tunnel_fallback\": " + std::string(tunnelFallback ? "true" : "false") + "\n";
+    content += "  \"tunnel_fallback\": " + std::string(tunnelFallback ? "true" : "false") + ",\n";
+    content += "  \"process_include\": " + stringArrayJson(processInclude) + ",\n";
+    content += "  \"process_exclude\": " + stringArrayJson(processExclude) + "\n";
     content += "}\n";
 
     const std::string path = configPath();
@@ -152,8 +178,8 @@ bool Config::save() const {
 }
 
 bool Config::forgetToken() {
-    // accountId stays: it is not a secret, and keeping it means a later
-    // --redeploy only needs a fresh token rather than a full --setup.
+    // accountId stays: it is not a secret and selects the same account when
+    // Wrangler OAuth exposes multiple memberships.
     secure::wipe(apiToken);
     return save();
 }

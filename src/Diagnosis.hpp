@@ -44,6 +44,7 @@ struct Verdict {
 Verdict infer(const std::vector<Attempt>& attempts);
 
 const char* name(Kind kind);
+const char* signalName(ProbeSignal signal);
 const char* describe(ProbeSignal signal);
 
 } // namespace diagnosis

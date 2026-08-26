@@ -3,13 +3,17 @@ add_executable(splithello_tests
     TestDiagnosis.cpp
     TestDnsMessage.cpp
     TestJson.cpp
+    TestLiveStats.cpp
     TestNetworkIdentity.cpp
     TestPacketStrategy.cpp
+    TestProcessFilter.cpp
     TestQuicStrategy.cpp
     TestRecoveryPolicy.cpp
     TestStrategy.cpp
+    TestTelemetry.cpp
     TestTlsHello.cpp
     TestTransparentFlow.cpp
+    TestWrangler.cpp
 )
 
 target_link_libraries(splithello_tests PRIVATE splithello_core)

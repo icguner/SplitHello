@@ -1,5 +1,7 @@
 #include "TrayApp.hpp"
 
+#include "DashboardPanel.hpp"
+
 #include <spdlog/spdlog.h>
 
 #include <filesystem>
@@ -18,6 +20,7 @@ constexpr UINT kCommandStop = 1002;
 constexpr UINT kCommandStartup = 1003;
 constexpr UINT kCommandOpenLogs = 1004;
 constexpr UINT kCommandExit = 1005;
+constexpr UINT kCommandDashboard = 1006;
 
 std::wstring quoteWindowsArgument(const std::wstring& argument) {
     if (argument.find_first_of(L" \t\n\v\"") == std::wstring::npos) return argument;
@@ -119,9 +122,12 @@ HICON stateIcon(TrayApp::EngineState state) {
 
 TrayApp::TrayApp(std::vector<std::wstring> engineArguments,
                  std::wstring logDirectory,
+                 std::string telemetryPath,
                  bool canStart)
     : engineArguments_(std::move(engineArguments)),
       logDirectory_(std::move(logDirectory)),
+      liveStatsName_(uniqueEventName(L"live-stats")),
+      telemetryPath_(std::move(telemetryPath)),
       canStart_(canStart) {}
 
 TrayApp::~TrayApp() {
@@ -227,6 +233,8 @@ void TrayApp::showMenu() {
 
     AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, stateText(state_));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, kCommandDashboard, L"Teşhis panelini aç");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
     const bool stopped = state_ == EngineState::Stopped || state_ == EngineState::Failed;
     AppendMenuW(menu, MF_STRING | ((!stopped || !canStart_) ? MF_DISABLED : 0),
@@ -281,6 +289,8 @@ void TrayApp::startEngine(bool automatic) {
     arguments.push_back(readyName);
     arguments.emplace_back(L"--parent-pid");
     arguments.push_back(std::to_wstring(GetCurrentProcessId()));
+    arguments.emplace_back(L"--live-stats");
+    arguments.push_back(liveStatsName_);
 
     std::wstring commandLine = quoteWindowsArgument(executable);
     for (const std::wstring& argument : arguments) {
@@ -361,8 +371,14 @@ void TrayApp::pollEngine() {
     }
 
     if (expected) {
-        setState(EngineState::Stopped);
-        showBalloon(L"SplitHello", L"Koruma durduruldu.");
+        if (configurationRestartPending_) {
+            configurationRestartPending_ = false;
+            setState(EngineState::Stopped);
+            startEngine();
+        } else {
+            setState(EngineState::Stopped);
+            showBalloon(L"SplitHello", L"Koruma durduruldu.");
+        }
     } else {
         scheduleAutomaticRestart(exitCode, nowMs);
     }
@@ -449,6 +465,29 @@ void TrayApp::openLogDirectory() const {
                   SW_SHOWNORMAL);
 }
 
+void TrayApp::openDashboard() {
+    if (!dashboard_) {
+        dashboard_ = std::make_unique<DashboardPanel>(telemetryPath_,
+                                                       liveStatsName_,
+                                                       [this]() {
+                                                           restartEngineForConfiguration();
+                                                       });
+    }
+    dashboard_->show();
+}
+
+void TrayApp::restartEngineForConfiguration() {
+    if (exiting_ || !canStart_) return;
+    restartPending_ = false;
+    restartAtMs_ = 0;
+    if (!engineProcess_) {
+        startEngine();
+        return;
+    }
+    configurationRestartPending_ = true;
+    requestStop();
+}
+
 LRESULT CALLBACK TrayApp::windowProc(HWND window, UINT message,
                                      WPARAM wParam, LPARAM lParam) {
     TrayApp* app = reinterpret_cast<TrayApp*>(
@@ -477,11 +516,7 @@ LRESULT TrayApp::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         if (notification == WM_CONTEXTMENU || notification == WM_RBUTTONUP) {
             showMenu();
         } else if (notification == WM_LBUTTONDBLCLK) {
-            if (state_ == EngineState::Stopped || state_ == EngineState::Failed) {
-                startEngine();
-            } else if (state_ == EngineState::Running) {
-                requestStop();
-            }
+            openDashboard();
         }
         return 0;
     }
@@ -491,6 +526,7 @@ LRESULT TrayApp::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case kCommandStop: requestStop(); break;
         case kCommandStartup: toggleStartup(); break;
         case kCommandOpenLogs: openLogDirectory(); break;
+        case kCommandDashboard: openDashboard(); break;
         case kCommandExit: requestExit(); break;
         default: break;
         }

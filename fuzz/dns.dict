@@ -1,0 +1,6 @@
+query_flags="\x01\x00"
+one_question="\x00\x01"
+type_a="\x00\x01\x00\x01"
+type_aaaa="\x00\x1c\x00\x01"
+label_www="\x03www"
+label_com="\x03com\x00"

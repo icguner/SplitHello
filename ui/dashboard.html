@@ -1,0 +1,1252 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:">
+  <title>SplitHello — Yerel Teşhis</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #142333;
+      --muted: #647483;
+      --fog: #eef3f5;
+      --paper: #fbfcfc;
+      --line: #d5dfe3;
+      --rail: #162a38;
+      --rail-2: #203d4c;
+      --aqua: #2c8b88;
+      --aqua-soft: #d8ece9;
+      --copper: #df754e;
+      --copper-soft: #f8e4db;
+      --red: #bd4f5c;
+      --red-soft: #f5dde1;
+      --gold: #a37828;
+      --gold-soft: #f5ecd6;
+      --shadow: 0 14px 38px rgba(18, 42, 56, .08);
+    }
+
+    * { box-sizing: border-box; }
+
+    html { background: var(--fog); }
+
+    body {
+      margin: 0;
+      min-width: 320px;
+      color: var(--ink);
+      background:
+        linear-gradient(rgba(22, 42, 56, .035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(22, 42, 56, .035) 1px, transparent 1px),
+        var(--fog);
+      background-size: 24px 24px;
+      font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+      font-size: 14px;
+    }
+
+    button { font: inherit; }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      min-height: 66px;
+      padding: 0 28px;
+      display: flex;
+      align-items: center;
+      gap: 24px;
+      color: #f6fbfc;
+      background: var(--rail);
+      border-bottom: 3px solid var(--copper);
+      box-shadow: 0 6px 24px rgba(9, 24, 34, .18);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      white-space: nowrap;
+      font-family: Bahnschrift, "Segoe UI Semibold", sans-serif;
+      font-size: 18px;
+      letter-spacing: .015em;
+    }
+
+    .brand-mark {
+      width: 27px;
+      height: 27px;
+      position: relative;
+      display: inline-grid;
+      place-items: center;
+      border: 1px solid rgba(255,255,255,.38);
+      transform: rotate(45deg);
+    }
+
+    .brand-mark::before,
+    .brand-mark::after {
+      content: "";
+      width: 14px;
+      height: 2px;
+      position: absolute;
+      background: var(--copper);
+      box-shadow: 0 5px 0 #69bab4;
+      transform: rotate(-45deg);
+    }
+
+    .local-state {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-right: auto;
+      padding-left: 22px;
+      border-left: 1px solid rgba(255,255,255,.18);
+      color: #b9c9d0;
+      font-size: 12px;
+    }
+
+    .state-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #68c2ad;
+      box-shadow: 0 0 0 4px rgba(104, 194, 173, .12);
+    }
+
+    .state-dot.offline {
+      background: #84949c;
+      box-shadow: 0 0 0 4px rgba(132, 148, 156, .12);
+    }
+
+    .live-strip {
+      min-height: 116px;
+      margin-bottom: 18px;
+      display: grid;
+      grid-template-columns: 1.25fr repeat(3, minmax(105px, .55fr)) 2fr auto;
+      align-items: stretch;
+      color: #eaf2f4;
+      background: var(--rail);
+      border: 1px solid #294654;
+      border-left: 4px solid var(--aqua);
+      box-shadow: var(--shadow);
+    }
+
+    .live-cell {
+      min-width: 0;
+      padding: 17px 18px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      border-right: 1px solid rgba(255,255,255,.1);
+    }
+
+    .live-label {
+      color: #8fa8b3;
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+    }
+
+    .live-value {
+      margin-top: 7px;
+      overflow: hidden;
+      font-family: Bahnschrift, "Segoe UI Semibold", sans-serif;
+      font-size: 23px;
+      line-height: 1;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .live-engine .live-value {
+      color: #80d1c6;
+      font-size: 16px;
+    }
+
+    .live-engine.offline .live-value { color: #a8b6bc; }
+
+    .live-sub {
+      margin-top: 7px;
+      color: #8fa8b3;
+      font-size: 10px;
+    }
+
+    .live-profiles {
+      gap: 8px;
+      align-items: flex-start;
+    }
+
+    .profile-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-top: 8px;
+    }
+
+    .profile-chip {
+      padding: 4px 6px;
+      color: #b9deda;
+      background: rgba(61, 145, 139, .18);
+      border: 1px solid rgba(105, 190, 181, .24);
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 9px;
+    }
+
+    .test-cell {
+      min-width: 190px;
+      padding: 15px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      gap: 7px;
+    }
+
+    .test-button {
+      padding: 9px 13px;
+      color: #fff;
+      background: var(--copper);
+      border: 1px solid #ed9473;
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    .test-button:hover:not(:disabled) { background: #eb8058; }
+    .test-button:disabled { cursor: default; opacity: .55; }
+
+    .test-button:focus-visible {
+      outline: 2px solid #8dd4ce;
+      outline-offset: 2px;
+    }
+
+    .test-result {
+      min-height: 28px;
+      color: #9eb1ba;
+      font-size: 10px;
+      line-height: 1.35;
+    }
+
+    .test-result.success { color: #81cec3; }
+    .test-result.warning { color: #f1c27d; }
+    .test-result.failed, .test-result.offline { color: #f0a9b1; }
+
+    .filters {
+      display: inline-flex;
+      gap: 3px;
+      padding: 3px;
+      background: rgba(255,255,255,.08);
+      border: 1px solid rgba(255,255,255,.12);
+    }
+
+    .filter {
+      min-width: 50px;
+      padding: 7px 10px;
+      color: #b9c9d0;
+      background: transparent;
+      border: 0;
+      cursor: pointer;
+    }
+
+    .filter:hover { color: white; }
+
+    .filter.active {
+      color: var(--rail);
+      background: #f2f7f8;
+      box-shadow: 0 2px 8px rgba(0,0,0,.16);
+    }
+
+    .filter:focus-visible,
+    .refresh:focus-visible {
+      outline: 2px solid #8dd4ce;
+      outline-offset: 2px;
+    }
+
+    .refresh {
+      width: 35px;
+      height: 35px;
+      color: #d8e4e8;
+      background: transparent;
+      border: 1px solid rgba(255,255,255,.2);
+      cursor: pointer;
+      font-size: 17px;
+    }
+
+    .refresh:hover { background: rgba(255,255,255,.09); }
+
+    main {
+      width: min(1380px, calc(100% - 48px));
+      margin: 0 auto;
+      padding: 34px 0 54px;
+    }
+
+    .intro {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 24px;
+      margin-bottom: 24px;
+    }
+
+    .eyebrow {
+      margin: 0 0 7px;
+      color: var(--copper);
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .16em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+
+    h1 {
+      margin-bottom: 6px;
+      font-family: Bahnschrift, "Segoe UI Semibold", sans-serif;
+      font-size: clamp(28px, 4vw, 42px);
+      font-weight: 600;
+      line-height: 1;
+      letter-spacing: -.025em;
+    }
+
+    .intro-copy {
+      max-width: 700px;
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+
+    .updated {
+      flex: none;
+      margin-bottom: 3px;
+      color: var(--muted);
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 11px;
+      text-align: right;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(135px, 1fr));
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+
+    .stat {
+      min-height: 118px;
+      padding: 18px 18px 15px;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-top: 3px solid var(--rail-2);
+      box-shadow: var(--shadow);
+    }
+
+    .stat.accent { border-top-color: var(--copper); }
+    .stat.good { border-top-color: var(--aqua); }
+    .stat.bad { border-top-color: var(--red); }
+
+    .stat-label {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .stat-value {
+      display: block;
+      margin: 8px 0 5px;
+      font-family: Bahnschrift, "Segoe UI Semibold", sans-serif;
+      font-size: 31px;
+      line-height: 1;
+    }
+
+    .stat-note {
+      color: #81909c;
+      font-size: 11px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.65fr) minmax(280px, .85fr);
+      gap: 18px;
+      margin-bottom: 18px;
+    }
+
+    .panel {
+      min-width: 0;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+    }
+
+    .panel-head {
+      min-height: 59px;
+      padding: 15px 18px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .panel-title {
+      margin: 0;
+      font-family: Bahnschrift, "Segoe UI Semibold", sans-serif;
+      font-size: 17px;
+      font-weight: 600;
+    }
+
+    .panel-kicker {
+      color: var(--muted);
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 10px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    .chart {
+      height: 248px;
+      padding: 28px 20px 18px;
+      display: flex;
+      align-items: end;
+      gap: clamp(4px, 1vw, 12px);
+      overflow: hidden;
+    }
+
+    .day {
+      flex: 1 1 0;
+      min-width: 11px;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      justify-content: end;
+      align-items: stretch;
+      gap: 7px;
+    }
+
+    .day-bars {
+      min-height: 3px;
+      display: flex;
+      align-items: end;
+      gap: 2px;
+      border-bottom: 1px solid #d9e1e4;
+    }
+
+    .day-bar {
+      flex: 1;
+      min-height: 2px;
+      background: var(--rail-2);
+      transition: height .35s ease;
+    }
+
+    .day-bar.bypass { background: var(--copper); }
+    .day-bar.failed { background: var(--red); }
+
+    .day-label {
+      overflow: hidden;
+      color: #84919b;
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 9px;
+      text-align: center;
+      text-overflow: clip;
+      white-space: nowrap;
+    }
+
+    .legend {
+      display: flex;
+      gap: 14px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .legend span::before {
+      content: "";
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      margin-right: 5px;
+      background: var(--rail-2);
+    }
+
+    .legend .bypass::before { background: var(--copper); }
+    .legend .failed::before { background: var(--red); }
+
+    .breakdowns {
+      padding: 17px 18px 20px;
+    }
+
+    .break-group + .break-group {
+      margin-top: 22px;
+      padding-top: 18px;
+      border-top: 1px solid var(--line);
+    }
+
+    .break-title {
+      margin-bottom: 12px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    .meter-row {
+      display: grid;
+      grid-template-columns: minmax(90px, 1fr) 2fr 38px;
+      gap: 9px;
+      align-items: center;
+      margin: 8px 0;
+    }
+
+    .meter-label {
+      overflow: hidden;
+      color: #425563;
+      font-size: 12px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .meter-track {
+      height: 7px;
+      overflow: hidden;
+      background: #e5ecee;
+    }
+
+    .meter-fill {
+      height: 100%;
+      min-width: 2px;
+      background: var(--aqua);
+    }
+
+    .meter-row.signal .meter-fill { background: var(--copper); }
+
+    .meter-count {
+      color: var(--muted);
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 11px;
+      text-align: right;
+    }
+
+    .profiles { margin-bottom: 18px; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    th, td {
+      padding: 13px 18px;
+      border-bottom: 1px solid #e1e7e9;
+      text-align: left;
+    }
+
+    th {
+      color: var(--muted);
+      background: #f6f9f9;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    td:not(:first-child), th:not(:first-child) { text-align: right; }
+
+    tbody tr:last-child td { border-bottom: 0; }
+
+    .profile-name {
+      color: var(--rail-2);
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .recent-list { padding: 4px 18px 16px; }
+
+    .event {
+      padding: 16px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .event:last-child { border-bottom: 0; }
+
+    .event-top {
+      display: grid;
+      grid-template-columns: minmax(160px, 1.1fr) 2.3fr auto;
+      gap: 16px;
+      align-items: center;
+    }
+
+    .host {
+      overflow: hidden;
+      margin-bottom: 4px;
+      font-family: Bahnschrift, "Segoe UI Semibold", sans-serif;
+      font-size: 15px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .event-meta {
+      color: var(--muted);
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 10px;
+    }
+
+    .evidence-ribbon {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .evidence-node {
+      min-width: 0;
+      padding: 7px 9px;
+      overflow: hidden;
+      color: #435764;
+      background: #edf2f3;
+      border: 1px solid #d5e0e3;
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 10px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .evidence-node.winner {
+      color: #155f5c;
+      background: var(--aqua-soft);
+      border-color: #b4dad6;
+    }
+
+    .evidence-node.verdict {
+      color: #914528;
+      background: var(--copper-soft);
+      border-color: #efc5b5;
+    }
+
+    .evidence-node.unresolved {
+      color: #8b3441;
+      background: var(--red-soft);
+      border-color: #e9bac1;
+    }
+
+    .arrow {
+      width: 24px;
+      flex: 0 0 24px;
+      position: relative;
+      height: 1px;
+      background: #9eacb4;
+    }
+
+    .arrow::after {
+      content: "";
+      position: absolute;
+      right: -1px;
+      top: -3px;
+      width: 6px;
+      height: 6px;
+      border-top: 1px solid #9eacb4;
+      border-right: 1px solid #9eacb4;
+      transform: rotate(45deg);
+    }
+
+    .confidence {
+      min-width: 74px;
+      padding: 6px 8px;
+      color: #325563;
+      background: #e5eef0;
+      border: 1px solid #cfdee2;
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 10px;
+      text-align: center;
+    }
+
+    .attempts {
+      margin-top: 10px;
+      color: var(--muted);
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 10px;
+      line-height: 1.7;
+    }
+
+    .attempt + .attempt::before {
+      content: "  /  ";
+      color: #a8b4ba;
+    }
+
+    .empty {
+      min-height: 178px;
+      padding: 34px 20px;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .empty strong {
+      display: block;
+      margin-bottom: 7px;
+      color: var(--ink);
+      font-family: Bahnschrift, "Segoe UI Semibold", sans-serif;
+      font-size: 17px;
+    }
+
+    .process-panel {
+      margin-top: 18px;
+      padding: 20px;
+      background: #eef3f4;
+      border: 1px solid #d3dfe2;
+      border-left: 3px solid var(--teal);
+      box-shadow: 0 8px 24px rgba(16, 41, 52, .08);
+    }
+
+    .process-head {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 15px;
+    }
+
+    .process-head h2 {
+      margin: 0;
+      color: var(--ink);
+      font: 600 18px/1.1 Bahnschrift, "Segoe UI Semibold", sans-serif;
+    }
+
+    .process-head p {
+      max-width: 680px;
+      margin: 5px 0 0;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.5;
+    }
+
+    .process-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .rule-field {
+      display: grid;
+      gap: 7px;
+    }
+
+    .rule-field label {
+      color: #36535f;
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    .rule-field textarea {
+      min-height: 96px;
+      resize: vertical;
+      padding: 11px 12px;
+      color: #17313d;
+      background: rgba(255,255,255,.86);
+      border: 1px solid #bdcdd2;
+      border-radius: 0;
+      font: 11px/1.55 "Cascadia Mono", Consolas, monospace;
+    }
+
+    .rule-field textarea:focus {
+      outline: 2px solid rgba(61,145,139,.36);
+      outline-offset: 1px;
+      border-color: var(--teal);
+    }
+
+    .process-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      margin-top: 12px;
+    }
+
+    .rule-status {
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .rule-status.success { color: #31766f; }
+    .rule-status.failed { color: #a4515d; }
+
+    .save-rules {
+      flex: 0 0 auto;
+      padding: 9px 16px;
+      color: #fff;
+      background: var(--rail);
+      border: 1px solid #294958;
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    .save-rules:hover:not(:disabled) { background: #244555; }
+    .save-rules:disabled { cursor: default; opacity: .55; }
+    .save-rules:focus-visible { outline: 2px solid var(--copper); outline-offset: 2px; }
+
+    .privacy-note {
+      margin-top: 15px;
+      color: #778893;
+      font-size: 11px;
+      text-align: right;
+    }
+
+    @media (max-width: 980px) {
+      .live-strip { grid-template-columns: repeat(4, 1fr); }
+      .live-engine, .live-profiles { grid-column: span 2; }
+      .test-cell { grid-column: span 2; }
+      .stats { grid-template-columns: repeat(3, 1fr); }
+      .grid { grid-template-columns: 1fr; }
+      .event-top { grid-template-columns: 1fr; }
+      .confidence { justify-self: start; }
+      .process-grid { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 680px) {
+      .topbar { padding: 10px 14px; flex-wrap: wrap; gap: 10px; }
+      .local-state { display: none; }
+      .filters { margin-left: auto; }
+      main { width: min(100% - 24px, 1380px); padding-top: 24px; }
+      .intro { align-items: start; flex-direction: column; }
+      .updated { text-align: left; }
+      .stats { grid-template-columns: 1fr 1fr; }
+      .live-strip { grid-template-columns: 1fr 1fr; }
+      .live-engine, .live-profiles, .test-cell { grid-column: span 2; }
+      .chart { gap: 3px; padding-inline: 12px; }
+      .day-label { display: none; }
+      th, td { padding-inline: 12px; }
+      .process-head, .process-footer { align-items: stretch; flex-direction: column; }
+      .save-rules { width: 100%; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>SplitHello</div>
+    <div class="local-state"><span class="state-dot offline" id="engine-dot"></span><span id="engine-top-state">Motor bekleniyor</span> · Yerel SQLite</div>
+    <div class="filters" role="group" aria-label="Zaman aralığı">
+      <button class="filter" data-days="1">24 sa</button>
+      <button class="filter" data-days="7">7 gün</button>
+      <button class="filter active" data-days="30">30 gün</button>
+    </div>
+    <button class="refresh" type="button" title="Yenile" aria-label="Yenile">↻</button>
+  </header>
+
+  <main>
+    <section class="intro">
+      <div>
+        <p class="eyebrow">Uyarlamalı DPI gözlemi</p>
+        <h1>Ağ yolu kanıt defteri</h1>
+        <p class="intro-copy">Dokunulmamış TLS baz çizgisini, denenmiş profilleri ve son kararı aynı olay üzerinde gör. “Engellendi” sonucu yalnızca başarılı karşı-deney varsa güçlü kanıt sayılır.</p>
+      </div>
+      <div class="updated" id="updated">veri bekleniyor</div>
+    </section>
+
+    <section class="live-strip" aria-label="Canlı motor oturumu">
+      <div class="live-cell live-engine offline" id="live-engine">
+        <span class="live-label">Motor nabzı</span>
+        <strong class="live-value" id="live-state">Çevrimdışı</strong>
+        <span class="live-sub" id="live-uptime">oturum yok</span>
+      </div>
+      <div class="live-cell"><span class="live-label">Aktif akış</span><strong class="live-value" id="live-active">0</strong><span class="live-sub">şu anda açık</span></div>
+      <div class="live-cell"><span class="live-label">Karar bekleyen</span><strong class="live-value" id="live-pending">0</strong><span class="live-sub">TLS profili seçiliyor</span></div>
+      <div class="live-cell"><span class="live-label">Oturum kararı</span><strong class="live-value" id="live-decisions">0</strong><span class="live-sub" id="live-decision-note">0 atlatılan · 0 çözülemeyen</span></div>
+      <div class="live-cell live-profiles"><span class="live-label">Aktif / kullanılan profiller</span><div class="profile-chips" id="live-profiles"><span class="profile-chip">veri bekleniyor</span></div></div>
+      <div class="test-cell">
+        <button class="test-button" id="connection-test" type="button" disabled>Bağlantıyı test et</button>
+        <div class="test-result" id="test-result" role="status">Motor açıldığında HTTPS relay yolu sınanabilir.</div>
+      </div>
+    </section>
+
+    <section class="stats" aria-label="Özet">
+      <article class="stat"><span class="stat-label">Toplam karar</span><strong class="stat-value" id="stat-total">—</strong><span class="stat-note">tamamlanan TLS akışı</span></article>
+      <article class="stat accent"><span class="stat-label">Atlatılan</span><strong class="stat-value" id="stat-bypassed">—</strong><span class="stat-note">alternatif profil kazandı</span></article>
+      <article class="stat good"><span class="stat-label">Temiz baz çizgi</span><strong class="stat-value" id="stat-normal">—</strong><span class="stat-note">müdahale kanıtı yok</span></article>
+      <article class="stat bad"><span class="stat-label">Çözülemeyen</span><strong class="stat-value" id="stat-unresolved">—</strong><span class="stat-note">başarılı karşı-deney yok</span></article>
+      <article class="stat"><span class="stat-label">Ortalama karar süresi</span><strong class="stat-value" id="stat-latency">—</strong><span class="stat-note" id="stat-cache">öğrenilmiş profil isabeti —</span></article>
+    </section>
+
+    <section class="grid">
+      <article class="panel">
+        <header class="panel-head">
+          <h2 class="panel-title">Günlük karar hacmi</h2>
+          <div class="legend"><span>normal</span><span class="bypass">atlatılan</span><span class="failed">çözülemeyen</span></div>
+        </header>
+        <div class="chart" id="daily-chart"></div>
+      </article>
+
+      <article class="panel">
+        <header class="panel-head"><h2 class="panel-title">Neden dağılımı</h2><span class="panel-kicker">karar / baz sinyali</span></header>
+        <div class="breakdowns">
+          <section class="break-group"><div class="break-title">Teşhis</div><div id="diagnoses"></div></section>
+          <section class="break-group"><div class="break-title">Baz çizgi sonucu</div><div id="signals"></div></section>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel profiles">
+      <header class="panel-head"><h2 class="panel-title">Kazanan profil performansı</h2><span class="panel-kicker">başarılı kararlar</span></header>
+      <div id="profiles-wrap"></div>
+    </section>
+
+    <section class="panel">
+      <header class="panel-head"><h2 class="panel-title">Son kanıt zincirleri</h2><span class="panel-kicker">baz çizgi → profil → hüküm</span></header>
+      <div class="recent-list" id="recent"></div>
+    </section>
+
+    <section class="process-panel" aria-labelledby="process-title">
+      <header class="process-head">
+        <div>
+          <h2 id="process-title">Süreç kapsamı</h2>
+          <p>Her satıra bir exe adı, tam yol veya <strong>* / ?</strong> deseni yaz. Include doluysa yalnız eşleşenler işlenir; exclude her zaman önceliklidir. Tanınamayan süreçler normal Windows yolunda bırakılır.</p>
+        </div>
+      </header>
+      <div class="process-grid">
+        <div class="rule-field">
+          <label for="process-include">Include · yalnız bunları işle</label>
+          <textarea id="process-include" spellcheck="false" placeholder="chrome.exe&#10;firefox*.exe"></textarea>
+        </div>
+        <div class="rule-field">
+          <label for="process-exclude">Exclude · bunlara dokunma</label>
+          <textarea id="process-exclude" spellcheck="false" placeholder="steam*.exe&#10;C:\Games\Legacy\*"></textarea>
+        </div>
+      </div>
+      <footer class="process-footer">
+        <span class="rule-status" id="rule-status" role="status">Kurallar yükleniyor…</span>
+        <button class="save-rules" id="save-rules" type="button">Kaydet ve motoru yenile</button>
+      </footer>
+    </section>
+
+    <p class="privacy-note">Alan adı ve ağ kimliği yalnızca <strong>%APPDATA%\splithello\telemetry.db</strong> içinde saklanır. Panel normalde ağ isteği göndermez; yalnızca <strong>Bağlantıyı test et</strong> seçildiğinde www.example.com adresine bir HTTPS HEAD isteği yollar.</p>
+  </main>
+
+  <script>
+    'use strict';
+
+    const bridge = window.chrome && window.chrome.webview;
+    let selectedDays = 30;
+
+    const tr = {
+      'unknown': 'belirsiz',
+      'no-interference': 'müdahale yok',
+      'sni-interference-likely': 'SNI müdahalesi olası',
+      'tls-incompatible': 'TLS uyumsuzluğu',
+      'transport-failure': 'taşıma hatası',
+      'throttling-suspected': 'yavaşlatma şüphesi',
+      'server-hello': 'ServerHello',
+      'tls-alert': 'TLS Alert',
+      'timeout': 'zaman aşımı',
+      'reset': 'RST',
+      'closed': 'kapandı',
+      'unexpected': 'beklenmeyen',
+      'not-tested': 'baz çizgi denenmedi',
+      'none': 'dokunulmamış'
+    };
+
+    const label = value => tr[value] || value || '—';
+    const count = value => new Intl.NumberFormat('tr-TR').format(value || 0);
+
+    function formatDuration(seconds) {
+      if (!Number.isFinite(seconds) || seconds < 0) return 'oturum yeni başladı';
+      const hours = Math.floor(seconds / 3600);
+      const minutes = Math.floor((seconds % 3600) / 60);
+      if (hours) return `${hours} sa ${minutes} dk açık`;
+      return `${minutes} dk açık`;
+    }
+
+    function clear(node) {
+      while (node.firstChild) node.removeChild(node.firstChild);
+    }
+
+    function element(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    }
+
+    function empty(node, title, copy) {
+      clear(node);
+      const box = element('div', 'empty');
+      const inner = element('div');
+      inner.append(element('strong', '', title), document.createTextNode(copy));
+      box.append(inner);
+      node.append(box);
+    }
+
+    function renderBreakdown(id, items, variant) {
+      const root = document.getElementById(id);
+      clear(root);
+      if (!items || !items.length) {
+        root.append(element('div', 'stat-note', 'Henüz dağılım oluşmadı.'));
+        return;
+      }
+      const max = Math.max(...items.map(item => item.count), 1);
+      items.slice(0, 6).forEach(item => {
+        const row = element('div', `meter-row ${variant || ''}`);
+        const meter = element('div', 'meter-track');
+        const fill = element('div', 'meter-fill');
+        fill.style.width = `${Math.max(3, item.count / max * 100)}%`;
+        meter.append(fill);
+        row.append(element('span', 'meter-label', label(item.key)), meter,
+                   element('span', 'meter-count', count(item.count)));
+        root.append(row);
+      });
+    }
+
+    function renderDaily(days) {
+      const root = document.getElementById('daily-chart');
+      clear(root);
+      if (!days || !days.length) {
+        empty(root, 'Henüz günlük veri yok', 'Motor karar verdikçe grafik burada oluşacak.');
+        return;
+      }
+      const max = Math.max(...days.map(day => day.total), 1);
+      days.forEach(day => {
+        const item = element('div', 'day');
+        item.title = `${day.day}: ${day.total} karar`;
+        const bars = element('div', 'day-bars');
+        const normal = Math.max(0, day.total - day.bypassed - day.unresolved);
+        [['', normal], ['bypass', day.bypassed], ['failed', day.unresolved]].forEach(([kind, value]) => {
+          const bar = element('div', `day-bar ${kind}`);
+          bar.style.height = `${Math.max(value ? 4 : 0, value / max * 188)}px`;
+          bars.append(bar);
+        });
+        const parts = day.day.split('-');
+        item.append(bars, element('span', 'day-label', `${parts[2]}.${parts[1]}`));
+        root.append(item);
+      });
+    }
+
+    function renderProfiles(profiles) {
+      const root = document.getElementById('profiles-wrap');
+      clear(root);
+      if (!profiles || !profiles.length) {
+        empty(root, 'Kazanan profil yok', 'Başarılı kararlar burada gecikme ve deneme sayısıyla karşılaştırılacak.');
+        return;
+      }
+      const table = element('table');
+      const head = element('thead');
+      const headRow = element('tr');
+      ['Profil', 'Karar', 'Ort. süre', 'Ort. deneme'].forEach(value => headRow.append(element('th', '', value)));
+      head.append(headRow);
+      const body = element('tbody');
+      profiles.forEach(profile => {
+        const row = element('tr');
+        row.append(element('td', 'profile-name', label(profile.name)),
+                   element('td', '', count(profile.count)),
+                   element('td', '', `${Math.round(profile.averageLatencyMs)} ms`),
+                   element('td', '', Number(profile.averageAttempts).toFixed(1)));
+        body.append(row);
+      });
+      table.append(head, body);
+      root.append(table);
+    }
+
+    function evidenceNode(text, kind) {
+      return element('span', `evidence-node ${kind || ''}`, text);
+    }
+
+    function renderRecent(events) {
+      const root = document.getElementById('recent');
+      clear(root);
+      if (!events || !events.length) {
+        empty(root, 'Kanıt zinciri bekleniyor', 'Bir TLS kararı tamamlandığında baz çizgi, profil ve hüküm burada yan yana görünecek.');
+        return;
+      }
+      events.forEach(event => {
+        const row = element('article', 'event');
+        const top = element('div', 'event-top');
+        const identity = element('div');
+        const stamp = new Date(event.timestamp * 1000).toLocaleString('tr-TR', {dateStyle: 'short', timeStyle: 'medium'});
+        identity.append(element('div', 'host', event.host),
+                        element('div', 'event-meta', `${stamp} · ${event.totalElapsedMs} ms · ${event.attemptCount} deneme${event.forced ? ' · zorlanmış profil' : ''}`));
+
+        const ribbon = element('div', 'evidence-ribbon');
+        const baseline = event.baseline ? `baz: ${label(event.baseline)}` : 'baz: denenmedi';
+        const winner = event.success ? `profil: ${label(event.winner)}` : 'profil: sonuç yok';
+        ribbon.append(evidenceNode(baseline), element('span', 'arrow'),
+                      evidenceNode(winner, event.success ? 'winner' : 'unresolved'),
+                      element('span', 'arrow'),
+                      evidenceNode(label(event.diagnosis), event.success ? 'verdict' : 'unresolved'));
+
+        top.append(identity, ribbon,
+                   element('span', 'confidence', `%${event.confidence} güven`));
+        row.append(top);
+
+        if (event.attempts && event.attempts.length) {
+          const attempts = element('div', 'attempts');
+          event.attempts.forEach(attempt => {
+            attempts.append(element('span', 'attempt',
+              `${label(attempt.profile)}: ${label(attempt.signal)} / ${attempt.elapsedMs} ms`));
+          });
+          row.append(attempts);
+        }
+        root.append(row);
+      });
+    }
+
+    function render(data) {
+      const summary = data.summary || {};
+      document.getElementById('stat-total').textContent = count(summary.total);
+      document.getElementById('stat-bypassed').textContent = count(summary.bypassed);
+      document.getElementById('stat-normal').textContent = count(summary.normal);
+      document.getElementById('stat-unresolved').textContent = count(summary.unresolved);
+      document.getElementById('stat-latency').textContent = `${Math.round(summary.averageLatencyMs || 0)} ms`;
+      const hitRate = summary.total ? Math.round((summary.cacheHits || 0) / summary.total * 100) : 0;
+      document.getElementById('stat-cache').textContent = `öğrenilmiş profil isabeti %${hitRate}`;
+      document.getElementById('updated').textContent = data.ready
+        ? `son okuma ${new Date(data.generatedAt * 1000).toLocaleTimeString('tr-TR')}`
+        : (data.error || 'veri bekleniyor');
+      renderDaily(data.daily);
+      renderBreakdown('diagnoses', data.diagnoses);
+      renderBreakdown('signals', data.signals, 'signal');
+      renderProfiles(data.profiles);
+      renderRecent(data.recent);
+    }
+
+    function renderLive(data) {
+      const online = Boolean(data.online);
+      document.getElementById('engine-dot').classList.toggle('offline', !online);
+      document.getElementById('engine-top-state').textContent = online ? 'Motor çalışıyor' : 'Motor çevrimdışı';
+      document.getElementById('live-engine').classList.toggle('offline', !online);
+      document.getElementById('live-state').textContent = online ? 'Koruma aktif' : 'Çevrimdışı';
+      document.getElementById('live-uptime').textContent = online
+        ? `${formatDuration(Math.floor(Date.now() / 1000) - data.startedAt)} · PID ${data.enginePid}`
+        : 'oturum yok';
+      document.getElementById('live-active').textContent = count(data.activeFlows);
+      document.getElementById('live-pending').textContent = count(data.pendingFlows);
+      document.getElementById('live-decisions').textContent = count(data.decisions);
+      document.getElementById('live-decision-note').textContent = `${count(data.bypassedDecisions)} atlatılan · ${count(data.unresolvedDecisions)} çözülemeyen`;
+
+      const profiles = document.getElementById('live-profiles');
+      clear(profiles);
+      const used = (data.profiles || [])
+        .filter(profile => profile.active || profile.decisions)
+        .sort((left, right) => right.active - left.active || right.decisions - left.decisions)
+        .slice(0, 6);
+      if (!used.length) {
+        profiles.append(element('span', 'profile-chip', online ? 'akış bekleniyor' : 'motor kapalı'));
+      } else {
+        used.forEach(profile => profiles.append(element(
+          'span', 'profile-chip',
+          `${label(profile.name)} · ${profile.active} aktif / ${profile.decisions} karar`
+        )));
+      }
+
+      const testButton = document.getElementById('connection-test');
+      if (testButton.dataset.running !== 'true') testButton.disabled = !online;
+    }
+
+    function renderTest(data) {
+      const button = document.getElementById('connection-test');
+      const result = document.getElementById('test-result');
+      const running = data.state === 'running';
+      button.dataset.running = running ? 'true' : 'false';
+      button.disabled = running || data.state === 'offline';
+      button.textContent = running ? 'Test ediliyor…' : 'Bağlantıyı test et';
+      result.className = `test-result ${data.state || ''}`;
+      const detail = data.elapsedMs ? ` · ${data.elapsedMs} ms` : '';
+      const status = data.status > 0 ? ` · HTTP ${data.status}` : '';
+      result.textContent = `${data.message || 'Test sonucu yok.'}${status}${detail}`;
+    }
+
+    function renderProcessRules(data) {
+      document.getElementById('process-include').value = (data.include || []).join('\n');
+      document.getElementById('process-exclude').value = (data.exclude || []).join('\n');
+      const status = document.getElementById('rule-status');
+      status.className = `rule-status ${data.state || ''}`;
+      status.textContent = data.message || 'Kurallar hazır. Boş include tüm süreçleri kapsar.';
+      const button = document.getElementById('save-rules');
+      button.disabled = false;
+      button.textContent = 'Kaydet ve motoru yenile';
+    }
+
+    function ruleLines(id) {
+      return [...new Set(document.getElementById(id).value
+        .split(/\r?\n/)
+        .map(value => value.trim())
+        .filter(Boolean))];
+    }
+
+    function requestRefresh() {
+      if (bridge) bridge.postMessage(`refresh:${selectedDays}`);
+    }
+
+    document.querySelectorAll('.filter').forEach(button => {
+      button.addEventListener('click', () => {
+        selectedDays = Number(button.dataset.days);
+        document.querySelectorAll('.filter').forEach(item => item.classList.toggle('active', item === button));
+        requestRefresh();
+      });
+    });
+    document.querySelector('.refresh').addEventListener('click', requestRefresh);
+    document.getElementById('connection-test').addEventListener('click', () => {
+      if (bridge) {
+        bridge.postMessage('test');
+      } else {
+        renderTest({state:'running',message:'HTTPS yolu sınanıyor…'});
+        window.setTimeout(() => renderTest({state:'success',message:'HTTPS relay zinciri yanıt verdi.',status:200,elapsedMs:118}), 650);
+      }
+    });
+    document.getElementById('save-rules').addEventListener('click', () => {
+      const payload = {
+        include: ruleLines('process-include'),
+        exclude: ruleLines('process-exclude')
+      };
+      const button = document.getElementById('save-rules');
+      button.disabled = true;
+      button.textContent = 'Kaydediliyor…';
+      const status = document.getElementById('rule-status');
+      status.className = 'rule-status';
+      status.textContent = 'Kurallar doğrulanıyor…';
+      if (bridge) {
+        bridge.postMessage(`save-process-rules:${JSON.stringify(payload)}`);
+      } else {
+        window.setTimeout(() => renderProcessRules({
+          ...payload, state:'success', message:'Kurallar kaydedildi; ağ motoru yenileniyor…'
+        }), 450);
+      }
+    });
+
+    if (bridge) {
+      bridge.addEventListener('message', event => {
+        if (event.data.messageType === 'live') renderLive(event.data);
+        else if (event.data.messageType === 'test') renderTest(event.data);
+        else if (event.data.messageType === 'processRules') renderProcessRules(event.data);
+        else render(event.data);
+      });
+      requestRefresh();
+      bridge.postMessage('process-rules');
+      window.setInterval(() => bridge.postMessage('live'), 1000);
+      window.setInterval(requestRefresh, 10000);
+    } else {
+      const now = Math.floor(Date.now() / 1000);
+      const daily = Array.from({length: 14}, (_, index) => ({
+        day: new Date((now - (13 - index) * 86400) * 1000).toISOString().slice(0, 10),
+        total: [9, 14, 11, 19, 23, 17, 28, 21, 31, 26, 38, 32, 35, 44][index],
+        bypassed: [1, 3, 2, 5, 7, 4, 8, 5, 10, 7, 12, 9, 8, 13][index],
+        unresolved: index % 5 === 0 ? 2 : 1
+      }));
+      render({ready: true, generatedAt: now,
+        summary: {total: 348, bypassed: 94, normal: 239, unresolved: 15, averageLatencyMs: 186.4, cacheHits: 217},
+        diagnoses: [{key:'no-interference',count:239},{key:'sni-interference-likely',count:94},{key:'transport-failure',count:11},{key:'tls-incompatible',count:4}],
+        signals: [{key:'server-hello',count:239},{key:'timeout',count:67},{key:'reset',count:27},{key:'not-tested',count:15}],
+        profiles: [{name:'none',count:239,averageLatencyMs:91,averageAttempts:1},{name:'sni-mid',count:61,averageLatencyMs:218,averageAttempts:2.1},{name:'record-1',count:23,averageLatencyMs:244,averageAttempts:2.6},{name:'packet-reverse',count:10,averageLatencyMs:302,averageAttempts:3.2}],
+        daily,
+        recent: [
+          {id:1,timestamp:now-42,host:'www.example.com',baseline:'timeout',diagnosis:'sni-interference-likely',confidence:92,winner:'sni-mid',success:true,attemptCount:2,totalElapsedMs:337,attempts:[{profile:'none',signal:'timeout',elapsedMs:301},{profile:'sni-mid',signal:'server-hello',elapsedMs:36}]},
+          {id:2,timestamp:now-130,host:'cdn.example.net',baseline:'server-hello',diagnosis:'no-interference',confidence:95,winner:'none',success:true,attemptCount:1,totalElapsedMs:74,attempts:[{profile:'none',signal:'server-hello',elapsedMs:74}]},
+          {id:3,timestamp:now-480,host:'media.example.org',baseline:'reset',diagnosis:'transport-failure',confidence:45,winner:'',success:false,attemptCount:3,totalElapsedMs:812,attempts:[{profile:'none',signal:'reset',elapsedMs:9},{profile:'sni-mid',signal:'timeout',elapsedMs:402},{profile:'record-1',signal:'timeout',elapsedMs:401}]}
+        ]
+      });
+      renderLive({online:true,enginePid:6420,startedAt:now-4872,activeFlows:7,pendingFlows:1,openedFlows:481,decisions:462,bypassedDecisions:94,unresolvedDecisions:6,profiles:[
+        {name:'none',active:4,decisions:332},{name:'sni-mid',active:2,decisions:88},{name:'packet-reverse',active:0,decisions:31}
+      ]});
+      renderProcessRules({include:['chrome.exe','firefox*.exe'],exclude:['steam*.exe']});
+    }
+  </script>
+</body>
+</html>

@@ -4,10 +4,10 @@
 
 // Secret handling.
 //
-// The Cloudflare API token and the Worker's shared secret are wrapped with
-// Windows DPAPI (CryptProtectData) before they touch the disk, so the ciphertext
-// is only decryptable by the same Windows user on the same machine. Copying
-// config.json to another account or another PC yields nothing.
+// The Worker's shared secret is wrapped with Windows DPAPI (CryptProtectData)
+// before it touches the disk, so the ciphertext is only decryptable by the same
+// Windows user on the same machine. Cloudflare OAuth credentials are owned by
+// Wrangler's OS keyring and never enter config.json.
 namespace secure {
 
 // DPAPI-encrypt and base64 the result. Returns empty on failure.
