@@ -1,54 +1,112 @@
 #pragma once
 
-#include <string>
-#include <cstdint>
-#include <thread>
+#include "Diagnosis.hpp"
+#include "Dns.hpp"
+#include "Strategy.hpp"
+#include "TlsHello.hpp"
+
 #include <atomic>
+#include <cstdint>
+#include <string>
+#include <thread>
+#include <vector>
 
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
-// Direct TCP relay with TLS ClientHello fragmentation for DPI bypass.
-// Resolves DNS via Worker's DoH endpoint (ISP poisons DNS),
-// then connects directly to the real IP and fragments the first
-// TLS packet so DPI can't read the SNI field.
+namespace packet_strategy { class PolicyRegistry; }
+
+// Shared, read-only state handed to every connection.
+struct RelayContext {
+    std::string workerUrl;
+    std::string sharedSecret;
+    std::string networkId = "network-default";
+    dns::Resolver* resolver = nullptr;
+    strategy::Store* strategies = nullptr;
+    packet_strategy::PolicyRegistry* packetPolicies = nullptr;
+    unsigned splitDelayMs = 20;
+    unsigned probeTimeoutMs = 3000;
+    bool tunnelFallback = false;
+    uint16_t bypassConnectPort = 0;
+
+    // When set, this profile is used for every connection and nothing is
+    // probed or learned. Debugging aid for comparing profiles on one network.
+    std::string forcedProfile;
+};
+
+// One proxied TCP connection.
+//
+// Resolves the target through the Worker (the ISP resolver is poisoned),
+// connects straight to it, and splits the TLS ClientHello across several valid
+// TLS records so SNI-based DPI never sees the hostname in one piece.
+//
+// The ClientHello is buffered until it is *complete* before anything is cut:
+// a browser can deliver it across several reads, and post-quantum key shares
+// push it well past a single segment. If the first profile does not get a
+// reply, the connection is retried with the next one and the winner is
+// remembered for that domain.
 class DirectRelay {
 public:
-    DirectRelay(SOCKET clientSock, const std::string& workerUrl,
-                const std::string& targetHost, uint16_t targetPort);
+    DirectRelay(SOCKET clientSock, const RelayContext& context,
+                std::string targetHost, uint16_t targetPort,
+                std::string originalTargetAddress = {},
+                uint16_t connectPort = 0);
     ~DirectRelay();
 
     DirectRelay(const DirectRelay&) = delete;
     DirectRelay& operator=(const DirectRelay&) = delete;
 
-    // Start in background thread. Self-destructs when done.
+    // Runs on a detached thread and deletes itself when the connection ends.
     void start();
 
 private:
     SOCKET clientSock_;
     SOCKET targetSock_ = INVALID_SOCKET;
-    std::string workerUrl_;
+    RelayContext context_;
     std::string targetHost_;
     uint16_t targetPort_;
-    std::atomic<bool> running_{false};
+    std::string originalTargetAddress_;
+    uint16_t connectPort_;
 
+    std::vector<std::string> candidates_;   // resolved addresses, in connect order
+    std::string connectedAddress_;
+
+    std::vector<uint8_t> clientBuffer_;     // ClientHello (+ anything trailing it)
+    tls::ClientHello hello_;
+    bool helloComplete_ = false;
+    std::vector<uint8_t> firstResponse_;    // target bytes read during probing
+    std::string activeProfile_ = "none";
+
+    std::atomic<bool> running_{false};
     std::thread clientToTarget_;
     std::thread targetToClient_;
 
     void run();
 
-    // Resolve hostname via Worker's /resolve endpoint (DoH).
-    std::string resolveDns(const std::string& host);
+    bool prepareCandidates();
+    bool connectTarget();
+    bool reconnect();
 
-    // Connect to target IP:port. Returns INVALID_SOCKET on failure.
-    SOCKET connectTarget(const std::string& ip, uint16_t port);
+    // Reads from the client until a complete ClientHello is buffered, the data
+    // is clearly not TLS, or the client goes quiet. False means the client
+    // hung up with nothing useful.
+    bool collectClientHello();
 
-    // Fragment TLS ClientHello and send to target.
-    // Splits after first 1 byte so DPI can't read SNI.
-    bool fragmentAndSend(const uint8_t* data, size_t len);
+    // Applies profiles in order until one draws a reply. False if none did.
+    bool deliverHello();
 
-    // Pump data from one socket to another.
+    bool writePlan(const strategy::FragmentPlan& plan);
+    bool writeFragmented(const strategy::FragmentPlan& plan);
+    diagnosis::ProbeSignal awaitResponse(std::vector<uint8_t>& out);
+    bool flushTrailingClientData();
+
+    // Last resort: hand the connection to the Worker's WebSocket relay.
+    // Takes ownership of clientSock_ on success.
+    bool handOffToTunnel();
+
+    void setNoDelay(bool enabled);
+
     void pumpClientToTarget();
     void pumpTargetToClient();
 

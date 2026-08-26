@@ -2,6 +2,7 @@
 
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 #include <functional>
 #include <atomic>
@@ -22,9 +23,12 @@ public:
     WsClient(const WsClient&) = delete;
     WsClient& operator=(const WsClient&) = delete;
 
-    // Connect to the relay. url must be like "wss://relay.workers.dev/tunnel"
+    // Connect to the relay. url must be like "wss://relay.workers.dev/tunnel".
+    // `headers` carries the bearer secret the Worker requires.
     // Returns true on success.
-    bool connect(std::string_view url);
+    bool connect(std::string_view url,
+                 const std::vector<std::pair<std::string, std::string>>& headers = {},
+                 uint16_t connectPortOverride = 0);
 
     // Send a text frame (JSON control messages).
     bool sendText(std::string_view data);
