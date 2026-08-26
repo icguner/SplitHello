@@ -1,141 +1,126 @@
 #include "Relay.hpp"
+
+#include "Json.hpp"
+#include "TcpConnect.hpp"
+
 #include <spdlog/spdlog.h>
+
 #include <format>
 
-Relay::Relay(SOCKET clientSock, const std::string& workerUrl,
-             const std::string& targetHost, uint16_t targetPort)
+Relay::Relay(SOCKET clientSock, std::string workerUrl, std::string sharedSecret,
+             std::string targetHost, uint16_t targetPort,
+             std::vector<uint8_t> initialData,
+             uint16_t workerConnectPort)
     : clientSock_(clientSock)
-    , workerUrl_(workerUrl)
-    , targetHost_(targetHost)
+    , workerUrl_(std::move(workerUrl))
+    , sharedSecret_(std::move(sharedSecret))
+    , targetHost_(std::move(targetHost))
     , targetPort_(targetPort)
-{}
+    , workerConnectPort_(workerConnectPort)
+    , initialData_(std::move(initialData)) {}
 
 Relay::~Relay() {
     stop();
 }
 
 void Relay::start() {
-    // Run the connection + pump in a detached thread.
-    // The relay will clean itself up when done.
     std::thread([this]() { run(); }).detach();
 }
 
 void Relay::run() {
     running_ = true;
 
-    // Build the tunnel endpoint URL
     std::string tunnelUrl = workerUrl_;
     if (!tunnelUrl.ends_with("/")) tunnelUrl += "/";
     tunnelUrl += "tunnel";
 
-    spdlog::info("Relay: connecting to worker {} for {}:{}", tunnelUrl, targetHost_, targetPort_);
+    spdlog::info("Tunel: {} -> {}:{}", tunnelUrl, targetHost_, targetPort_);
 
-    if (!ws_.connect(tunnelUrl)) {
-        spdlog::error("Relay: WebSocket connection failed for {}:{}", targetHost_, targetPort_);
-        closesocket(clientSock_);
-        delete this;
-        return;
+    std::vector<std::pair<std::string, std::string>> headers;
+    if (!sharedSecret_.empty()) {
+        headers.push_back({"Authorization", "Bearer " + sharedSecret_});
     }
 
-    // Send connect command
-    std::string connectCmd = std::format(
+    const auto fail = [this](const char* reason) {
+        spdlog::error("Tunel hatasi ({}): {}:{}", reason, targetHost_, targetPort_);
+        running_ = false;
+        if (clientSock_ != INVALID_SOCKET) {
+            closesocket(clientSock_);
+            clientSock_ = INVALID_SOCKET;
+        }
+        delete this;
+    };
+
+    if (!ws_.connect(tunnelUrl, headers, workerConnectPort_)) { fail("baglanti"); return; }
+
+    const std::string command = std::format(
         R"({{"cmd":"connect","host":"{}","port":{}}})",
-        targetHost_, targetPort_);
+        json::escape(targetHost_), targetPort_);
 
-    if (!ws_.sendText(connectCmd)) {
-        spdlog::error("Relay: failed to send connect command");
-        closesocket(clientSock_);
-        delete this;
-        return;
-    }
+    if (!ws_.sendText(command)) { fail("connect komutu"); return; }
 
-    // Wait for connected response
-    std::vector<uint8_t> resp;
+    std::vector<uint8_t> response;
     bool isText = false;
-    int n = ws_.receive(resp, isText);
-    if (n <= 0) {
-        spdlog::error("Relay: no response from worker");
-        closesocket(clientSock_);
-        delete this;
+    if (ws_.receive(response, isText) <= 0) { fail("yanit yok"); return; }
+
+    const std::string responseText(response.begin(), response.end());
+    if (responseText.find("\"connected\"") == std::string::npos) {
+        spdlog::error("Tunel reddedildi: {}", responseText);
+        fail("reddedildi");
         return;
     }
 
-    std::string respStr(resp.begin(), resp.end());
-    if (respStr.find("\"connected\"") == std::string::npos) {
-        spdlog::error("Relay: worker refused connection: {}", respStr);
-        closesocket(clientSock_);
-        delete this;
+    // Replay what the client already sent before we fell back to the tunnel.
+    if (!initialData_.empty() && !ws_.sendBinary(initialData_.data(), initialData_.size())) {
+        fail("ilk veri");
         return;
     }
 
-    spdlog::info("Relay: tunnel established for {}:{}", targetHost_, targetPort_);
+    spdlog::info("Tunel kuruldu: {}:{}", targetHost_, targetPort_);
 
-    // Start bidirectional pumps
     sockToWs_ = std::thread([this]() { pumpSockToWs(); });
     wsToSock_ = std::thread([this]() { pumpWsToSock(); });
 
-    // Wait for both to finish
     if (sockToWs_.joinable()) sockToWs_.join();
     if (wsToSock_.joinable()) wsToSock_.join();
 
-    spdlog::info("Relay: connection closed for {}:{}", targetHost_, targetPort_);
-    closesocket(clientSock_);
+    spdlog::debug("Tunel kapandi: {}:{}", targetHost_, targetPort_);
+
+    running_ = false;
+    if (clientSock_ != INVALID_SOCKET) {
+        closesocket(clientSock_);
+        clientSock_ = INVALID_SOCKET;
+    }
     delete this;
 }
 
 void Relay::pumpSockToWs() {
-    uint8_t buf[8192];
+    std::vector<uint8_t> buffer(32 * 1024);
 
     while (running_) {
-        int n = recv(clientSock_, reinterpret_cast<char*>(buf), sizeof(buf), 0);
-        if (n <= 0) {
-            spdlog::debug("Relay: TCP socket closed/error (recv={})", n);
-            stop();
-            return;
-        }
-
-        if (!ws_.sendBinary(buf, n)) {
-            spdlog::debug("Relay: WebSocket send failed");
-            stop();
-            return;
-        }
+        const int received = recv(clientSock_, (char*)buffer.data(), (int)buffer.size(), 0);
+        if (received <= 0) break;
+        if (!ws_.sendBinary(buffer.data(), (size_t)received)) break;
     }
+    stop();
 }
 
 void Relay::pumpWsToSock() {
-    std::vector<uint8_t> buf;
+    std::vector<uint8_t> buffer;
     bool isText = false;
 
     while (running_) {
-        int n = ws_.receive(buf, isText);
-        if (n <= 0) {
-            spdlog::debug("Relay: WebSocket closed/error (recv={})", n);
-            stop();
-            return;
-        }
-
-        // Send all received data to the TCP socket
-        const char* ptr = reinterpret_cast<const char*>(buf.data());
-        int remaining = n;
-
-        while (remaining > 0 && running_) {
-            int sent = send(clientSock_, ptr, remaining, 0);
-            if (sent <= 0) {
-                spdlog::debug("Relay: TCP socket send failed");
-                stop();
-                return;
-            }
-            ptr += sent;
-            remaining -= sent;
-        }
+        const int received = ws_.receive(buffer, isText);
+        if (received <= 0) break;
+        if (!tcp::sendAll(clientSock_, buffer.data(), (size_t)received)) break;
     }
+    stop();
 }
 
 void Relay::stop() {
     bool expected = true;
     if (running_.compare_exchange_strong(expected, false)) {
         ws_.close();
-        // Shutdown the TCP socket to unblock recv/send
-        shutdown(clientSock_, SD_BOTH);
+        if (clientSock_ != INVALID_SOCKET) shutdown(clientSock_, SD_BOTH);
     }
 }

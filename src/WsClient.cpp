@@ -20,7 +20,9 @@ void WsClient::cleanup() {
     connected_ = false;
 }
 
-bool WsClient::connect(std::string_view url) {
+bool WsClient::connect(std::string_view url,
+                       const std::vector<std::pair<std::string, std::string>>& headers,
+                       uint16_t connectPortOverride) {
     cleanup();
 
     // Parse URL: wss://host[:port]/path
@@ -56,7 +58,10 @@ bool WsClient::connect(std::string_view url) {
         host = hostPort;
     }
 
-    spdlog::info("Connecting to {}:{}{} (secure={})", host, port, path, secure);
+    const INTERNET_PORT transportPort = connectPortOverride == 0
+        ? port : (INTERNET_PORT)connectPortOverride;
+    spdlog::debug("Connecting to {}:{} via port {}{} (secure={})",
+                  host, port, transportPort, path, secure);
 
     // Convert strings to wide
     auto toWide = [](const std::string& s) -> std::wstring {
@@ -82,7 +87,7 @@ bool WsClient::connect(std::string_view url) {
     }
 
     // Create connection
-    connect_ = WinHttpConnect(session_, wHost.c_str(), port, 0);
+    connect_ = WinHttpConnect(session_, wHost.c_str(), transportPort, 0);
     if (!connect_) {
         spdlog::error("WinHttpConnect failed: {}", GetLastError());
         cleanup();
@@ -98,6 +103,19 @@ bool WsClient::connect(std::string_view url) {
         spdlog::error("WinHttpOpenRequest failed: {}", GetLastError());
         cleanup();
         return false;
+    }
+
+    if (connectPortOverride != 0 && connectPortOverride != port) {
+        const std::wstring hostHeader = toWide("Host: " + host);
+        WinHttpAddRequestHeaders(request_, hostHeader.c_str(), (DWORD)-1,
+                                 WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+    }
+
+    // Authorization for the Worker's /tunnel endpoint.
+    for (const auto& [name, value] : headers) {
+        const std::wstring line = toWide(name + ": " + value);
+        WinHttpAddRequestHeaders(request_, line.c_str(), (DWORD)-1,
+                                 WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
     }
 
     // Set WebSocket upgrade option (MSDN: NULL, 0 parameters)
@@ -131,7 +149,12 @@ bool WsClient::connect(std::string_view url) {
                         &statusCode, &statusCodeSize, WINHTTP_NO_HEADER_INDEX);
 
     if (statusCode != 101) {
-        spdlog::error("WebSocket upgrade failed, HTTP status: {}", statusCode);
+        if (statusCode == 401 || statusCode == 403) {
+            spdlog::error("Tunel kimlik dogrulamasi reddedildi (HTTP {}). "
+                          "--redeploy ile worker'i guncelleyin.", statusCode);
+        } else {
+            spdlog::error("WebSocket upgrade failed, HTTP status: {}", statusCode);
+        }
         cleanup();
         return false;
     }

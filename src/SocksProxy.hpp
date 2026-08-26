@@ -1,5 +1,8 @@
 #pragma once
 
+#include "DirectRelay.hpp"
+#include "TransparentFlow.hpp"
+
 #include <string>
 #include <cstdint>
 #include <atomic>
@@ -9,13 +12,13 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
-// Local proxy server supporting both SOCKS5 (RFC 1928) and HTTP CONNECT.
-// Auto-detects protocol from the first byte of each connection.
-// SOCKS5: used by apps launched with --proxy-server=socks5://...
-// HTTP CONNECT: used by Windows system proxy (Internet Options).
+// Local relay listener. Connections reflected by WinDivert are authenticated
+// against FlowRegistry and need no application-level handshake. Explicit
+// SOCKS5 and HTTP CONNECT remain available as a recovery/debugging path.
 class SocksProxy {
 public:
-    explicit SocksProxy(const std::string& workerUrl, uint16_t port = 1080);
+    explicit SocksProxy(RelayContext context, uint16_t port = 1080,
+                        transparent::FlowRegistry* transparentFlows = nullptr);
     ~SocksProxy();
 
     SocksProxy(const SocksProxy&) = delete;
@@ -25,10 +28,12 @@ public:
     void stop();
 
     uint16_t port() const { return port_; }
+    bool running() const { return running_.load(); }
 
 private:
-    std::string workerUrl_;
+    RelayContext context_;
     uint16_t port_;
+    transparent::FlowRegistry* transparentFlows_;
     SOCKET listenSock_ = INVALID_SOCKET;
     std::atomic<bool> running_{false};
 

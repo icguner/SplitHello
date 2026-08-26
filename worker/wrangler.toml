@@ -2,3 +2,21 @@ name = "splithello-relay"
 main = "src/index.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
+
+# SHARED_SECRET is required. Without it the Worker returns 401 for every
+# /resolve and /tunnel request - an unauthenticated deployment would be an open
+# DNS proxy and an open TCP relay billed to this account.
+#
+# `splithello.exe --setup` generates one and uploads it as a secret_text
+# binding. When deploying by hand, set it yourself and copy the same value into
+# %APPDATA%\splithello\config.json via --setup:
+#
+#   wrangler secret put SHARED_SECRET
+#
+# Rate limiting is best-effort: the Worker falls back to a per-isolate counter
+# if this binding is not available on the account.
+[[unsafe.bindings]]
+name = "RATE_LIMITER"
+type = "ratelimit"
+namespace_id = "1001"
+simple = { limit = 600, period = 60 }

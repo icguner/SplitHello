@@ -1,7 +1,14 @@
 #include "SocksProxy.hpp"
+
 #include "DirectRelay.hpp"
+#include "TcpConnect.hpp"
+
 #include <spdlog/spdlog.h>
+
+#include <charconv>
 #include <format>
+#include <optional>
+#include <vector>
 
 // SOCKS5 constants (RFC 1928)
 namespace socks5 {
@@ -17,8 +24,55 @@ namespace socks5 {
     constexpr uint8_t REP_CMD_NOT_SUPPORTED = 0x07;
 }
 
-SocksProxy::SocksProxy(const std::string& workerUrl, uint16_t port)
-    : workerUrl_(workerUrl), port_(port)
+namespace {
+
+// Parse a decimal port without throwing on junk input from the client.
+bool parsePort(std::string_view text, uint16_t& out) {
+    unsigned value = 0;
+    const auto* begin = text.data();
+    const auto* end = text.data() + text.size();
+    const auto result = std::from_chars(begin, end, value);
+    if (result.ec != std::errc{} || result.ptr != end || value == 0 || value > 65535) {
+        return false;
+    }
+    out = (uint16_t)value;
+    return true;
+}
+
+bool peerEndpoint(SOCKET socket, std::string& address, uint16_t& port) {
+    sockaddr_storage peer{};
+    int peerLength = sizeof(peer);
+    if (getpeername(socket, reinterpret_cast<sockaddr*>(&peer), &peerLength) == SOCKET_ERROR) {
+        return false;
+    }
+
+    char text[INET6_ADDRSTRLEN] = {};
+    if (peer.ss_family == AF_INET) {
+        const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(&peer);
+        if (!inet_ntop(AF_INET, &ipv4->sin_addr, text, sizeof(text))) return false;
+        port = ntohs(ipv4->sin_port);
+    } else if (peer.ss_family == AF_INET6) {
+        const auto* ipv6 = reinterpret_cast<const sockaddr_in6*>(&peer);
+        if (IN6_IS_ADDR_V4MAPPED(&ipv6->sin6_addr)) {
+            const uint8_t* bytes = ipv6->sin6_addr.u.Byte;
+            if (!inet_ntop(AF_INET, bytes + 12, text, sizeof(text))) return false;
+        } else if (!inet_ntop(AF_INET6, &ipv6->sin6_addr, text, sizeof(text))) {
+            return false;
+        }
+        port = ntohs(ipv6->sin6_port);
+    } else {
+        return false;
+    }
+
+    address = text;
+    return port != 0;
+}
+
+} // namespace
+
+SocksProxy::SocksProxy(RelayContext context, uint16_t port,
+                       transparent::FlowRegistry* transparentFlows)
+    : context_(std::move(context)), port_(port), transparentFlows_(transparentFlows)
 {}
 
 SocksProxy::~SocksProxy() {
@@ -51,21 +105,37 @@ std::string SocksProxy::recvLine(SOCKET sock) {
 }
 
 bool SocksProxy::run() {
-    listenSock_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    const int family = transparentFlows_ ? AF_INET6 : AF_INET;
+    listenSock_ = socket(family, SOCK_STREAM, IPPROTO_TCP);
     if (listenSock_ == INVALID_SOCKET) {
         spdlog::error("Listen socket olusturulamadi: {}", WSAGetLastError());
         return false;
     }
 
-    int opt = 1;
-    setsockopt(listenSock_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<char*>(&opt), sizeof(opt));
+    int exclusive = 1;
+    setsockopt(listenSock_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+               reinterpret_cast<char*>(&exclusive), sizeof(exclusive));
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(port_);
+    int bindResult = SOCKET_ERROR;
+    if (transparentFlows_) {
+        int ipv6Only = 0;
+        setsockopt(listenSock_, IPPROTO_IPV6, IPV6_V6ONLY,
+                   reinterpret_cast<char*>(&ipv6Only), sizeof(ipv6Only));
 
-    if (bind(listenSock_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+        sockaddr_in6 address{};
+        address.sin6_family = AF_INET6;
+        address.sin6_addr = in6addr_any;
+        address.sin6_port = htons(port_);
+        bindResult = bind(listenSock_, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+    } else {
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(port_);
+        bindResult = bind(listenSock_, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+    }
+
+    if (bindResult == SOCKET_ERROR) {
         spdlog::error("Port {} bind hatasi: {}", port_, WSAGetLastError());
         closesocket(listenSock_);
         listenSock_ = INVALID_SOCKET;
@@ -80,10 +150,14 @@ bool SocksProxy::run() {
     }
 
     running_ = true;
-    spdlog::info("Proxy dinliyor: 127.0.0.1:{} (SOCKS5 + HTTP CONNECT)", port_);
+    if (transparentFlows_) {
+        spdlog::info("Transparent relay dinliyor: [::]:{} (IPv4 + IPv6)", port_);
+    } else {
+        spdlog::info("Manuel proxy dinliyor: 127.0.0.1:{} (SOCKS5 + HTTP CONNECT)", port_);
+    }
 
     while (running_) {
-        sockaddr_in clientAddr{};
+        sockaddr_storage clientAddr{};
         int addrLen = sizeof(clientAddr);
         SOCKET clientSock = accept(listenSock_, reinterpret_cast<sockaddr*>(&clientAddr), &addrLen);
 
@@ -109,6 +183,29 @@ void SocksProxy::stop() {
 }
 
 void SocksProxy::handleClient(SOCKET clientSock) {
+    if (transparentFlows_) {
+        std::string peerAddress;
+        uint16_t peerPort = 0;
+        if (peerEndpoint(clientSock, peerAddress, peerPort)) {
+            const std::optional<transparent::Target> target =
+                transparentFlows_->claim(peerAddress, peerPort);
+            if (target) {
+                spdlog::trace("Transparent CONNECT {}:{}", target->address, target->targetPort);
+                auto* relay = new DirectRelay(clientSock, context_, target->address,
+                                              target->targetPort, target->address,
+                                              target->connectPort);
+                relay->start();
+                return;
+            }
+        }
+
+        // A listener bound to all local interfaces must never become an open
+        // proxy. Only a SYN previously observed by WinDivert is accepted.
+        spdlog::warn("Yetkisiz transparent relay baglantisi reddedildi");
+        closesocket(clientSock);
+        return;
+    }
+
     // Peek first byte to detect protocol
     uint8_t firstByte;
     int peeked = recv(clientSock, reinterpret_cast<char*>(&firstByte), 1, MSG_PEEK);
@@ -139,7 +236,7 @@ void SocksProxy::handleClient(SOCKET clientSock) {
     spdlog::info("CONNECT {}:{}", targetHost, targetPort);
 
     // Create direct relay (takes ownership, self-destructs)
-    auto* relay = new DirectRelay(clientSock, workerUrl_, targetHost, targetPort);
+    auto* relay = new DirectRelay(clientSock, context_, std::move(targetHost), targetPort);
     relay->start();
 }
 
@@ -157,12 +254,23 @@ bool SocksProxy::httpConnectHandshake(SOCKET sock, std::string& targetHost, uint
     std::string method = requestLine.substr(0, spacePos);
 
     if (method != "CONNECT") {
-        // Non-CONNECT HTTP requests - return 405
+        // Plain-HTTP proxying (absolute-URI requests) is not implemented: there
+        // is no ClientHello to fragment on port 80. The system proxy is
+        // registered for https only, so this should only be reached by a
+        // manually configured client.
         spdlog::debug("HTTP {} istegi reddedildi (sadece CONNECT desteklenir)", method);
-        const char* resp = "HTTP/1.1 405 Method Not Allowed\r\n"
-                           "Content-Length: 0\r\n"
-                           "Connection: close\r\n\r\n";
-        send(sock, resp, (int)strlen(resp), 0);
+
+        // Drain the rest of the request before replying. Closing a socket that
+        // still has unread data triggers an abortive reset, and the client then
+        // sees a dropped connection instead of the status we just sent.
+        while (!recvLine(sock).empty()) {}
+
+        static constexpr std::string_view resp =
+            "HTTP/1.1 405 Method Not Allowed\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n\r\n";
+        tcp::sendAll(sock, resp.data(), resp.size());
+        shutdown(sock, SD_SEND);
         return false;
     }
 
@@ -175,7 +283,10 @@ bool SocksProxy::httpConnectHandshake(SOCKET sock, std::string& targetHost, uint
     if (colonPos == std::string::npos) return false;
 
     targetHost = hostPort.substr(0, colonPos);
-    targetPort = static_cast<uint16_t>(std::stoi(hostPort.substr(colonPos + 1)));
+    if (targetHost.empty() || !parsePort(std::string_view(hostPort).substr(colonPos + 1), targetPort)) {
+        spdlog::debug("Gecersiz CONNECT hedefi: {}", hostPort);
+        return false;
+    }
 
     // Read remaining headers until empty line
     while (true) {
@@ -184,10 +295,8 @@ bool SocksProxy::httpConnectHandshake(SOCKET sock, std::string& targetHost, uint
     }
 
     // Send 200 Connection Established
-    const char* response = "HTTP/1.1 200 Connection Established\r\n\r\n";
-    send(sock, response, (int)strlen(response), 0);
-
-    return true;
+    static constexpr std::string_view response = "HTTP/1.1 200 Connection Established\r\n\r\n";
+    return tcp::sendAll(sock, response.data(), response.size());
 }
 
 // ---- SOCKS5 ----
@@ -210,7 +319,7 @@ bool SocksProxy::socks5Handshake(SOCKET sock, std::string& targetHost, uint16_t&
     }
 
     uint8_t authReply[2] = { socks5::VERSION, hasNoAuth ? socks5::AUTH_NONE : socks5::AUTH_REJECT };
-    send(sock, reinterpret_cast<char*>(authReply), 2, 0);
+    if (!tcp::sendAll(sock, authReply, sizeof(authReply))) return false;
     if (!hasNoAuth) return false;
 
     // Phase 2: Connect request
@@ -220,7 +329,7 @@ bool SocksProxy::socks5Handshake(SOCKET sock, std::string& targetHost, uint16_t&
 
     if (req[1] != socks5::CMD_CONNECT) {
         uint8_t reply[10] = { socks5::VERSION, socks5::REP_CMD_NOT_SUPPORTED, 0x00, socks5::ATYP_IPV4 };
-        send(sock, reinterpret_cast<char*>(reply), 10, 0);
+        tcp::sendAll(sock, reply, sizeof(reply));
         return false;
     }
 
@@ -262,7 +371,5 @@ bool SocksProxy::socks5Handshake(SOCKET sock, std::string& targetHost, uint16_t&
     reply[0] = socks5::VERSION;
     reply[1] = socks5::REP_SUCCESS;
     reply[3] = socks5::ATYP_IPV4;
-    send(sock, reinterpret_cast<char*>(reply), 10, 0);
-
-    return true;
+    return tcp::sendAll(sock, reply, sizeof(reply));
 }

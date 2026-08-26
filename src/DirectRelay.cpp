@@ -1,18 +1,84 @@
 #include "DirectRelay.hpp"
+
+#include "PacketStrategy.hpp"
+#include "Relay.hpp"
+#include "TcpConnect.hpp"
+
 #include <spdlog/spdlog.h>
-#include <vector>
-#include <format>
 
-#include <winhttp.h>
-#pragma comment(lib, "winhttp.lib")
+#include <algorithm>
 
-DirectRelay::DirectRelay(SOCKET clientSock, const std::string& workerUrl,
-                         const std::string& targetHost, uint16_t targetPort)
+namespace {
+
+// Upper bound on what we will buffer while waiting for a complete ClientHello.
+// A TLS record cannot exceed 16 KiB; the extra room absorbs whatever the client
+// pipelines behind it.
+constexpr size_t kMaxHelloBuffer = 64 * 1024;
+
+// How long to wait for the client to produce its first bytes. Server-first
+// protocols tunnelled through CONNECT never send anything, so this must expire
+// rather than hang the connection.
+constexpr unsigned kClientFirstByteTimeoutMs = 4000;
+constexpr unsigned kClientContinuationTimeoutMs = 2000;
+
+constexpr unsigned kConnectAttemptDelayMs = 250;   // RFC 8305 recommends 250ms
+constexpr unsigned kConnectTimeoutMs = 10000;
+
+// Known paths normally succeed on the first cached profile. An unknown path
+// may need both packet-level and TLS-record families before it can be classified.
+constexpr size_t kMaxProbeAttempts = 12;
+
+// After a blocked attempt the DPI box often keeps resetting the same 5-tuple
+// for a moment. Retrying instantly makes the next profile look broken when it
+// is only caught in that residual window.
+constexpr unsigned kRetryPauseMs = 150;
+
+constexpr size_t kProbeReadBufferSize = 32 * 1024;
+constexpr size_t kPumpBufferSize = 64 * 1024;
+constexpr size_t kMaxProbeResponse = 64 * 1024;
+
+// Addresses for hosts the Worker could not answer for. Poisoned for blocked
+// domains, but correct for everything else, so it is a useful fallback.
+std::vector<std::string> systemResolve(const std::string& host, uint16_t port) {
+    std::vector<std::string> out;
+
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    addrinfo* resolved = nullptr;
+    if (getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &resolved) != 0) {
+        return out;
+    }
+
+    for (addrinfo* it = resolved; it; it = it->ai_next) {
+        char text[INET6_ADDRSTRLEN] = {};
+        if (it->ai_family == AF_INET) {
+            inet_ntop(AF_INET, &((sockaddr_in*)it->ai_addr)->sin_addr, text, sizeof(text));
+        } else if (it->ai_family == AF_INET6) {
+            inet_ntop(AF_INET6, &((sockaddr_in6*)it->ai_addr)->sin6_addr, text, sizeof(text));
+        } else {
+            continue;
+        }
+        if (text[0]) out.emplace_back(text);
+    }
+    freeaddrinfo(resolved);
+    return out;
+}
+
+} // namespace
+
+DirectRelay::DirectRelay(SOCKET clientSock, const RelayContext& context,
+                         std::string targetHost, uint16_t targetPort,
+                         std::string originalTargetAddress,
+                         uint16_t connectPort)
     : clientSock_(clientSock)
-    , workerUrl_(workerUrl)
-    , targetHost_(targetHost)
+    , context_(context)
+    , targetHost_(std::move(targetHost))
     , targetPort_(targetPort)
-{}
+    , originalTargetAddress_(std::move(originalTargetAddress))
+    , connectPort_(connectPort == 0 ? targetPort : connectPort) {}
 
 DirectRelay::~DirectRelay() {
     stop();
@@ -22,399 +88,426 @@ void DirectRelay::start() {
     std::thread([this]() { run(); }).detach();
 }
 
-// --- DNS Resolution via Worker /resolve endpoint ---
+// ---- Address resolution ----
 
-static std::wstring toWide(const std::string& s) {
-    if (s.empty()) return {};
-    int sz = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
-    std::wstring w(sz, 0);
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), w.data(), sz);
-    return w;
-}
+bool DirectRelay::prepareCandidates() {
+    candidates_.clear();
 
-// Extract a string value from simple JSON: "key":"value"
-static std::string jsonGet(const std::string& json, const std::string& key) {
-    std::string needle = "\"" + key + "\"";
-    auto pos = json.find(needle);
-    if (pos == std::string::npos) return {};
-    pos += needle.size();
-    while (pos < json.size() && (json[pos] == ' ' || json[pos] == ':')) pos++;
-    if (pos >= json.size() || json[pos] != '"') return {};
-    pos++;
-    std::string result;
-    while (pos < json.size() && json[pos] != '"') {
-        if (json[pos] == '\\' && pos + 1 < json.size()) pos++;
-        result += json[pos++];
-    }
-    return result;
-}
-
-std::string DirectRelay::resolveDns(const std::string& host) {
-    // Parse Worker URL to get the HTTPS host
-    // workerUrl_ is like "wss://workerdpi-relay.xxx.workers.dev"
-    std::string workerHost;
-    auto pos = workerUrl_.find("://");
-    if (pos != std::string::npos) {
-        workerHost = workerUrl_.substr(pos + 3);
-        auto slash = workerHost.find('/');
-        if (slash != std::string::npos) workerHost.resize(slash);
+    // Preserve the address selected by the application, then add the cached
+    // dual-stack pool. Redirecting the SYN to localhost makes the application
+    // believe that its first address connected immediately, so its own Happy
+    // Eyeballs fallback can no longer race IPv4 against a broken IPv6 route.
+    // The transparent DNS proxy warms this resolver cache before TLS arrives.
+    if (!originalTargetAddress_.empty()) {
+        candidates_.push_back(originalTargetAddress_);
     }
 
-    if (workerHost.empty()) {
-        spdlog::warn("DNS: Worker URL parse hatasi, hostname olarak kullaniliyor");
-        return {};
-    }
-
-    std::wstring wHost = toWide(workerHost);
-    std::wstring wPath = toWide("/resolve?host=" + host);
-
-    HINTERNET session = WinHttpOpen(L"WorkerDPI-DNS/1.0",
-                                    WINHTTP_ACCESS_TYPE_NO_PROXY,
-                                    WINHTTP_NO_PROXY_NAME,
-                                    WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session) {
-        spdlog::error("DNS: WinHttpOpen failed: {}", GetLastError());
-        return {};
-    }
-
-    // Set timeouts: resolve=5s, connect=5s, send=5s, receive=5s
-    DWORD timeout = 5000;
-    WinHttpSetTimeouts(session, timeout, timeout, timeout, timeout);
-
-    HINTERNET conn = WinHttpConnect(session, wHost.c_str(),
-                                    INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (!conn) {
-        spdlog::error("DNS: WinHttpConnect failed: {}", GetLastError());
-        WinHttpCloseHandle(session);
-        return {};
-    }
-
-    HINTERNET req = WinHttpOpenRequest(conn, L"GET", wPath.c_str(),
-                                       nullptr, WINHTTP_NO_REFERER,
-                                       WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                       WINHTTP_FLAG_SECURE);
-    if (!req) {
-        spdlog::error("DNS: WinHttpOpenRequest failed: {}", GetLastError());
-        WinHttpCloseHandle(conn);
-        WinHttpCloseHandle(session);
-        return {};
-    }
-
-    if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                            WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
-        spdlog::error("DNS: WinHttpSendRequest failed: {}", GetLastError());
-        WinHttpCloseHandle(req);
-        WinHttpCloseHandle(conn);
-        WinHttpCloseHandle(session);
-        return {};
-    }
-
-    if (!WinHttpReceiveResponse(req, nullptr)) {
-        spdlog::error("DNS: WinHttpReceiveResponse failed: {}", GetLastError());
-        WinHttpCloseHandle(req);
-        WinHttpCloseHandle(conn);
-        WinHttpCloseHandle(session);
-        return {};
-    }
-
-    // Check HTTP status
-    DWORD statusCode = 0;
-    DWORD scSize = sizeof(statusCode);
-    WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &scSize,
-                        WINHTTP_NO_HEADER_INDEX);
-
-    // Read response body
-    std::string body;
-    DWORD available = 0;
-    do {
-        WinHttpQueryDataAvailable(req, &available);
-        if (available == 0) break;
-        std::vector<char> buf(available);
-        DWORD bytesRead = 0;
-        WinHttpReadData(req, buf.data(), available, &bytesRead);
-        body.append(buf.data(), bytesRead);
-    } while (available > 0);
-
-    WinHttpCloseHandle(req);
-    WinHttpCloseHandle(conn);
-    WinHttpCloseHandle(session);
-
-    if (statusCode != 200) {
-        spdlog::warn("DNS: /resolve HTTP {} for {}: {}", statusCode, host, body);
-        return {};
-    }
-
-    std::string ip = jsonGet(body, "ip");
-    if (!ip.empty()) {
-        spdlog::info("DNS: {} -> {}", host, ip);
-    } else {
-        spdlog::warn("DNS: bos yanit for {}: {}", host, body);
-    }
-    return ip;
-}
-
-// --- Direct TCP Connection ---
-
-SOCKET DirectRelay::connectTarget(const std::string& ip, uint16_t port) {
-    // Try to resolve as address (could be IP or hostname)
-    addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-
-    addrinfo* result = nullptr;
-    std::string portStr = std::to_string(port);
-
-    if (getaddrinfo(ip.c_str(), portStr.c_str(), &hints, &result) != 0) {
-        spdlog::error("getaddrinfo hatasi: {} ({})", ip, WSAGetLastError());
-        return INVALID_SOCKET;
-    }
-
-    SOCKET sock = INVALID_SOCKET;
-    for (auto* ptr = result; ptr; ptr = ptr->ai_next) {
-        sock = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
-        if (sock == INVALID_SOCKET) continue;
-
-        if (::connect(sock, ptr->ai_addr, (int)ptr->ai_addrlen) == SOCKET_ERROR) {
-            closesocket(sock);
-            sock = INVALID_SOCKET;
-            continue;
-        }
-        break; // connected
-    }
-    freeaddrinfo(result);
-
-    return sock;
-}
-
-// --- TLS Fragmentation ---
-
-// Find SNI hostname offset and length within a TLS ClientHello
-static bool findSniOffset(const uint8_t* data, size_t len, size_t& sniOffset, size_t& sniLen) {
-    // Minimum: 5 (record) + 4 (handshake) + 2 (version) + 32 (random) = 43
-    if (len < 43) return false;
-
-    size_t pos = 5; // skip TLS record header
-    pos += 4;       // skip handshake header (type + length)
-    pos += 2;       // skip client version
-    pos += 32;      // skip random
-
-    // Session ID
-    if (pos >= len) return false;
-    uint8_t sidLen = data[pos++];
-    pos += sidLen;
-
-    // Cipher suites
-    if (pos + 2 > len) return false;
-    uint16_t csLen = (data[pos] << 8) | data[pos + 1];
-    pos += 2 + csLen;
-
-    // Compression methods
-    if (pos >= len) return false;
-    uint8_t cmLen = data[pos++];
-    pos += cmLen;
-
-    // Extensions length
-    if (pos + 2 > len) return false;
-    uint16_t extTotalLen = (data[pos] << 8) | data[pos + 1];
-    pos += 2;
-
-    size_t extEnd = pos + extTotalLen;
-    if (extEnd > len) extEnd = len;
-
-    while (pos + 4 <= extEnd) {
-        uint16_t extType = (data[pos] << 8) | data[pos + 1];
-        uint16_t extLen = (data[pos + 2] << 8) | data[pos + 3];
-        pos += 4;
-
-        if (extType == 0x0000 && pos + extLen <= extEnd) {
-            // SNI extension found
-            // SNI list: listLen(2) + nameType(1) + nameLen(2) + name
-            if (extLen >= 5) {
-                size_t nameLen = (data[pos + 3] << 8) | data[pos + 4];
-                sniOffset = pos + 5;  // start of hostname
-                sniLen = nameLen;
-                return (sniOffset + sniLen <= len);
+    if (context_.resolver && !tcp::isIpLiteral(targetHost_)) {
+        const dns::Result result = context_.resolver->resolve(targetHost_);
+        for (const std::string& address : result.candidates()) {
+            if (std::find(candidates_.begin(), candidates_.end(), address) ==
+                candidates_.end()) {
+                candidates_.push_back(address);
             }
         }
-        pos += extLen;
-    }
-    return false;
-}
-
-bool DirectRelay::fragmentAndSend(const uint8_t* data, size_t len) {
-    if (len < 6) {
-        return send(targetSock_, (const char*)data, (int)len, 0) > 0;
     }
 
-    bool isTls = (data[0] == 0x16 && data[1] == 0x03);
-    if (!isTls) {
-        return send(targetSock_, (const char*)data, (int)len, 0) > 0;
+    if (candidates_.empty()) {
+        spdlog::warn("DNS: {} Worker uzerinden cozulemedi, sistem cozumleyicisi deneniyor",
+                     targetHost_);
+        candidates_ = systemResolve(targetHost_, targetPort_);
     }
 
-    // Enable TCP_NODELAY so each send() goes as a separate TCP segment
-    int nodelay = 1;
-    setsockopt(targetSock_, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
-
-    uint16_t recordLen = (data[3] << 8) | data[4];
-    size_t totalRecord = 5 + recordLen;
-    if (totalRecord > len) totalRecord = len;
-
-    // Strategy: TLS Record Fragmentation
-    // Split the single TLS record into two valid TLS records.
-    // DPI that inspects within a single TLS record won't find the full SNI.
-    // This is valid per TLS RFC - handshake messages can span multiple records.
-
-    // Find SNI to split right in the middle of the hostname
-    size_t sniOff = 0, sniLen = 0;
-    size_t splitPayloadAt;
-
-    if (findSniOffset(data, len, sniOff, sniLen) && sniLen > 2) {
-        // Split in the middle of the SNI hostname
-        splitPayloadAt = (sniOff + sniLen / 2) - 5; // offset within payload (subtract record header)
-        spdlog::debug("SNI found at offset {}, len {}, split at payload byte {}",
-                      sniOff, sniLen, splitPayloadAt);
-    } else {
-        // SNI not found, split after 2 bytes of payload
-        splitPayloadAt = 2;
+    if (candidates_.empty()) {
+        spdlog::error("Adres cozumlenemedi: {}", targetHost_);
+        return false;
     }
-
-    if (splitPayloadAt < 1) splitPayloadAt = 1;
-    if (splitPayloadAt >= recordLen) splitPayloadAt = recordLen / 2;
-
-    size_t part1Len = splitPayloadAt;
-    size_t part2Len = recordLen - splitPayloadAt;
-
-    // Build and send first TLS record: [type][ver][len1][payload_part1]
-    uint8_t hdr1[5] = { data[0], data[1], data[2],
-                        (uint8_t)(part1Len >> 8), (uint8_t)(part1Len & 0xFF) };
-    send(targetSock_, (const char*)hdr1, 5, 0);
-    send(targetSock_, (const char*)(data + 5), (int)part1Len, 0);
-
-    Sleep(50);
-
-    // Build and send second TLS record: [type][ver][len2][payload_part2]
-    uint8_t hdr2[5] = { data[0], data[1], data[2],
-                        (uint8_t)(part2Len >> 8), (uint8_t)(part2Len & 0xFF) };
-    send(targetSock_, (const char*)hdr2, 5, 0);
-
-    // Send second payload in small chunks for extra TCP fragmentation
-    const uint8_t* part2Data = data + 5 + part1Len;
-    size_t sent = 0;
-    while (sent < part2Len) {
-        size_t chunk = (part2Len - sent > 5) ? 5 : (part2Len - sent);
-        send(targetSock_, (const char*)(part2Data + sent), (int)chunk, 0);
-        sent += chunk;
-        if (sent < part2Len) Sleep(1);
-    }
-
-    // Send any trailing data after the TLS record
-    if (totalRecord < len) {
-        send(targetSock_, (const char*)(data + totalRecord), (int)(len - totalRecord), 0);
-    }
-
-    spdlog::debug("TLS record split: {}+{} payload bytes (record total {})",
-                  part1Len, part2Len, recordLen);
-
-    // Disable TCP_NODELAY
-    nodelay = 0;
-    setsockopt(targetSock_, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
-
     return true;
 }
 
-// --- Main Flow ---
+bool DirectRelay::connectTarget() {
+    targetSock_ = tcp::connectAny(candidates_, connectPort_, kConnectAttemptDelayMs,
+                                  kConnectTimeoutMs, connectedAddress_);
+    if (targetSock_ == INVALID_SOCKET) {
+        spdlog::error("Baglanti kurulamadi: {}:{}", targetHost_, targetPort_);
+        return false;
+    }
+    spdlog::debug("Baglandi: {} ({}:{})", connectedAddress_, targetHost_, targetPort_);
+    return true;
+}
+
+bool DirectRelay::reconnect() {
+    if (targetSock_ != INVALID_SOCKET) {
+        closesocket(targetSock_);
+        targetSock_ = INVALID_SOCKET;
+    }
+    return connectTarget();
+}
+
+// ---- ClientHello reassembly ----
+
+bool DirectRelay::collectClientHello() {
+    clientBuffer_.clear();
+    helloComplete_ = false;
+
+    std::vector<uint8_t> chunk(16384);
+    unsigned timeoutMs = kClientFirstByteTimeoutMs;
+
+    while (true) {
+        const int received = tcp::recvTimeout(clientSock_, chunk.data(), chunk.size(), timeoutMs);
+
+        if (received == tcp::kTimedOut) {
+            // Either a server-first protocol, or a client that stopped mid-hello.
+            // Forward whatever we have; the target decides what to make of it.
+            if (!clientBuffer_.empty()) {
+                spdlog::debug("ClientHello tamamlanmadi ({} bayt), oldugu gibi iletiliyor",
+                              clientBuffer_.size());
+            }
+            return true;
+        }
+        if (received <= 0) {
+            return !clientBuffer_.empty();
+        }
+
+        clientBuffer_.insert(clientBuffer_.end(), chunk.begin(), chunk.begin() + received);
+        timeoutMs = kClientContinuationTimeoutMs;
+
+        const tls::ParseStatus status =
+            tls::parseClientHello(clientBuffer_.data(), clientBuffer_.size(), hello_);
+
+        switch (status) {
+        case tls::ParseStatus::Ok:
+            helloComplete_ = true;
+            if (!hello_.serverName.empty()) {
+                targetHost_ = strategy::normalizeHost(hello_.serverName);
+            }
+            if (hello_.hasEch) {
+                spdlog::debug("{}: ECH uzantisi var (gercek ECH veya GREASE); tum guvenli profiller acik",
+                             targetHost_);
+            } else if (hello_.spansRecords) {
+                spdlog::debug("{}: ClientHello zaten birden fazla kayda yayilmis", targetHost_);
+            }
+            return true;
+
+        case tls::ParseStatus::NeedMore:
+            if (clientBuffer_.size() >= kMaxHelloBuffer) {
+                spdlog::warn("ClientHello {} bayti asti, parcalanmadan iletiliyor", kMaxHelloBuffer);
+                return true;
+            }
+            break; // keep reading
+
+        case tls::ParseStatus::NotTls:
+            spdlog::debug("{}:{} TLS degil, duz iletim", targetHost_, targetPort_);
+            return true;
+
+        case tls::ParseStatus::Malformed:
+            spdlog::debug("{}:{} bozuk TLS kaydi, duz iletim", targetHost_, targetPort_);
+            return true;
+        }
+    }
+}
+
+// ---- Fragmentation ----
+
+void DirectRelay::setNoDelay(bool enabled) {
+    if (targetSock_ == INVALID_SOCKET) return;
+    int value = enabled ? 1 : 0;
+    setsockopt(targetSock_, IPPROTO_TCP, TCP_NODELAY, (const char*)&value, sizeof(value));
+}
+
+bool DirectRelay::writeFragmented(const strategy::FragmentPlan& plan) {
+    const uint8_t* data = clientBuffer_.data();
+    const uint8_t contentType = data[0];
+    const uint8_t versionMajor = data[1];
+    const uint8_t versionMinor = data[2];
+    const uint8_t* payload = data + tls::kRecordHeaderSize;
+    const size_t payloadLength = hello_.recordPayloadLength;
+
+    // Split points plus the implicit final boundary.
+    std::vector<size_t> boundaries = plan.recordSplits;
+    boundaries.push_back(payloadLength);
+
+    size_t start = 0;
+    for (const size_t end : boundaries) {
+        const size_t length = end - start;
+        const uint8_t header[tls::kRecordHeaderSize] = {
+            contentType, versionMajor, versionMinor,
+            (uint8_t)(length >> 8), (uint8_t)(length & 0xFF)
+        };
+
+        if (!tcp::sendAll(targetSock_, header, sizeof(header))) return false;
+
+        if (plan.writeChunk == 0) {
+            if (!tcp::sendAll(targetSock_, payload + start, length)) return false;
+        } else {
+            for (size_t offset = 0; offset < length; offset += plan.writeChunk) {
+                const size_t piece = std::min(plan.writeChunk, length - offset);
+                if (!tcp::sendAll(targetSock_, payload + start + offset, piece)) return false;
+                if (offset + piece < length) Sleep(1);
+            }
+        }
+
+        start = end;
+        if (start < payloadLength && plan.delayMs > 0) Sleep(plan.delayMs);
+    }
+    return true;
+}
+
+bool DirectRelay::writePlan(const strategy::FragmentPlan& plan) {
+    // Each send() has to leave as its own segment, so Nagle must be off while
+    // we are laying out the fragments.
+    setNoDelay(true);
+
+    bool ok = true;
+
+    if (helloComplete_ && plan.splitsAnything()) {
+        ok = writeFragmented(plan);
+    } else if (helloComplete_) {
+        ok = tcp::sendAll(targetSock_, clientBuffer_.data(), hello_.recordTotalLength);
+    }
+
+    setNoDelay(false);
+    return ok;
+}
+
+diagnosis::ProbeSignal DirectRelay::awaitResponse(std::vector<uint8_t>& out) {
+    std::vector<uint8_t> buffer(kProbeReadBufferSize);
+    out.clear();
+
+    const ULONGLONG deadline = GetTickCount64() + context_.probeTimeoutMs;
+    while (out.size() < kMaxProbeResponse) {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= deadline) return diagnosis::ProbeSignal::Timeout;
+
+        const unsigned remaining = (unsigned)std::min<ULONGLONG>(deadline - now, 0xFFFFFFFFULL);
+        const int received = tcp::recvTimeout(targetSock_, buffer.data(), buffer.size(), remaining);
+
+        if (received == tcp::kTimedOut) return diagnosis::ProbeSignal::Timeout;
+        if (received == 0) return diagnosis::ProbeSignal::Closed;
+        if (received < 0) return diagnosis::ProbeSignal::Reset;
+
+        out.insert(out.end(), buffer.begin(), buffer.begin() + received);
+        switch (tls::classifyServerResponse(out.data(), out.size())) {
+        case tls::ServerResponseStatus::ServerHello:
+            return diagnosis::ProbeSignal::ServerHello;
+        case tls::ServerResponseStatus::Alert:
+            return diagnosis::ProbeSignal::Alert;
+        case tls::ServerResponseStatus::Unexpected:
+            return diagnosis::ProbeSignal::Unexpected;
+        case tls::ServerResponseStatus::NeedMore:
+            break;
+        }
+    }
+    return diagnosis::ProbeSignal::Unexpected;
+}
+
+bool DirectRelay::flushTrailingClientData() {
+    if (!helloComplete_ || hello_.spansRecords ||
+        clientBuffer_.size() <= hello_.recordTotalLength) return true;
+
+    // RFC 8446 permits 0-RTT application data immediately after ClientHello.
+    // It must be delivered only to the winning connection: replaying it on
+    // every diagnostic attempt could repeat a non-idempotent request.
+    return tcp::sendAll(targetSock_, clientBuffer_.data() + hello_.recordTotalLength,
+                        clientBuffer_.size() - hello_.recordTotalLength);
+}
+
+bool DirectRelay::deliverHello() {
+    if (clientBuffer_.empty()) return true; // server-first protocol: nothing to send yet
+
+    if (!helloComplete_) {
+        // Not something we can safely re-frame - forward it byte for byte.
+        return tcp::sendAll(targetSock_, clientBuffer_.data(), clientBuffer_.size());
+    }
+
+    if (hello_.spansRecords) {
+        // We only know the first record is complete; the remainder of the
+        // handshake may still be waiting in the client socket. Forward what
+        // we have and switch to streaming instead of waiting for a response
+        // that the server cannot produce until later records arrive.
+        activeProfile_ = "none";
+        return tcp::sendAll(targetSock_, clientBuffer_.data(), clientBuffer_.size());
+    }
+
+    // --strategy pins one profile: useful for comparing profiles on a given
+    // network, and it must not pollute what we have learned. "none" trails it
+    // so a hello the forced profile cannot describe (no SNI, ECH, already
+    // fragmented) still goes out rather than failing the connection.
+    const std::vector<std::string> order =
+        context_.forcedProfile.empty()
+            ? context_.strategies->probeOrder(context_.networkId, targetHost_, hello_)
+            : (context_.forcedProfile == "none"
+                   ? std::vector<std::string>{"none"}
+                   : std::vector<std::string>{context_.forcedProfile, "none"});
+    const std::string remembered = context_.strategies->lookup(context_.networkId, targetHost_);
+
+    size_t attempts = 0;
+    std::vector<diagnosis::Attempt> evidence;
+    for (const std::string& profile : order) {
+        if (attempts >= kMaxProbeAttempts) break;
+
+        strategy::FragmentPlan plan;
+        const bool applicable = strategy::buildPlan(profile, hello_, context_.splitDelayMs, plan);
+        if (!applicable && profile != "none") continue;
+
+        // Every retry needs a fresh connection: the previous one was reset or
+        // blackholed, and the server has already seen a partial handshake.
+        if (attempts > 0) {
+            Sleep(kRetryPauseMs);
+            if (!reconnect()) return false;
+        }
+        attempts++;
+
+        packet_strategy::Policy packetPolicy;
+        if (context_.packetPolicies &&
+            packet_strategy::policyForProfile(profile, hello_, packetPolicy)) {
+            sockaddr_storage local{};
+            int localLength = sizeof(local);
+            uint16_t localPort = 0;
+            if (getsockname(targetSock_, reinterpret_cast<sockaddr*>(&local),
+                            &localLength) == 0) {
+                if (local.ss_family == AF_INET) {
+                    localPort = ntohs(reinterpret_cast<sockaddr_in*>(&local)->sin_port);
+                } else if (local.ss_family == AF_INET6) {
+                    localPort = ntohs(reinterpret_cast<sockaddr_in6*>(&local)->sin6_port);
+                }
+            }
+            context_.packetPolicies->arm(connectedAddress_, localPort, packetPolicy);
+        }
+
+        const ULONGLONG probeStarted = GetTickCount64();
+        if (!writePlan(plan)) {
+            spdlog::debug("{}: '{}' profili gonderilemedi", targetHost_, profile);
+            continue;
+        }
+
+        const diagnosis::ProbeSignal outcome = awaitResponse(firstResponse_);
+        const ULONGLONG elapsed = GetTickCount64() - probeStarted;
+        evidence.push_back({profile, outcome,
+                            (unsigned)std::min<ULONGLONG>(elapsed, 0xFFFFFFFFULL)});
+
+        if (outcome == diagnosis::ProbeSignal::ServerHello) {
+            activeProfile_ = profile;
+            const diagnosis::Verdict verdict = diagnosis::infer(evidence);
+            if (!context_.forcedProfile.empty()) {
+                spdlog::debug("{}: '{}' (zorlanan)", targetHost_, profile);
+            } else {
+                context_.strategies->remember(context_.networkId, targetHost_, profile,
+                                              verdict.kind, verdict.confidence);
+                const bool newlyLearned = profile != remembered || attempts > 1;
+                if (verdict.kind == diagnosis::Kind::NoInterference) {
+                    spdlog::trace("{}: normal TLS, sure={}ms", targetHost_,
+                                  evidence.back().elapsedMs);
+                } else if (newlyLearned) {
+                    spdlog::info("{}: teshis={} guven={}% profil='{}' sure={}ms ({}. deneme)",
+                                 targetHost_, diagnosis::name(verdict.kind), verdict.confidence,
+                                 profile, evidence.back().elapsedMs, attempts);
+                } else {
+                    spdlog::trace("{}: ogrenilmis profil='{}' sure={}ms",
+                                  targetHost_, profile, evidence.back().elapsedMs);
+                }
+            }
+            return true;
+        }
+
+        if (profile == remembered && context_.forcedProfile.empty()) {
+            context_.strategies->recordFailure(context_.networkId, targetHost_, profile);
+        }
+        spdlog::debug("{}: '{}' basarisiz - {}", targetHost_, profile,
+                      diagnosis::describe(outcome));
+        firstResponse_.clear();
+    }
+
+    const diagnosis::Verdict verdict = diagnosis::infer(evidence);
+    spdlog::warn("{}:{} icin sonuc yok; teshis={} guven={}%",
+                 targetHost_, targetPort_, diagnosis::name(verdict.kind), verdict.confidence);
+    return false;
+}
+
+// ---- Worker tunnel fallback ----
+
+bool DirectRelay::handOffToTunnel() {
+    if (!context_.tunnelFallback || context_.workerUrl.empty()) return false;
+
+    spdlog::info("{}:{} Worker tuneline devrediliyor", targetHost_, targetPort_);
+
+    auto* relay = new Relay(clientSock_, context_.workerUrl, context_.sharedSecret,
+                            targetHost_, targetPort_, std::move(clientBuffer_),
+                            context_.bypassConnectPort);
+    clientSock_ = INVALID_SOCKET; // ownership transferred
+    relay->start();
+    return true;
+}
+
+// ---- Main flow ----
 
 void DirectRelay::run() {
     running_ = true;
 
-    // Step 1: Resolve DNS via Worker (bypass ISP DNS poisoning)
-    std::string connectAddr = targetHost_;
+    // Transparent connections initially carry only an IP address. Buffering
+    // first lets us recover SNI, resolve it over the Worker, and keep adaptive
+    // learning scoped to the hostname instead of a shared CDN address. Manual
+    // SOCKS/CONNECT retains its old connect-first behavior for server-first
+    // protocols.
+    const bool prepared = originalTargetAddress_.empty()
+        ? (prepareCandidates() && connectTarget() && collectClientHello())
+        : (collectClientHello() && prepareCandidates() && connectTarget());
+    if (prepared) {
+        if (deliverHello() && flushTrailingClientData()) {
+            spdlog::trace("Baglanti kuruldu: {}:{} [{}] via {}",
+                          targetHost_, targetPort_, activeProfile_, connectedAddress_);
 
-    // Check if it's already an IP address
-    bool isIp = true;
-    for (char c : targetHost_) {
-        if (c != '.' && (c < '0' || c > '9')) { isIp = false; break; }
-    }
-
-    if (!isIp) {
-        std::string resolved = resolveDns(targetHost_);
-        if (!resolved.empty()) {
-            connectAddr = resolved;
+            // Whatever the probe already read has to reach the client first.
+            const bool flushed = firstResponse_.empty() ||
+                                 tcp::sendAll(clientSock_, firstResponse_.data(),
+                                              firstResponse_.size());
+            if (flushed) {
+                clientToTarget_ = std::thread([this]() { pumpClientToTarget(); });
+                targetToClient_ = std::thread([this]() { pumpTargetToClient(); });
+                if (clientToTarget_.joinable()) clientToTarget_.join();
+                if (targetToClient_.joinable()) targetToClient_.join();
+            }
+            spdlog::trace("Baglanti kapandi: {}:{}", targetHost_, targetPort_);
         } else {
-            spdlog::warn("DNS cozumlenemedi: {}, direkt deneniyor", targetHost_);
+            handOffToTunnel(); // takes clientSock_ on success
         }
     }
 
-    // Step 2: Direct TCP connection
-    spdlog::info("Direkt baglanti: {}:{} ({})", connectAddr, targetPort_, targetHost_);
+    // Clear the handles before the destructor runs so a recycled handle value
+    // can never be shut down out from under another connection.
+    running_ = false;
+    if (clientSock_ != INVALID_SOCKET) { closesocket(clientSock_); clientSock_ = INVALID_SOCKET; }
+    if (targetSock_ != INVALID_SOCKET) { closesocket(targetSock_); targetSock_ = INVALID_SOCKET; }
 
-    targetSock_ = connectTarget(connectAddr, targetPort_);
-    if (targetSock_ == INVALID_SOCKET) {
-        spdlog::error("Baglanti hatasi: {}:{}", connectAddr, targetPort_);
-        closesocket(clientSock_);
-        delete this;
-        return;
-    }
-
-    spdlog::info("Baglanti kuruldu: {}:{}", targetHost_, targetPort_);
-
-    // Step 3: Start bidirectional relay
-    // Client→Target pump handles TLS fragmentation on first packet
-    clientToTarget_ = std::thread([this]() { pumpClientToTarget(); });
-    targetToClient_ = std::thread([this]() { pumpTargetToClient(); });
-
-    if (clientToTarget_.joinable()) clientToTarget_.join();
-    if (targetToClient_.joinable()) targetToClient_.join();
-
-    spdlog::debug("Baglanti kapandi: {}:{}", targetHost_, targetPort_);
-
-    closesocket(clientSock_);
-    if (targetSock_ != INVALID_SOCKET) closesocket(targetSock_);
     delete this;
 }
 
 void DirectRelay::pumpClientToTarget() {
-    uint8_t buf[8192];
-    bool firstPacket = true;
+    std::vector<uint8_t> buffer(kPumpBufferSize);
 
     while (running_) {
-        int n = recv(clientSock_, (char*)buf, sizeof(buf), 0);
-        if (n <= 0) { stop(); return; }
-
-        if (firstPacket) {
-            // Fragment the first TLS packet (ClientHello with SNI)
-            if (!fragmentAndSend(buf, n)) { stop(); return; }
-            firstPacket = false;
-        } else {
-            if (send(targetSock_, (char*)buf, n, 0) <= 0) { stop(); return; }
-        }
+        const int received = recv(clientSock_, (char*)buffer.data(), (int)buffer.size(), 0);
+        if (received <= 0) break;
+        if (!tcp::sendAll(targetSock_, buffer.data(), (size_t)received)) break;
     }
+    stop();
 }
 
 void DirectRelay::pumpTargetToClient() {
-    uint8_t buf[8192];
+    std::vector<uint8_t> buffer(kPumpBufferSize);
 
     while (running_) {
-        int n = recv(targetSock_, (char*)buf, sizeof(buf), 0);
-        if (n <= 0) { stop(); return; }
-
-        const char* ptr = (const char*)buf;
-        int remaining = n;
-        while (remaining > 0 && running_) {
-            int sent = send(clientSock_, ptr, remaining, 0);
-            if (sent <= 0) { stop(); return; }
-            ptr += sent;
-            remaining -= sent;
-        }
+        const int received = recv(targetSock_, (char*)buffer.data(), (int)buffer.size(), 0);
+        if (received <= 0) break;
+        if (!tcp::sendAll(clientSock_, buffer.data(), (size_t)received)) break;
     }
+    stop();
 }
 
 void DirectRelay::stop() {
     bool expected = true;
     if (running_.compare_exchange_strong(expected, false)) {
         if (targetSock_ != INVALID_SOCKET) shutdown(targetSock_, SD_BOTH);
-        shutdown(clientSock_, SD_BOTH);
+        if (clientSock_ != INVALID_SOCKET) shutdown(clientSock_, SD_BOTH);
     }
 }
