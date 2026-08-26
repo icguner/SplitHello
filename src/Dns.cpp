@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <exception>
 #include <limits>
 
 #define WIN32_LEAN_AND_MEAN
@@ -178,24 +179,60 @@ Result Resolver::resolve(const std::string& host) {
         return direct;
     }
 
-    const unsigned long long now = GetTickCount64();
+    // A and AAAA queries for the same hostname usually arrive together. Let
+    // only one worker call /resolve while the other waits for its shared result.
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = cache_.find(key);
-        if (it != cache_.end() && it->second.expiresAtMs > now) {
-            return it->second.result;
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (true) {
+            const unsigned long long now = GetTickCount64();
+            const auto cached = cache_.find(key);
+            if (cached != cache_.end() && cached->second.expiresAtMs > now) {
+                return cached->second.result;
+            }
+
+            if (inFlight_.insert(key).second) break;
+            cacheReady_.wait(lock, [this, &key]() {
+                return !inFlight_.contains(key);
+            });
         }
     }
 
-    Result result = query(key);
+    Result result;
+    try {
+        result = query(key);
+    } catch (const std::exception& error) {
+        spdlog::error("DNS: {} sorgusu beklenmeyen hatayla sonlandi: {}", key, error.what());
+    } catch (...) {
+        spdlog::error("DNS: {} sorgusu bilinmeyen hatayla sonlandi", key);
+    }
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (cache_.size() >= kMaxCacheEntries) cache_.clear();
+
+        // Avoid the old all-or-nothing clear: besides causing a cache-miss
+        // storm, it removed the Worker's bootstrap address and could make its
+        // own DoH lookup recurse through the transparent DNS path.
+        if (!cache_.contains(key) && cache_.size() >= kMaxCacheEntries) {
+            const std::string bootstrapKey = lowercase(workerHost_);
+            auto victim = cache_.end();
+            for (auto it = cache_.begin(); it != cache_.end(); ++it) {
+                if (it->first == bootstrapKey) continue;
+                if (victim == cache_.end() ||
+                    it->second.expiresAtMs < victim->second.expiresAtMs) {
+                    victim = it;
+                }
+            }
+            if (victim != cache_.end()) cache_.erase(victim);
+        }
 
         const unsigned lifetime = result.empty() ? kNegativeCacheSeconds : result.ttlSeconds;
-        cache_[key] = Entry{result, now + (unsigned long long)lifetime * 1000ULL};
+        cache_[key] = Entry{
+            result,
+            GetTickCount64() + (unsigned long long)lifetime * 1000ULL
+        };
+        inFlight_.erase(key);
     }
+    cacheReady_.notify_all();
     return result;
 }
 

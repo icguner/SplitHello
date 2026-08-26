@@ -38,7 +38,11 @@ SOCKET beginConnect(const std::string& address, uint16_t port) {
     }
 
     u_long nonBlocking = 1;
-    ioctlsocket(sock, FIONBIO, &nonBlocking);
+    if (ioctlsocket(sock, FIONBIO, &nonBlocking) == SOCKET_ERROR) {
+        closesocket(sock);
+        freeaddrinfo(resolved);
+        return INVALID_SOCKET;
+    }
 
     const int result = ::connect(sock, resolved->ai_addr, (int)resolved->ai_addrlen);
     freeaddrinfo(resolved);
@@ -50,9 +54,9 @@ SOCKET beginConnect(const std::string& address, uint16_t port) {
     return sock;
 }
 
-void makeBlocking(SOCKET sock) {
+bool makeBlocking(SOCKET sock) {
     u_long blocking = 0;
-    ioctlsocket(sock, FIONBIO, &blocking);
+    return ioctlsocket(sock, FIONBIO, &blocking) != SOCKET_ERROR;
 }
 
 } // namespace
@@ -65,7 +69,10 @@ bool sendAll(SOCKET sock, const void* data, size_t length) {
         const int chunk = (int)std::min<size_t>(left, 1 << 20);
         const int sent = ::send(sock, cursor, chunk, 0);
         if (sent == SOCKET_ERROR) {
-            if (WSAGetLastError() == WSAEWOULDBLOCK) continue; // blocking socket: rare but legal
+            if (WSAGetLastError() == WSAEWOULDBLOCK) {
+                Sleep(1); // avoid a full-core spin if a socket stayed non-blocking
+                continue;
+            }
             return false;
         }
         if (sent == 0) return false;
@@ -101,6 +108,7 @@ SOCKET connectAny(const std::vector<std::string>& addresses,
 
     const ULONGLONG deadline = GetTickCount64() + totalTimeoutMs;
     std::vector<Attempt> inFlight;
+    inFlight.reserve(std::min(addresses.size(), kMaxParallelAttempts));
     size_t nextCandidate = 0;
     ULONGLONG nextStartAt = 0; // first attempt fires immediately
 
@@ -146,7 +154,11 @@ SOCKET connectAny(const std::vector<std::string>& addresses,
         tv.tv_usec = (long)((waitMs % 1000) * 1000);
 
         const int ready = ::select(0, nullptr, &writable, &failed, &tv);
-        if (ready <= 0) continue; // timeout or error: fall through to start the next candidate
+        if (ready == SOCKET_ERROR) {
+            spdlog::debug("Baglanti yarisi select hatasi: {}", WSAGetLastError());
+            break;
+        }
+        if (ready == 0) continue; // timeout: fall through to start the next candidate
 
         for (size_t i = 0; i < inFlight.size();) {
             const SOCKET sock = inFlight[i].sock;
@@ -174,7 +186,11 @@ SOCKET connectAny(const std::vector<std::string>& addresses,
 
     for (const Attempt& attempt : inFlight) closesocket(attempt.sock);
 
-    if (winner != INVALID_SOCKET) makeBlocking(winner);
+    if (winner != INVALID_SOCKET && !makeBlocking(winner)) {
+        closesocket(winner);
+        winner = INVALID_SOCKET;
+        chosenAddress.clear();
+    }
     return winner;
 }
 

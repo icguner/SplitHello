@@ -69,8 +69,9 @@ public:
     std::string lookup(const std::string& host) const;
     std::string lookup(const std::string& networkId, const std::string& host) const;
 
-    // Records `profile` for `host` and persists immediately (writes are rare -
-    // only when a domain's winning profile actually changes).
+    // Records a bypass `profile` for `host` and persists immediately. The
+    // untouched baseline (`none`) removes a stale mapping instead of filling
+    // the cache with healthy destinations that need no learned state.
     void remember(const std::string& host, const std::string& profile);
     void remember(const std::string& networkId, const std::string& host,
                   const std::string& profile, diagnosis::Kind kind,
