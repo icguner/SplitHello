@@ -135,6 +135,9 @@ std::wstring trLabel(const std::string& key) {
         {"tls-incompatible", L"TLS uyumsuzluğu"},
         {"transport-failure", L"taşıma hatası"},
         {"throttling-suspected", L"yavaşlatma şüphesi"},
+        {"learned-profile", L"öğrenilmiş profil (kanıtsız)"},
+        {"transient-failure", L"geçici ağ hatası"},
+        {"interference-suspected", L"SNI müdahalesi şüphesi (tek örnek)"},
         {"server-hello", L"ServerHello"},
         {"tls-alert", L"TLS Alert"},
         {"timeout", L"zaman aşımı"},
@@ -1427,7 +1430,7 @@ struct DashboardPanel::Impl {
             {L"DOKUNULMADI", groupCount(data.normal), L"müdahale kanıtı yok",
              theme.quiet, static_cast<double>(data.normal),
              static_cast<double>(data.previous.normal), 1},
-            {L"ATLATILDI", groupCount(data.bypassed), L"alternatif profil kazandı",
+            {L"ATLATILDI", groupCount(data.bypassed), L"doğrulanmış karşı-deney",
              theme.acted, static_cast<double>(data.bypassed),
              static_cast<double>(data.previous.bypassed), 0},
             {L"ÇÖZÜLEMEDİ", groupCount(data.unresolved),
@@ -1496,8 +1499,9 @@ struct DashboardPanel::Impl {
         // Legend on the same line the plot starts from.
         {
             struct Item { const wchar_t* label; D2D1_COLOR_F colour; };
-            const Item items[3] = {{L"dokunulmadı", theme.quiet},
+            const Item items[4] = {{L"dokunulmadı", theme.quiet},
                                    {L"atlatıldı", theme.acted},
+                                   {L"öğrenilmiş", theme.inkFaint},
                                    {L"çözülemedi", theme.failed}};
             float x = rect.left;
             for (const Item& item : items) {
@@ -1560,11 +1564,12 @@ struct DashboardPanel::Impl {
                      theme.hover);
             }
 
-            const int64_t clean =
-                std::max<int64_t>(0, day.total - day.bypassed - day.unresolved);
+            const int64_t clean = std::max<int64_t>(
+                0, day.total - day.bypassed - day.learned - day.unresolved);
             struct Segment { int64_t value; D2D1_COLOR_F colour; };
-            const Segment segments[3] = {{clean, theme.quiet},
+            const Segment segments[4] = {{clean, theme.quiet},
                                          {day.bypassed, theme.acted},
+                                         {day.learned, theme.inkFaint},
                                          {day.unresolved, theme.failed}};
             float bottom = plotBottom;
             for (const Segment& segment : segments) {
@@ -1595,8 +1600,8 @@ struct DashboardPanel::Impl {
         if (hoverBar < 0 || hoverBar >= static_cast<int>(data.daily.size())) return;
         const telemetry::DashboardData::Day& day =
             data.daily[static_cast<size_t>(hoverBar)];
-        const int64_t clean =
-            std::max<int64_t>(0, day.total - day.bypassed - day.unresolved);
+        const int64_t clean = std::max<int64_t>(
+            0, day.total - day.bypassed - day.learned - day.unresolved);
 
         std::wstring stamp = widen(day.day);
         if (stamp.size() == 10) {
@@ -1604,12 +1609,13 @@ struct DashboardPanel::Impl {
                     stamp.substr(0, 4);
         }
         struct Row { const wchar_t* label; int64_t value; D2D1_COLOR_F colour; };
-        const Row rows[3] = {{L"dokunulmadı", clean, theme.quiet},
+        const Row rows[4] = {{L"dokunulmadı", clean, theme.quiet},
                              {L"atlatıldı", day.bypassed, theme.acted},
+                             {L"öğrenilmiş", day.learned, theme.inkFaint},
                              {L"çözülemedi", day.unresolved, theme.failed}};
 
         const float width = S(186);
-        const float height = S(104);
+        const float height = S(121);
         D2D1_RECT_F anchor =
             chartBars.empty()
                 ? volumeRect
@@ -1819,7 +1825,7 @@ struct DashboardPanel::Impl {
         const float countLeft = rect.right - countW;
         label(L"ALAN ADI", {rect.left, y, rect.left + S(200), y + S(14)},
               theme.inkFaint);
-        label(L"ATL. / ÇÖZ. / TOP.", {countLeft - S(60), y, rect.right, y + S(14)},
+        label(L"KANIT / ÇÖZ. / TOP.", {countLeft - S(60), y, rect.right, y + S(14)},
               theme.inkFaint, DWRITE_TEXT_ALIGNMENT_TRAILING);
         y += S(20);
 

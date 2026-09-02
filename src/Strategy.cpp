@@ -16,9 +16,33 @@ constexpr unsigned kSlowProfileMinDelayMs = 40;
 constexpr uint64_t kLearningTtlSeconds = 7ULL * 24ULL * 60ULL * 60ULL;
 constexpr const char* kDefaultNetwork = "network-default";
 
+// A learned winner is re-proven against the untouched baseline this often.
+// A false positive therefore corrects itself within one interval instead of
+// living for the full TTL; a real block pays one probe timeout per interval.
+constexpr uint64_t kReverifyIntervalSeconds = 30ULL * 60ULL;
+
+// While one connection is re-verifying, parallel connections to the same host
+// keep using the winner rather than all running the baseline at once.
+constexpr uint64_t kReverifyHoldSeconds = 15;
+
+// How long a successful baseline vouches for a host. DPI does not toggle
+// within minutes; Wi-Fi, upstream and DNS hiccups do.
+constexpr uint64_t kBaselineHealthyWindowSeconds = 15ULL * 60ULL;
+constexpr size_t kMaxHealthyHosts = 4096;
+
+// A single differential nominates; the second one confirms. Parallel
+// connections fail within seconds of each other during a hiccup, so the
+// confirming strike has to come from a clearly later connection.
+constexpr uint64_t kConfirmMinGapSeconds = 60;
+constexpr uint64_t kCandidateTtlSeconds = 6ULL * 60ULL * 60ULL;
+
 uint64_t nowSeconds() {
     return (uint64_t)std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+uint64_t resolveNow(uint64_t explicitSeconds) {
+    return explicitSeconds != 0 ? explicitSeconds : nowSeconds();
 }
 
 bool parseUnsigned64(const std::string& text, uint64_t& value) {
@@ -38,7 +62,10 @@ diagnosis::Kind parseKind(const std::string& text) {
              diagnosis::Kind::SniInterferenceLikely,
              diagnosis::Kind::TlsIncompatible,
              diagnosis::Kind::TransportFailure,
-             diagnosis::Kind::ThrottlingSuspected}) {
+             diagnosis::Kind::ThrottlingSuspected,
+             diagnosis::Kind::LearnedProfile,
+             diagnosis::Kind::TransientFailure,
+             diagnosis::Kind::InterferenceSuspected}) {
         if (text == diagnosis::name(kind)) return kind;
     }
     return diagnosis::Kind::Unknown;
@@ -174,6 +201,7 @@ void Store::load() {
 
     std::lock_guard<std::mutex> lock(mutex_);
     entries_.clear();
+    candidates_.clear();
 
     const uint64_t loadedAt = nowSeconds();
     size_t pos = 1; // just past '{'
@@ -211,9 +239,18 @@ void Store::load() {
         if (fields.size() > 2) parseUnsigned32(fields[2], entry.confidence);
         if (fields.size() > 3) parseUnsigned64(fields[3], entry.expiresAt);
         if (fields.size() > 4) parseUnsigned32(fields[4], entry.failures);
+        if (fields.size() > 5) parseUnsigned64(fields[5], entry.verifiedAt);
         entry.confidence = std::min(entry.confidence, 100U);
 
-        if (entry.expiresAt > loadedAt && entries_.size() < kMaxRememberedHosts) {
+        if (entry.expiresAt <= loadedAt) continue;
+        if (entry.verifiedAt == 0) {
+            // Written before winners needed a second differential. Keep it as
+            // a candidate: its first use re-tests the baseline instead of
+            // trusting a verdict that may have come from a hiccup.
+            if (candidates_.size() < kMaxRememberedHosts) {
+                candidates_[key] = {entry.profile, 0, loadedAt + kCandidateTtlSeconds};
+            }
+        } else if (entries_.size() < kMaxRememberedHosts) {
             entries_[key] = std::move(entry);
         }
     }
@@ -235,49 +272,121 @@ void Store::remember(const std::string& host, const std::string& profile) {
     remember(kDefaultNetwork, host, profile, diagnosis::Kind::Unknown, 50);
 }
 
-void Store::remember(const std::string& networkId, const std::string& host,
-                     const std::string& profile, diagnosis::Kind kind,
-                     unsigned confidence) {
+Store::Outcome Store::remember(const std::string& networkId, const std::string& host,
+                               const std::string& profile, diagnosis::Kind kind,
+                               unsigned confidence, uint64_t nowSeconds_) {
     const std::string normalizedHost = normalizeHost(host);
-    if (normalizedHost.empty() || !findProfile(profile)) return;
+    if (normalizedHost.empty() || !findProfile(profile)) return Outcome::Ignored;
 
+    const uint64_t now = resolveNow(nowSeconds_);
     const std::string key = scopeKey(networkId, normalizedHost);
     if (profile == "none") {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (entries_.erase(key) != 0) saveLocked();
-        return;
+        const bool hadEntry = entries_.erase(key) != 0;
+        candidates_.erase(key);
+        if (hadEntry) saveLocked();
+        return hadEntry ? Outcome::Forgotten : Outcome::Ignored;
+    }
+
+    // A hiccup is not a bypass. Whatever profile happened to be tried when the
+    // path came back must not become the remembered winner.
+    if (kind == diagnosis::Kind::TransientFailure) return Outcome::Ignored;
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = entries_.find(key);
+    const bool live = it != entries_.end() && it->second.expiresAt > now;
+
+    if (kind == diagnosis::Kind::LearnedProfile) {
+        // The winner worked again without a fresh baseline. That keeps it
+        // alive, but it can neither create a winner nor count as re-proof.
+        if (!live || it->second.profile != profile) return Outcome::Ignored;
+        if (it->second.failures != 0) {
+            it->second.failures = 0;
+            saveLocked();
+        }
+        return Outcome::Refreshed;
+    }
+
+    if (live && it->second.profile == profile) {
+        // A confirmed winner re-proved itself against a fresh baseline.
+        it->second.failures = 0;
+        it->second.verifiedAt = now;
+        it->second.reverifyStartedAt = 0;
+        it->second.expiresAt = now + kLearningTtlSeconds;
+        if (confidence > it->second.confidence) {
+            it->second.confidence = std::min(confidence, 100U);
+            it->second.kind = kind;
+        }
+        saveLocked();
+        return Outcome::Reverified;
+    }
+
+    if (kind == diagnosis::Kind::SniInterferenceLikely) {
+        // One differential nominates; a second one at least a minute later,
+        // with no healthy baseline in between, confirms. A hiccup fails a
+        // burst of parallel connections within seconds and is usually gone
+        // before a later connection could reproduce it.
+        auto candidate = candidates_.find(key);
+        if (candidate != candidates_.end() && candidate->second.expiresAt <= now) {
+            candidates_.erase(candidate);
+            candidate = candidates_.end();
+        }
+        if (candidate == candidates_.end()) {
+            candidates_[key] = {profile, now, now + kCandidateTtlSeconds};
+            return Outcome::Candidate;
+        }
+        Candidate& pending = candidate->second;
+        pending.profile = profile; // the latest winner is the one worth keeping
+        if (pending.firstStrikeAt == 0) {
+            pending.firstStrikeAt = now; // legacy entry: this was its first real strike
+            return Outcome::Candidate;
+        }
+        if (now < pending.firstStrikeAt + kConfirmMinGapSeconds) return Outcome::Candidate;
+        candidates_.erase(candidate);
     }
 
     Entry replacement;
     replacement.profile = profile;
     replacement.kind = kind;
     replacement.confidence = std::min(confidence, 100U);
-    replacement.expiresAt = nowSeconds() + kLearningTtlSeconds;
-
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto it = entries_.find(key);
-    if (it != entries_.end() && it->second.profile == profile &&
-        it->second.expiresAt > nowSeconds()) {
-        bool changed = false;
-        if (it->second.failures != 0) {
-            it->second.failures = 0;
-            changed = true;
-        }
-        if (replacement.confidence > it->second.confidence) {
-            it->second.confidence = replacement.confidence;
-            it->second.kind = kind;
-            changed = true;
-        }
-        if (!changed) return;
-        saveLocked();
-        return;
-    }
+    replacement.expiresAt = now + kLearningTtlSeconds;
+    replacement.verifiedAt = now;
 
     if (it == entries_.end() && entries_.size() >= kMaxRememberedHosts) {
         entries_.erase(entries_.begin()); // bounded cache; evicted paths are relearned
     }
     entries_[key] = std::move(replacement);
     saveLocked();
+    return Outcome::Learned;
+}
+
+void Store::noteBaselineHealthy(const std::string& networkId, const std::string& host,
+                                uint64_t nowSeconds_) {
+    const uint64_t now = resolveNow(nowSeconds_);
+    const std::string key = scopeKey(networkId, host);
+    std::lock_guard<std::mutex> lock(mutex_);
+    candidates_.erase(key); // the path is fine; the earlier strike was a hiccup
+    if (healthyAt_.size() >= kMaxHealthyHosts && !healthyAt_.contains(key)) {
+        for (auto it = healthyAt_.begin(); it != healthyAt_.end();) {
+            if (it->second + kBaselineHealthyWindowSeconds <= now) {
+                it = healthyAt_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        if (healthyAt_.size() >= kMaxHealthyHosts) healthyAt_.erase(healthyAt_.begin());
+    }
+    healthyAt_[key] = now;
+}
+
+bool Store::baselineRecentlyHealthy(const std::string& networkId, const std::string& host,
+                                    uint64_t nowSeconds_) const {
+    const uint64_t now = resolveNow(nowSeconds_);
+    const std::string key = scopeKey(networkId, host);
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = healthyAt_.find(key);
+    return it != healthyAt_.end() && it->second <= now &&
+           it->second + kBaselineHealthyWindowSeconds > now;
 }
 
 void Store::recordFailure(const std::string& networkId, const std::string& host,
@@ -310,12 +419,21 @@ void Store::forget(const std::string& host) {
             ++it;
         }
     }
+    for (auto it = candidates_.begin(); it != candidates_.end();) {
+        if (it->first.ends_with(suffix)) {
+            it = candidates_.erase(it);
+        } else {
+            ++it;
+        }
+    }
     if (changed) saveLocked();
 }
 
 void Store::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     entries_.clear();
+    candidates_.clear();
+    healthyAt_.clear();
     saveLocked();
 }
 
@@ -329,25 +447,66 @@ size_t Store::size() const {
 }
 
 std::vector<std::string> Store::probeOrder(const std::string& host,
-                                           const tls::ClientHello& hello) const {
+                                           const tls::ClientHello& hello) {
     return probeOrder(kDefaultNetwork, host, hello);
 }
 
 std::vector<std::string> Store::probeOrder(const std::string& networkId,
                                            const std::string& host,
-                                           const tls::ClientHello& hello) const {
+                                           const tls::ClientHello& hello,
+                                           uint64_t nowSeconds_) {
     // A ClientHello already spanning records may still be incomplete in our
     // buffer, so replaying it is unsafe.
     if (hello.spansRecords) return {"none"};
 
-    std::vector<std::string> order;
-    order.reserve(profileTable().size());
-    const std::string remembered = lookup(networkId, host);
+    const uint64_t now = resolveNow(nowSeconds_);
+    std::string remembered;
+    std::string pending;
+    bool reverify = false;
+    {
+        const std::string key = scopeKey(networkId, host);
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = entries_.find(key);
+        if (it != entries_.end() && it->second.expiresAt > now) {
+            Entry& entry = it->second;
+            remembered = entry.profile;
+            if (entry.verifiedAt + kReverifyIntervalSeconds <= now &&
+                entry.reverifyStartedAt + kReverifyHoldSeconds <= now) {
+                entry.reverifyStartedAt = now;
+                reverify = true;
+            }
+        } else {
+            const auto candidate = candidates_.find(key);
+            if (candidate != candidates_.end() && candidate->second.expiresAt > now) {
+                pending = candidate->second.profile;
+            }
+        }
+    }
 
-    if (!remembered.empty()) order.push_back(remembered);
+    std::vector<std::string> order;
+    order.reserve(profileTable().size() + 1);
+
+    // Re-verification and candidate confirmation both lead with the baseline
+    // and retry with the profile in question, so a host that is really
+    // blocked pays exactly one probe timeout.
+    std::string lead = remembered;
+    bool baselineQueued = false;
+    if (!remembered.empty()) {
+        if (reverify) {
+            order.push_back("none");
+            baselineQueued = true;
+        }
+        order.push_back(remembered);
+    } else if (!pending.empty()) {
+        order.push_back("none");
+        baselineQueued = true;
+        order.push_back(pending);
+        lead = pending;
+    }
 
     for (const Profile& p : profileTable()) {
-        if (p.name == remembered) continue;
+        if (p.name == lead) continue;
+        if (baselineQueued && p.name == "none") continue;
         if (p.requiresSni && !hello.hasSni()) continue;
         order.push_back(p.name);
     }
@@ -368,7 +527,8 @@ bool Store::saveLocked() const {
         const std::string encoded = entry.profile + ";" + diagnosis::name(entry.kind) + ";" +
                                     std::to_string(entry.confidence) + ";" +
                                     std::to_string(entry.expiresAt) + ";" +
-                                    std::to_string(entry.failures);
+                                    std::to_string(entry.failures) + ";" +
+                                    std::to_string(entry.verifiedAt);
         content += "    \"" + json::escape(key) + "\": \"" + json::escape(encoded) + "\"";
     }
     content += "\n  }\n}\n";

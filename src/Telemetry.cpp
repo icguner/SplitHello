@@ -59,6 +59,39 @@ bool execute(sqlite3* database, const char* sql) {
     return false;
 }
 
+int schemaVersion(sqlite3* database) {
+    Statement statement(database, "PRAGMA user_version;");
+    if (!statement || sqlite3_step(statement.get()) != SQLITE_ROW) return 0;
+    return sqlite3_column_int(statement.get(), 0);
+}
+
+// Schema 1 recorded every reuse of a remembered profile as
+// "sni-interference-likely" although no baseline had been run, and it had
+// no transient class at all. Reclassify the history once so the panel stops
+// presenting cache hits and network hiccups as interference evidence.
+bool migrateDatabase(sqlite3* database) {
+    if (schemaVersion(database) >= 2) return true;
+    if (!execute(database, "BEGIN;")) return false;
+    const bool ok =
+        execute(database,
+            "UPDATE probe_events SET diagnosis_kind='learned-profile'"
+            " WHERE diagnosis_kind='sni-interference-likely'"
+            " AND baseline_signal IS NULL;") &&
+        execute(database,
+            "UPDATE probe_events SET diagnosis_kind='transient-failure', confidence=70"
+            " WHERE diagnosis_kind='sni-interference-likely'"
+            " AND baseline_signal<>'server-hello'"
+            " AND EXISTS (SELECT 1 FROM probe_events AS healthy"
+            "  WHERE healthy.network_id=probe_events.network_id"
+            "  AND healthy.host=probe_events.host"
+            "  AND healthy.baseline_signal='server-hello'"
+            "  AND healthy.occurred_at BETWEEN probe_events.occurred_at-900"
+            "  AND probe_events.occurred_at+900);") &&
+        execute(database, "PRAGMA user_version=2;");
+    execute(database, ok ? "COMMIT;" : "ROLLBACK;");
+    return ok;
+}
+
 bool initializeDatabase(sqlite3* database) {
     sqlite3_busy_timeout(database, 2000);
     return execute(database, "PRAGMA journal_mode=WAL;") &&
@@ -100,7 +133,7 @@ bool initializeDatabase(sqlite3* database) {
         execute(database,
             "CREATE INDEX IF NOT EXISTS idx_probe_attempts_event "
             "ON probe_attempts(event_id, ordinal);") &&
-        execute(database, "PRAGMA user_version=1;");
+        migrateDatabase(database);
 }
 
 void bindText(sqlite3_stmt* statement, int index, const std::string& value) {
@@ -212,6 +245,7 @@ std::string serializeDashboard(const DashboardData& data) {
     }
     output << ",\"summary\":{\"total\":" << data.total
            << ",\"bypassed\":" << data.bypassed
+           << ",\"learned\":" << data.learned
            << ",\"normal\":" << data.normal
            << ",\"unresolved\":" << data.unresolved
            << ",\"averageLatencyMs\":" << std::fixed << std::setprecision(1)
@@ -239,6 +273,7 @@ std::string serializeDashboard(const DashboardData& data) {
         output << "{\"day\":\"" << json::escape(day.day)
                << "\",\"total\":" << day.total
                << ",\"bypassed\":" << day.bypassed
+               << ",\"learned\":" << day.learned
                << ",\"unresolved\":" << day.unresolved << '}';
     }
     output << "]";
@@ -430,11 +465,12 @@ DashboardData Store::dashboardSnapshot(const std::string& path,
 
     Statement summary(database,
         "SELECT COUNT(*),"
-        " COALESCE(SUM(success=1 AND winning_profile<>'none'),0),"
+        " COALESCE(SUM(diagnosis_kind='sni-interference-likely'),0),"
         " COALESCE(SUM(diagnosis_kind='no-interference'),0),"
         " COALESCE(SUM(success=0),0),"
         " COALESCE(AVG(total_elapsed_ms),0),"
-        " COALESCE(SUM(cache_hit),0)"
+        " COALESCE(SUM(cache_hit),0),"
+        " COALESCE(SUM(diagnosis_kind IN ('learned-profile','transient-failure','interference-suspected')),0)"
         " FROM probe_events WHERE occurred_at>=?;");
     if (summary) {
         bindCutoff(summary, cutoff);
@@ -445,6 +481,7 @@ DashboardData Store::dashboardSnapshot(const std::string& path,
             data.unresolved = sqlite3_column_int64(summary.get(), 3);
             data.averageLatencyMs = sqlite3_column_double(summary.get(), 4);
             data.cacheHits = sqlite3_column_int64(summary.get(), 5);
+            data.learned = sqlite3_column_int64(summary.get(), 6);
         }
     }
 
@@ -453,10 +490,11 @@ DashboardData Store::dashboardSnapshot(const std::string& path,
     const int64_t previousCutoff = cutoff - static_cast<int64_t>(windowDays) * 86400;
     Statement previous(database,
         "SELECT COUNT(*),"
-        " COALESCE(SUM(success=1 AND winning_profile<>'none'),0),"
+        " COALESCE(SUM(diagnosis_kind='sni-interference-likely'),0),"
         " COALESCE(SUM(diagnosis_kind='no-interference'),0),"
         " COALESCE(SUM(success=0),0),"
-        " COALESCE(AVG(total_elapsed_ms),0)"
+        " COALESCE(AVG(total_elapsed_ms),0),"
+        " COALESCE(SUM(diagnosis_kind IN ('learned-profile','transient-failure','interference-suspected')),0)"
         " FROM probe_events WHERE occurred_at>=? AND occurred_at<?;");
     if (previous) {
         sqlite3_bind_int64(previous.get(), 1, previousCutoff);
@@ -467,6 +505,7 @@ DashboardData Store::dashboardSnapshot(const std::string& path,
             data.previous.normal = sqlite3_column_int64(previous.get(), 2);
             data.previous.unresolved = sqlite3_column_int64(previous.get(), 3);
             data.previous.averageLatencyMs = sqlite3_column_double(previous.get(), 4);
+            data.previous.learned = sqlite3_column_int64(previous.get(), 5);
         }
     }
 
@@ -531,11 +570,11 @@ DashboardData Store::dashboardSnapshot(const std::string& path,
     // Hosts ranked by how often they actually needed intervention.
     Statement hosts(database,
         "SELECT host,COUNT(*),"
-        " COALESCE(SUM(success=1 AND winning_profile<>'none'),0),"
+        " COALESCE(SUM(diagnosis_kind='sni-interference-likely'),0),"
         " COALESCE(SUM(success=0),0),"
         " COALESCE(AVG(total_elapsed_ms),0)"
         " FROM probe_events WHERE occurred_at>=? GROUP BY host"
-        " ORDER BY (COALESCE(SUM(success=1 AND winning_profile<>'none'),0)"
+        " ORDER BY (COALESCE(SUM(diagnosis_kind='sni-interference-likely'),0)"
         "           +COALESCE(SUM(success=0),0)) DESC, COUNT(*) DESC LIMIT 8;");
     if (hosts) {
         bindCutoff(hosts, cutoff);
@@ -587,7 +626,8 @@ DashboardData Store::dashboardSnapshot(const std::string& path,
 
     Statement daily(database,
         "SELECT strftime('%Y-%m-%d',occurred_at,'unixepoch','localtime'),"
-        " COUNT(*),COALESCE(SUM(success=1 AND winning_profile<>'none'),0),"
+        " COUNT(*),COALESCE(SUM(diagnosis_kind='sni-interference-likely'),0),"
+        " COALESCE(SUM(diagnosis_kind IN ('learned-profile','transient-failure','interference-suspected')),0),"
         " COALESCE(SUM(success=0),0) FROM probe_events"
         " WHERE occurred_at>=? GROUP BY 1 ORDER BY 1;");
     if (daily) {
@@ -597,7 +637,8 @@ DashboardData Store::dashboardSnapshot(const std::string& path,
                 columnText(daily.get(), 0),
                 sqlite3_column_int64(daily.get(), 1),
                 sqlite3_column_int64(daily.get(), 2),
-                sqlite3_column_int64(daily.get(), 3)});
+                sqlite3_column_int64(daily.get(), 3),
+                sqlite3_column_int64(daily.get(), 4)});
         }
     }
 

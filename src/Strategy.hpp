@@ -72,10 +72,32 @@ public:
     // Records a bypass `profile` for `host` and persists immediately. The
     // untouched baseline (`none`) removes a stale mapping instead of filling
     // the cache with healthy destinations that need no learned state.
+    //
+    // What is learned depends on the verdict. A differential
+    // (SniInterferenceLikely) re-verifies an existing winner; for a host
+    // without one it only nominates a candidate, and a second differential
+    // at least a minute later with no healthy baseline in between promotes
+    // it. A cache hit (LearnedProfile) keeps a winner alive, a transient
+    // failure changes nothing. `nowSeconds` of 0 means the wall clock.
+    enum class Outcome {
+        Ignored,      // nothing to record
+        Forgotten,    // the untouched baseline retired a winner
+        Candidate,    // first differential: waiting for a second one
+        Learned,      // confirmed and persisted
+        Reverified,   // an existing winner re-proved itself
+        Refreshed,    // cache hit kept the winner alive
+    };
     void remember(const std::string& host, const std::string& profile);
-    void remember(const std::string& networkId, const std::string& host,
-                  const std::string& profile, diagnosis::Kind kind,
-                  unsigned confidence);
+    Outcome remember(const std::string& networkId, const std::string& host,
+                     const std::string& profile, diagnosis::Kind kind,
+                     unsigned confidence, uint64_t nowSeconds = 0);
+
+    // The untouched baseline just succeeded for `host`. A baseline failure
+    // shortly afterwards is then treated as a hiccup rather than as DPI.
+    void noteBaselineHealthy(const std::string& networkId, const std::string& host,
+                             uint64_t nowSeconds = 0);
+    bool baselineRecentlyHealthy(const std::string& networkId, const std::string& host,
+                                 uint64_t nowSeconds = 0) const;
 
     // Degrades a cached profile after a failed re-check. Two consecutive
     // failures evict it so the next connection performs a fresh baseline.
@@ -90,11 +112,18 @@ public:
     size_t size() const;
 
     // Probe order for a host: the remembered profile first, then the rest.
+    // A winner that has not been re-proven for a while is re-verified: the
+    // untouched baseline goes first and, if it succeeds, the winner is
+    // dropped. Only one connection per host starts a re-verification at a
+    // time, so a burst of parallel connections does not all pay for it. A
+    // pending candidate is placed right behind the baseline so confirming
+    // (or clearing) it costs at most one probe timeout.
     std::vector<std::string> probeOrder(const std::string& host,
-                                        const tls::ClientHello& hello) const;
+                                        const tls::ClientHello& hello);
     std::vector<std::string> probeOrder(const std::string& networkId,
                                         const std::string& host,
-                                        const tls::ClientHello& hello) const;
+                                        const tls::ClientHello& hello,
+                                        uint64_t nowSeconds = 0);
 
 private:
     struct Entry {
@@ -103,11 +132,26 @@ private:
         unsigned confidence = 0;
         uint64_t expiresAt = 0;
         unsigned failures = 0;
+        uint64_t verifiedAt = 0;          // last differential that re-proved it
+        uint64_t reverifyStartedAt = 0;   // in-memory only
+    };
+
+    // A differential seen once. Never persisted: a restart simply asks for a
+    // fresh pair of strikes.
+    struct Candidate {
+        std::string profile;
+        uint64_t firstStrikeAt = 0;   // 0: legacy entry, no strike under the new rules yet
+        uint64_t expiresAt = 0;
     };
 
     mutable std::mutex mutex_;
     std::string path_;
     std::unordered_map<std::string, Entry> entries_;
+    std::unordered_map<std::string, Candidate> candidates_;
+
+    // Most recent successful untouched baseline per scoped host. Never
+    // persisted: it only needs to outlive a network hiccup.
+    std::unordered_map<std::string, uint64_t> healthyAt_;
 
     bool saveLocked() const;
 };

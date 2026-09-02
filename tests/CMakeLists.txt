@@ -9,6 +9,7 @@ add_executable(splithello_tests
     TestProcessFilter.cpp
     TestQuicStrategy.cpp
     TestRecoveryPolicy.cpp
+    TestSocksProxy.cpp
     TestStrategy.cpp
     TestTelemetry.cpp
     TestTlsHello.cpp

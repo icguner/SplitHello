@@ -16,6 +16,9 @@
 // This is the fallback path, used only when every fragmentation profile
 // failed and --tunnel-fallback is on. Unlike the direct path it routes the
 // payload through the Worker, so it costs latency and Cloudflare quota.
+//
+// Runs on the caller's thread (DirectRelay hands over mid-connection) and
+// owns the client socket for the rest of its life.
 class Relay {
 public:
     Relay(SOCKET clientSock, std::string workerUrl, std::string sharedSecret,
@@ -23,13 +26,17 @@ public:
           std::vector<uint8_t> initialData = {},
           uint16_t workerConnectPort = 0);
 
+    // Closes the client socket if run() did not get to.
     ~Relay();
 
     Relay(const Relay&) = delete;
     Relay& operator=(const Relay&) = delete;
 
-    // Runs on a detached thread and deletes itself when the connection ends.
-    void start();
+    // Serves the tunnel on the calling thread and returns once it has ended.
+    void run();
+
+    // Aborts the tunnel from another thread; run() unwinds shortly after.
+    void stop();
 
 private:
     SOCKET clientSock_;
@@ -44,13 +51,13 @@ private:
     std::vector<uint8_t> initialData_;
 
     WsClient ws_;
-    std::atomic<bool> running_{false};
+    std::atomic<bool> stopping_{false};
 
+    // WinHTTP cannot be multiplexed with a socket in one select(), so the
+    // socket->WebSocket direction needs its own thread. It is always joined
+    // before run() returns.
     std::thread sockToWs_;
-    std::thread wsToSock_;
 
-    void run();
     void pumpSockToWs();
     void pumpWsToSock();
-    void stop();
 };
