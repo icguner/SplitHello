@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 442" width="760" height="442" role="img" aria-label="SNI parcalama: tek kayitta engellenen ClientHello ve iki kayda bolunerek gecen ClientHello">
+  <defs>
+    <marker id="ra" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#a34a55"/>
+    </marker>
+    <marker id="ga" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#3f9c6b"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="760" height="442" rx="18" fill="#0d1424"/>
+  <text x="380" y="40" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="15" font-weight="600" fill="#93a1c0" letter-spacing="1.6">SNI PARÇALAMA &#183; SNI FRAGMENTATION</text>
+
+  <!-- blocked -->
+  <rect x="30" y="62" width="700" height="152" rx="14" fill="#1a1317" stroke="#6b2f36" stroke-width="1.5"/>
+  <text x="52" y="90" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" font-weight="700" fill="#f87171" letter-spacing="1.2">ENGELLENİYOR / BLOCKED</text>
+
+  <rect x="52" y="102" width="552" height="46" rx="9" fill="#16203a" stroke="#2b3a5c" stroke-width="1.5"/>
+  <text x="66" y="130" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" fill="#93a1c0">tek TLS kaydı / one record</text>
+  <rect x="300" y="107" width="180" height="36" rx="7" fill="#3a1d22" stroke="#a34a55" stroke-width="1.5"/>
+  <text x="390" y="130" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="13" font-weight="600" fill="#fca5a5">SNI: discord.com</text>
+  <text x="540" y="130" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" fill="#93a1c0">uzantılar</text>
+
+  <path d="M390 148 L390 168" stroke="#a34a55" stroke-width="2" marker-end="url(#ra)"/>
+  <rect x="250" y="170" width="280" height="32" rx="16" fill="#2a1518" stroke="#a34a55" stroke-width="1.5"/>
+  <text x="390" y="191" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" fill="#fca5a5">DPI tam adı okur &#8594; RST / reads full SNI</text>
+
+  <text x="667" y="128" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="26" font-weight="700" fill="#f87171">&#10007;</text>
+  <text x="667" y="150" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="11.5" font-weight="700" fill="#f87171" letter-spacing="0.8">KESİLDİ</text>
+
+  <!-- splithello -->
+  <rect x="30" y="228" width="700" height="154" rx="14" fill="#101f18" stroke="#2f6b46" stroke-width="1.5"/>
+  <text x="52" y="256" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" font-weight="700" fill="#4ade80" letter-spacing="1.2">SPLITHELLO</text>
+
+  <rect x="52" y="268" width="258" height="46" rx="9" fill="#16203a" stroke="#2b3a5c" stroke-width="1.5"/>
+  <text x="64" y="296" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" fill="#93a1c0">Kayıt 1 / Record 1</text>
+  <rect x="238" y="273" width="64" height="36" rx="7" fill="#132e22" stroke="#2f6b46" stroke-width="1.5"/>
+  <text x="270" y="296" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="13" font-weight="600" fill="#86efac">disc</text>
+
+  <path d="M320 269 L320 313" stroke="#4ade80" stroke-width="2" stroke-dasharray="4 4"/>
+
+  <rect x="330" y="268" width="274" height="46" rx="9" fill="#16203a" stroke="#2b3a5c" stroke-width="1.5"/>
+  <rect x="340" y="273" width="88" height="36" rx="7" fill="#132e22" stroke="#2f6b46" stroke-width="1.5"/>
+  <text x="384" y="296" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="13" font-weight="600" fill="#86efac">ord.com</text>
+  <text x="516" y="296" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" fill="#93a1c0">Kayıt 2 / Record 2</text>
+
+  <path d="M328 314 L328 334" stroke="#3f9c6b" stroke-width="2" marker-end="url(#ga)"/>
+  <rect x="176" y="336" width="304" height="32" rx="16" fill="#12301f" stroke="#2f6b46" stroke-width="1.5"/>
+  <text x="328" y="357" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" fill="#86efac">DPI tam adı bulamaz / cannot match SNI</text>
+
+  <text x="667" y="294" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="26" font-weight="700" fill="#4ade80">&#10003;</text>
+  <text x="667" y="316" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="11.5" font-weight="700" fill="#4ade80" letter-spacing="0.8">BAĞLANDI</text>
+
+  <text x="380" y="406" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="11.5" fill="#6f7f9c">RFC el sıkışmanın birden fazla kayda yayılmasına izin verir; sunucu normal birleştirir.</text>
+  <text x="380" y="426" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="11.5" fill="#6f7f9c">The RFC allows a handshake to span records &#8212; the server reassembles it normally.</text>
+</svg>

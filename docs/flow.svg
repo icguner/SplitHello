@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 676" width="760" height="676" role="img" aria-label="SplitHello akis semasi: uygulama, WinDivert, relay, baz cizgi karari ve dogrudan hedef baglantisi">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#5b7ba6"/>
+    </marker>
+    <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#3f9c6b"/>
+    </marker>
+    <marker id="aw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#a3801f"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="760" height="676" rx="18" fill="#0d1424"/>
+
+  <text x="380" y="40" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="15" font-weight="600" fill="#93a1c0" letter-spacing="1.6">NASIL ÇALIŞIR &#183; HOW IT WORKS</text>
+
+  <!-- 1. app -->
+  <rect x="190" y="68" width="380" height="74" rx="14" fill="#16203a" stroke="#2b3a5c" stroke-width="1.5"/>
+  <text x="380" y="97" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="16" font-weight="600" fill="#e8eefc">Uygulama / App</text>
+  <text x="380" y="120" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" fill="#93a1c0">Discord, tarayıcı, oyun &#183; TCP/443 &#183; ayar gerekmez / no config</text>
+  <path d="M380 142 L380 176" stroke="#5b7ba6" stroke-width="2" marker-end="url(#a)"/>
+
+  <!-- 2. windivert -->
+  <rect x="190" y="178" width="380" height="74" rx="14" fill="#16203a" stroke="#2b3a5c" stroke-width="1.5"/>
+  <text x="380" y="207" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="16" font-weight="600" fill="#60a5fa">WinDivert &#183; imzalı sürücü / signed driver</text>
+  <text x="380" y="230" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" fill="#93a1c0">Giden akışı hedefini koruyarak yansıtır / reflects, keeps destination</text>
+  <path d="M380 252 L380 286" stroke="#5b7ba6" stroke-width="2" marker-end="url(#a)"/>
+
+  <!-- 3. relay -->
+  <rect x="190" y="288" width="380" height="74" rx="14" fill="#16203a" stroke="#2b3a5c" stroke-width="1.5"/>
+  <text x="380" y="317" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="16" font-weight="600" fill="#a78bfa">SplitHello Relay &#183; [::]:1080</text>
+  <text x="380" y="340" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" fill="#93a1c0">ClientHello&#8217;dan alan adı çözülür / recovers the hostname</text>
+  <path d="M380 362 L380 394" stroke="#5b7ba6" stroke-width="2" marker-end="url(#a)"/>
+
+  <!-- decision -->
+  <rect x="105" y="396" width="550" height="62" rx="31" fill="#1b2745" stroke="#3d5a8a" stroke-width="1.5"/>
+  <text x="380" y="421" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="14.5" font-weight="600" fill="#e8eefc">Dokunulmamış ClientHello geçiyor mu?</text>
+  <text x="380" y="442" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" fill="#93a1c0">Does the untouched ClientHello pass?</text>
+
+  <path d="M270 458 L205 496" stroke="#3f9c6b" stroke-width="2" marker-end="url(#ag)"/>
+  <path d="M490 458 L555 496" stroke="#a3801f" stroke-width="2" marker-end="url(#aw)"/>
+
+  <!-- yes -->
+  <rect x="40" y="498" width="330" height="90" rx="14" fill="#122b20" stroke="#2f6b46" stroke-width="1.5"/>
+  <text x="205" y="527" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="15" font-weight="700" fill="#4ade80">EVET / YES &#183; %99,3</text>
+  <text x="205" y="551" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" fill="#b9d7c6">Aynen iletilir, ek gecikme yok</text>
+  <text x="205" y="571" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" fill="#7fa891">Forwarded untouched, no added delay</text>
+
+  <!-- no -->
+  <rect x="390" y="498" width="330" height="90" rx="14" fill="#2c2411" stroke="#7a6320" stroke-width="1.5"/>
+  <text x="555" y="527" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="15" font-weight="700" fill="#fbbf24">HAYIR / NO &#183; %0,5</text>
+  <text x="555" y="551" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" fill="#e0cfa0">Profil denenir, kazanan öğrenilir</text>
+  <text x="555" y="571" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" fill="#a89768">Probe profiles, learn the winner</text>
+
+  <path d="M205 588 L205 610 L380 610 L380 624" stroke="#3f9c6b" stroke-width="2" fill="none"/>
+  <path d="M555 588 L555 610 L380 610 L380 624" stroke="#a3801f" stroke-width="2" fill="none" marker-end="url(#a)"/>
+
+  <!-- target -->
+  <rect x="170" y="626" width="420" height="40" rx="20" fill="#16203a" stroke="#2b3a5c" stroke-width="1.5"/>
+  <text x="380" y="652" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="13" fill="#cbd6ea">Hedefe <tspan font-weight="700" fill="#e8eefc">doğrudan</tspan> bağlantı &#183; VPN ve tünel yok / direct, no VPN</text>
+</svg>

@@ -21,17 +21,9 @@ SplitHello ikisini de VPN ya da veri yolunda uzak sunucu olmadan çözer.
 
 ## Nasıl çalışır? / How it works
 
-```mermaid
-flowchart TD
-    A["Uygulama / App<br/>Discord, tarayıcı, oyun"] -->|"TCP 443<br/>ayar gerekmez / no config"| B["WinDivert<br/>imzalı sürücü / signed driver"]
-    B -->|"hedefi koruyarak yansıtır<br/>reflects, keeps destination"| C["SplitHello Relay<br/>[::]:1080"]
-    C --> D{"Baz çizgi geçiyor mu?<br/>Does untouched pass?"}
-    D -->|"Evet / Yes  (%99)"| E["Dokunma, aynen ilet<br/>Forward untouched"]
-    D -->|"Hayır / No"| F["Profil dene<br/>Probe profiles"]
-    F --> G["Kazananı öğren<br/>Learn the winner"]
-    E --> H["Hedef sunucu / Target"]
-    G --> H
-```
+<p align="center">
+  <img src="docs/flow.svg" alt="SplitHello akis semasi / how it works" width="760">
+</p>
 
 **TR** — Akış özeti: WinDivert giden 443 trafiğini yerel relay'e yansıtır, relay ClientHello'dan alan adını çıkarır, önce **hiç dokunmadan** dener. Geçerse iş biter. Geçmezse sınırlı bir profil kümesini dener ve çalışanı o ağ + alan adı için hatırlar.
 
@@ -43,15 +35,9 @@ flowchart TD
 
 **TR** — En çok işe yarayan aile, tek bir ClientHello'yu **geçerli birden fazla TLS kaydına** bölerek alan adını ikiye ayırır:
 
-```
-Engelleniyor / Blocked:
-[TLS Record: ClientHello  SNI = "discord.com"]  --> DPI okur   --> KESİLDİ
-
-SplitHello:
-[TLS Record 1: ... "disc"    ]  --> DPI tam adı bulamaz
-[TLS Record 2: "ord.com" ... ]  --> DPI tam adı bulamaz
-                                --> Bağlantı kuruldu / Connected
-```
+<p align="center">
+  <img src="docs/sni-split.svg" alt="SNI parcalama / SNI fragmentation" width="760">
+</p>
 
 **TR** — Bu standart dışı bir hile değil: RFC, el sıkışma mesajlarının birden fazla kayda yayılmasına izin verir. Sunucu normal birleştirir; aynı birleştirmeyi yapmayan DPI alan adını göremez.
 
@@ -65,13 +51,9 @@ SplitHello:
 
 **EN — Short answer: none for normal sites.** Numbers below come from **25,703 real connection** decisions measured in one session.
 
-```mermaid
-pie showData
-    title Trafik dağılımı / Traffic breakdown (25,703)
-    "Dokunulmadı / Untouched" : 25512
-    "Atlatma gerekti / Bypass needed" : 137
-    "Diğer / Other" : 54
-```
+<p align="center">
+  <img src="docs/speed.svg" alt="Hiz olcumu / measured speed" width="760">
+</p>
 
 | | TR | EN | Ölçüm / Measured |
 |---|---|---|---|
@@ -92,16 +74,9 @@ pie showData
 
 **EN** — One failure is not evidence. A network hiccup fails the baseline *and* the profile tried during it, which looks exactly like a successful bypass. Learning therefore requires **two independent confirmations**.
 
-```mermaid
-flowchart LR
-    A["Baz çizgi düştü,<br/>profil geçti<br/>Baseline failed,<br/>profile worked"] --> B{"Son 15 dk'da<br/>sağlıklı baz çizgi?<br/>Healthy baseline<br/>in last 15 min?"}
-    B -->|"Evet / Yes"| C["Geçici hata<br/>Transient — öğrenme yok"]
-    B -->|"Hayır / No"| D{"İkinci kanıt<br/>≥60 sn sonra?<br/>Second proof<br/>≥60 s later?"}
-    D -->|"Hayır / No"| E["Aday<br/>Candidate — henüz öğrenilmez"]
-    D -->|"Evet / Yes"| F["Öğrenildi<br/>Learned — 7 gün / 7 days"]
-    F --> G["Her 30 dk yeniden doğrula<br/>Re-verify every 30 min"]
-    G -->|"baz çizgi artık geçiyor<br/>baseline passes again"| H["Unut / Forget"]
-```
+<p align="center">
+  <img src="docs/learning.svg" alt="Ogrenme kurali / learning rule" width="760">
+</p>
 
 **TR** — Öğrenilen kayıtlar Windows ağ kimliğine göre ayrılır (evdeki kural mobil hotspot'ta kullanılmaz), 7 gün sonra düşer ve **30 dakikada bir** dokunulmamış baz çizgiye karşı yeniden sınanır. Baz çizgi tekrar geçerse kayıt hemen silinir; böylece yanlış bir öğrenme en geç bir saat içinde kendini düzeltir.
 
@@ -110,18 +85,6 @@ flowchart LR
 ---
 
 ## Mimari / Architecture
-
-```mermaid
-flowchart TD
-    subgraph W["Windows"]
-        A["Uygulamalar / Apps"] --> B["WinDivert 2.2.2"]
-        B --> C["Relay motoru / engine<br/>bağlantı başına 1 iş parçacığı<br/>1 thread per connection"]
-        C --> D["Yerel SQLite<br/>telemetry.db"]
-        D --> E["Tray paneli<br/>Direct2D dashboard"]
-    end
-    C -->|"doğrudan / direct"| T["Hedef sunucu / Target server"]
-    C -.->|"yalnızca DNS / DNS only"| CF["Cloudflare Worker"]
-```
 
 **TR** — Veri yolunda VPN, tünel ya da uzak sunucu yok; hedefe doğrudan bağlanılır. Cloudflare Worker normalde **yalnızca DNS** için kullanılır. Her bağlantıya tek bir iş parçacığı bakar, eşzamanlı bağlantı 1.024 ile sınırlıdır, 10 dakika veri akmayan bağlantı kapanır ve kapanışta tüm bağlantılar iptal edilip iş parçacıkları beklenir.
 
