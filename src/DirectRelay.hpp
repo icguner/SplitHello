@@ -9,8 +9,8 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
-#include <thread>
 #include <vector>
 
 #define WIN32_LEAN_AND_MEAN
@@ -19,6 +19,7 @@
 
 namespace packet_strategy { class PolicyRegistry; }
 namespace telemetry { class Store; }
+class Relay;
 
 // Shared, read-only state handed to every connection.
 struct RelayContext {
@@ -34,6 +35,11 @@ struct RelayContext {
     unsigned probeTimeoutMs = 3000;
     bool tunnelFallback = false;
     uint16_t bypassConnectPort = 0;
+
+    // An established connection that moves no bytes in either direction for
+    // this long is closed. Abandoned flows would otherwise hold a thread, two
+    // sockets and their buffers for as long as the process lives.
+    unsigned idleTimeoutMs = 10 * 60 * 1000;
 
     // When set, this profile is used for every connection and nothing is
     // probed or learned. Debugging aid for comparing profiles on one network.
@@ -51,8 +57,14 @@ struct RelayContext {
 // push it well past a single segment. If a profile does not get a reply, the
 // connection is retried with the next one and a proven bypass winner is
 // remembered for that network and domain.
+//
+// The whole connection is served on the thread that calls run(): handshake,
+// probing and the bidirectional pump. There are no detached threads and no
+// self-deletion, so the owner (SocksProxy) can abort the connection with
+// stop() and know exactly when it has finished.
 class DirectRelay {
 public:
+    // Takes ownership of clientSock.
     DirectRelay(SOCKET clientSock, const RelayContext& context,
                 std::string targetHost, uint16_t targetPort,
                 std::string originalTargetAddress = {},
@@ -62,8 +74,14 @@ public:
     DirectRelay(const DirectRelay&) = delete;
     DirectRelay& operator=(const DirectRelay&) = delete;
 
-    // Runs on a detached thread and deletes itself when the connection ends.
-    void start();
+    // Serves the connection on the calling thread and returns once it has
+    // ended. Both sockets are closed by the time it returns.
+    void run();
+
+    // Aborts the connection from another thread. Safe to call at any point,
+    // including before run() and after it returned; run() then unwinds within
+    // a bounded time (the longest single wait is a connect attempt).
+    void stop();
 
 private:
     SOCKET clientSock_;
@@ -84,11 +102,13 @@ private:
     std::vector<uint8_t> firstResponse_;    // target bytes read during probing
     std::string activeProfile_ = "none";
 
-    std::atomic<bool> running_{false};
-    std::thread clientToTarget_;
-    std::thread targetToClient_;
-
-    void run();
+    // Handle values change while probing (every retry reconnects) and are
+    // cleared at the end. stop() runs on a foreign thread, so every mutation
+    // and every shutdown() of a handle happens under this mutex; otherwise a
+    // recycled handle value could be shut down under a different connection.
+    std::mutex socketMutex_;
+    std::atomic<bool> stopping_{false};
+    Relay* tunnel_ = nullptr;               // guarded by socketMutex_
 
     bool prepareCandidates();
     bool connectTarget();
@@ -111,14 +131,18 @@ private:
     diagnosis::ProbeSignal awaitResponse(std::vector<uint8_t>& out);
     bool flushTrailingClientData();
 
-    // Last resort: hand the connection to the Worker's WebSocket relay.
-    // Takes ownership of clientSock_ on success.
+    // Last resort: hand the connection to the Worker's WebSocket relay. Runs
+    // the tunnel on this thread and takes ownership of clientSock_ on success.
     bool handOffToTunnel();
 
     void setNoDelay(bool enabled);
 
-    void pumpClientToTarget();
-    void pumpTargetToClient();
+    // Moves bytes in both directions on this thread until either side has
+    // finished, an error occurs, the idle timeout expires or stop() is called.
+    void pump();
 
-    void stop();
+    // The handshake buffers are only needed until the first bytes are
+    // flowing; an established connection should not pin 100 KiB for hours.
+    void releaseHandshakeBuffers();
+    void closeSockets();
 };

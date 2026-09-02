@@ -31,9 +31,14 @@ bool hasSignal(const std::vector<Attempt>& attempts, ProbeSignal signal) {
                        });
 }
 
+bool isTransportFailure(ProbeSignal signal) {
+    return signal == ProbeSignal::Timeout || signal == ProbeSignal::Reset ||
+           signal == ProbeSignal::Closed;
+}
+
 } // namespace
 
-Verdict infer(const std::vector<Attempt>& attempts) {
+Verdict infer(const std::vector<Attempt>& attempts, const Context& context) {
     if (attempts.empty()) return {};
 
     const Attempt* success = findSuccess(attempts);
@@ -48,17 +53,32 @@ Verdict infer(const std::vector<Attempt>& attempts) {
         }
 
         const Attempt* baseline = findProfile(attempts, "none");
-        if (baseline && baseline->signal != ProbeSignal::ServerHello) {
-            // A strict TLS Alert is weaker evidence of censorship than a
-            // blackhole/reset: it can also mean endpoint intolerance.
-            const unsigned confidence = baseline->signal == ProbeSignal::Alert ? 70 : 92;
-            return {Kind::SniInterferenceLikely, confidence, success->profile};
+        if (!baseline || baseline->signal == ProbeSignal::ServerHello) {
+            // A remembered profile was tried without a fresh baseline. It is a
+            // known workaround, but this connection did not re-prove the cause
+            // of the interference, so it is not evidence of it either.
+            return {Kind::LearnedProfile, 65, success->profile};
         }
 
-        // A remembered profile may be tried without a fresh baseline. It is a
-        // known workaround, but this individual connection did not re-prove
-        // the cause of the interference.
-        return {Kind::SniInterferenceLikely, 65, success->profile};
+        if (context.baselineRecentlyHealthy) {
+            return {Kind::TransientFailure, 70, success->profile};
+        }
+
+        if (!context.rememberedProfile.empty() &&
+            context.rememberedProfile != success->profile) {
+            const Attempt* remembered = findProfile(attempts, context.rememberedProfile);
+            if (remembered && isTransportFailure(remembered->signal) &&
+                isTransportFailure(baseline->signal)) {
+                // The proven bypass and the baseline died the same way and a
+                // third profile got through moments later: the path blinked.
+                return {Kind::TransientFailure, 60, success->profile};
+            }
+        }
+
+        // A strict TLS Alert is weaker evidence of censorship than a
+        // blackhole/reset: it can also mean endpoint intolerance.
+        const unsigned confidence = baseline->signal == ProbeSignal::Alert ? 70 : 92;
+        return {Kind::SniInterferenceLikely, confidence, success->profile};
     }
 
     if (hasSignal(attempts, ProbeSignal::Alert)) {
@@ -67,9 +87,7 @@ Verdict infer(const std::vector<Attempt>& attempts) {
 
     const bool onlyTransportFailures = std::all_of(
         attempts.begin(), attempts.end(), [](const Attempt& attempt) {
-            return attempt.signal == ProbeSignal::Timeout ||
-                   attempt.signal == ProbeSignal::Reset ||
-                   attempt.signal == ProbeSignal::Closed;
+            return isTransportFailure(attempt.signal);
         });
     if (onlyTransportFailures) {
         // Without a successful differential probe this deliberately does not
@@ -80,6 +98,10 @@ Verdict infer(const std::vector<Attempt>& attempts) {
     return {Kind::Unknown, 25, {}};
 }
 
+bool isVerifiedBypass(Kind kind) {
+    return kind == Kind::SniInterferenceLikely;
+}
+
 const char* name(Kind kind) {
     switch (kind) {
     case Kind::Unknown:               return "unknown";
@@ -88,6 +110,9 @@ const char* name(Kind kind) {
     case Kind::TlsIncompatible:       return "tls-incompatible";
     case Kind::TransportFailure:      return "transport-failure";
     case Kind::ThrottlingSuspected:   return "throttling-suspected";
+    case Kind::LearnedProfile:        return "learned-profile";
+    case Kind::TransientFailure:      return "transient-failure";
+    case Kind::InterferenceSuspected: return "interference-suspected";
     }
     return "unknown";
 }

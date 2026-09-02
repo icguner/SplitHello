@@ -6,8 +6,11 @@
 #include <spdlog/spdlog.h>
 
 #include <charconv>
+#include <chrono>
 #include <format>
+#include <iterator>
 #include <optional>
+#include <system_error>
 #include <vector>
 
 // SOCKS5 constants (RFC 1928)
@@ -25,6 +28,15 @@ namespace socks5 {
 }
 
 namespace {
+
+// Cancelled connections unwind within a few seconds; the only long wait is a
+// connect race that is still in flight. Past this we log, but keep waiting:
+// a session thread references the proxy and its context, so returning early
+// would hand the crash over to whoever destroys them next.
+constexpr unsigned kStopDrainWarnSeconds = 15;
+
+// Rejections come in bursts; one line every few seconds is enough.
+constexpr ULONGLONG kRejectLogIntervalMs = 5000;
 
 // Parse a decimal port without throwing on junk input from the client.
 bool parsePort(std::string_view text, uint16_t& out) {
@@ -68,11 +80,28 @@ bool peerEndpoint(SOCKET socket, std::string& address, uint16_t& port) {
     return port != 0;
 }
 
+uint16_t boundPort(SOCKET socket) {
+    sockaddr_storage local{};
+    int length = sizeof(local);
+    if (getsockname(socket, reinterpret_cast<sockaddr*>(&local), &length) == SOCKET_ERROR) {
+        return 0;
+    }
+    if (local.ss_family == AF_INET) {
+        return ntohs(reinterpret_cast<const sockaddr_in*>(&local)->sin_port);
+    }
+    if (local.ss_family == AF_INET6) {
+        return ntohs(reinterpret_cast<const sockaddr_in6*>(&local)->sin6_port);
+    }
+    return 0;
+}
+
 } // namespace
 
 SocksProxy::SocksProxy(RelayContext context, uint16_t port,
-                       transparent::FlowRegistry* transparentFlows)
+                       transparent::FlowRegistry* transparentFlows,
+                       size_t maxConnections)
     : context_(std::move(context)), port_(port), transparentFlows_(transparentFlows)
+    , maxConnections_(maxConnections == 0 ? 1 : maxConnections)
 {}
 
 SocksProxy::~SocksProxy() {
@@ -106,83 +135,238 @@ std::string SocksProxy::recvLine(SOCKET sock) {
 
 bool SocksProxy::run() {
     const int family = transparentFlows_ ? AF_INET6 : AF_INET;
-    listenSock_ = socket(family, SOCK_STREAM, IPPROTO_TCP);
-    if (listenSock_ == INVALID_SOCKET) {
+    SOCKET listener = socket(family, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == INVALID_SOCKET) {
         spdlog::error("Listen socket olusturulamadi: {}", WSAGetLastError());
         return false;
     }
 
     int exclusive = 1;
-    setsockopt(listenSock_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+    setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
                reinterpret_cast<char*>(&exclusive), sizeof(exclusive));
 
     int bindResult = SOCKET_ERROR;
     if (transparentFlows_) {
         int ipv6Only = 0;
-        setsockopt(listenSock_, IPPROTO_IPV6, IPV6_V6ONLY,
+        setsockopt(listener, IPPROTO_IPV6, IPV6_V6ONLY,
                    reinterpret_cast<char*>(&ipv6Only), sizeof(ipv6Only));
 
         sockaddr_in6 address{};
         address.sin6_family = AF_INET6;
         address.sin6_addr = in6addr_any;
         address.sin6_port = htons(port_);
-        bindResult = bind(listenSock_, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+        bindResult = bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address));
     } else {
         sockaddr_in address{};
         address.sin_family = AF_INET;
         address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         address.sin_port = htons(port_);
-        bindResult = bind(listenSock_, reinterpret_cast<sockaddr*>(&address), sizeof(address));
+        bindResult = bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address));
     }
 
     if (bindResult == SOCKET_ERROR) {
         spdlog::error("Port {} bind hatasi: {}", port_, WSAGetLastError());
-        closesocket(listenSock_);
-        listenSock_ = INVALID_SOCKET;
+        closesocket(listener);
         return false;
     }
 
-    if (listen(listenSock_, SOMAXCONN) == SOCKET_ERROR) {
+    if (listen(listener, SOMAXCONN) == SOCKET_ERROR) {
         spdlog::error("Listen hatasi: {}", WSAGetLastError());
-        closesocket(listenSock_);
-        listenSock_ = INVALID_SOCKET;
+        closesocket(listener);
         return false;
     }
 
-    running_ = true;
+    if (port_ == 0) port_ = boundPort(listener);
+
+    {
+        std::lock_guard<std::mutex> lock(listenMutex_);
+        if (stopRequested_) {
+            closesocket(listener);
+            return false;
+        }
+        listenSock_ = listener;
+        running_ = true;
+    }
+
     if (transparentFlows_) {
         spdlog::info("Transparent relay dinliyor: [::]:{} (IPv4 + IPv6)", port_);
     } else {
         spdlog::info("Manuel proxy dinliyor: 127.0.0.1:{} (SOCKS5 + HTTP CONNECT)", port_);
     }
+    spdlog::debug("Es zamanli baglanti siniri: {}", maxConnections_);
 
     while (running_) {
         sockaddr_storage clientAddr{};
         int addrLen = sizeof(clientAddr);
-        SOCKET clientSock = accept(listenSock_, reinterpret_cast<sockaddr*>(&clientAddr), &addrLen);
+        SOCKET clientSock = accept(listener, reinterpret_cast<sockaddr*>(&clientAddr), &addrLen);
 
         if (clientSock == INVALID_SOCKET) {
             if (running_) spdlog::warn("Accept hatasi: {}", WSAGetLastError());
             continue;
         }
 
-        std::thread([this, clientSock]() {
-            handleClient(clientSock);
-        }).detach();
+        spawnSession(clientSock);
     }
 
     return true;
 }
 
 void SocksProxy::stop() {
+    stopRequested_ = true;
     running_ = false;
-    if (listenSock_ != INVALID_SOCKET) {
-        closesocket(listenSock_);
-        listenSock_ = INVALID_SOCKET;
+    {
+        std::lock_guard<std::mutex> lock(listenMutex_);
+        if (listenSock_ != INVALID_SOCKET) {
+            closesocket(listenSock_);
+            listenSock_ = INVALID_SOCKET;
+        }
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(sessionsMutex_);
+        if (!sessions_.empty()) {
+            spdlog::info("{} acik baglanti kapatiliyor", sessions_.size());
+            for (auto& [id, session] : sessions_) cancel(*session);
+        }
+
+        const bool drained = sessionsChanged_.wait_for(
+            lock, std::chrono::seconds(kStopDrainWarnSeconds),
+            [this]() { return sessions_.empty(); });
+        if (!drained) {
+            spdlog::warn("{} baglanti {} saniye icinde kapanmadi; bekleniyor",
+                         sessions_.size(), kStopDrainWarnSeconds);
+            sessionsChanged_.wait(lock, [this]() { return sessions_.empty(); });
+        }
+    }
+
+    reapFinished();
+}
+
+size_t SocksProxy::activeConnections() const {
+    std::lock_guard<std::mutex> lock(sessionsMutex_);
+    return sessions_.size();
+}
+
+// ---- Session lifecycle ----
+
+void SocksProxy::spawnSession(SOCKET clientSock) {
+    // Threads that finished since the last accept are joined here, so the
+    // accept loop is the steady-state reaper and nothing accumulates.
+    reapFinished();
+
+    std::lock_guard<std::mutex> lock(sessionsMutex_);
+    if (!running_ || sessions_.size() >= maxConnections_) {
+        rejected_++;
+        const ULONGLONG now = GetTickCount64();
+        if (running_ && now - lastRejectLogAt_ >= kRejectLogIntervalMs) {
+            lastRejectLogAt_ = now;
+            spdlog::warn("Baglanti siniri doldu ({} acik); yeni baglanti reddedildi (toplam {})",
+                         sessions_.size(), rejected_.load());
+        }
+        closesocket(clientSock);
+        return;
+    }
+
+    const uint64_t id = nextSessionId_++;
+    auto session = std::make_unique<Session>();
+    session->clientSock = clientSock;
+    Session* raw = session.get();
+    sessions_.emplace(id, std::move(session));
+
+    try {
+        // Assigned under the lock: the thread cannot reach its own handle in
+        // sessionMain() before this store is visible.
+        raw->thread = std::thread([this, id, raw]() { sessionMain(id, raw); });
+    } catch (const std::system_error& error) {
+        spdlog::error("Baglanti is parcacigi baslatilamadi: {}", error.what());
+        sessions_.erase(id);
+        closesocket(clientSock);
     }
 }
 
-void SocksProxy::handleClient(SOCKET clientSock) {
+void SocksProxy::sessionMain(uint64_t id, Session* session) {
+    serve(*session);
+
+    std::vector<std::thread> reap;
+    {
+        std::lock_guard<std::mutex> lock(sessionsMutex_);
+        auto it = sessions_.find(id);
+        finished_.push_back(std::move(it->second->thread));
+        sessions_.erase(it); // destroys *session; it must not be touched below
+
+        // Join whatever exited before us so the finished list stays short
+        // even when no new connection arrives for a long time. Our own
+        // handle is the last element and stays for someone else to join.
+        if (finished_.size() > 1) {
+            reap.assign(std::make_move_iterator(finished_.begin()),
+                        std::make_move_iterator(finished_.end() - 1));
+            finished_.erase(finished_.begin(), finished_.end() - 1);
+        }
+    }
+    sessionsChanged_.notify_all();
+
+    for (std::thread& thread : reap) {
+        if (thread.joinable()) thread.join();
+    }
+}
+
+void SocksProxy::serve(Session& session) {
+    const SOCKET clientSock = session.clientSock;
+
+    std::string targetHost;
+    uint16_t targetPort = 0;
+    std::string originalAddress;
+    uint16_t connectPort = 0;
+    const bool ok = negotiate(clientSock, targetHost, targetPort, originalAddress, connectPort);
+
+    if (!ok) {
+        // Retire the handle under the lock: cancel() must never shut down a
+        // handle value that has already been closed and possibly reissued.
+        std::lock_guard<std::mutex> lock(sessionsMutex_);
+        session.clientSock = INVALID_SOCKET;
+        closesocket(clientSock);
+        return;
+    }
+
+    DirectRelay relay(clientSock, context_, std::move(targetHost), targetPort,
+                      std::move(originalAddress), connectPort);
+    {
+        std::lock_guard<std::mutex> lock(sessionsMutex_);
+        session.clientSock = INVALID_SOCKET; // the relay owns it now
+        if (session.cancelled) return;        // relay's destructor closes it
+        session.relay = &relay;
+    }
+
+    relay.run();
+
+    std::lock_guard<std::mutex> lock(sessionsMutex_);
+    session.relay = nullptr;
+}
+
+void SocksProxy::cancel(Session& session) {
+    session.cancelled = true;
+    if (session.relay) {
+        session.relay->stop();
+    } else if (session.clientSock != INVALID_SOCKET) {
+        shutdown(session.clientSock, SD_BOTH); // unblocks the handshake recv
+    }
+}
+
+void SocksProxy::reapFinished() {
+    std::vector<std::thread> done;
+    {
+        std::lock_guard<std::mutex> lock(sessionsMutex_);
+        done.swap(finished_);
+    }
+    for (std::thread& thread : done) {
+        if (thread.joinable()) thread.join();
+    }
+}
+
+// ---- Target negotiation ----
+
+bool SocksProxy::negotiate(SOCKET clientSock, std::string& targetHost, uint16_t& targetPort,
+                           std::string& originalAddress, uint16_t& connectPort) {
     if (transparentFlows_) {
         std::string peerAddress;
         uint16_t peerPort = 0;
@@ -191,33 +375,26 @@ void SocksProxy::handleClient(SOCKET clientSock) {
                 transparentFlows_->claim(peerAddress, peerPort);
             if (target) {
                 spdlog::trace("Transparent CONNECT {}:{}", target->address, target->targetPort);
-                auto* relay = new DirectRelay(clientSock, context_, target->address,
-                                              target->targetPort, target->address,
-                                              target->connectPort);
-                relay->start();
-                return;
+                targetHost = target->address;
+                targetPort = target->targetPort;
+                originalAddress = target->address;
+                connectPort = target->connectPort;
+                return true;
             }
         }
 
         // A listener bound to all local interfaces must never become an open
         // proxy. Only a SYN previously observed by WinDivert is accepted.
         spdlog::warn("Yetkisiz transparent relay baglantisi reddedildi");
-        closesocket(clientSock);
-        return;
+        return false;
     }
 
     // Peek first byte to detect protocol
     uint8_t firstByte;
     int peeked = recv(clientSock, reinterpret_cast<char*>(&firstByte), 1, MSG_PEEK);
-    if (peeked <= 0) {
-        closesocket(clientSock);
-        return;
-    }
+    if (peeked <= 0) return false;
 
-    std::string targetHost;
-    uint16_t targetPort = 0;
     bool ok = false;
-
     if (firstByte == socks5::VERSION) {
         // SOCKS5 protocol
         ok = socks5Handshake(clientSock, targetHost, targetPort);
@@ -227,17 +404,10 @@ void SocksProxy::handleClient(SOCKET clientSock) {
     } else {
         spdlog::warn("Bilinmeyen protokol: ilk byte=0x{:02x}", firstByte);
     }
-
-    if (!ok) {
-        closesocket(clientSock);
-        return;
-    }
+    if (!ok) return false;
 
     spdlog::info("CONNECT {}:{}", targetHost, targetPort);
-
-    // Create direct relay (takes ownership, self-destructs)
-    auto* relay = new DirectRelay(clientSock, context_, std::move(targetHost), targetPort);
-    relay->start();
+    return true;
 }
 
 // ---- HTTP CONNECT ----

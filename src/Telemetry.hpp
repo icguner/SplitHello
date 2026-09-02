@@ -44,7 +44,8 @@ struct DashboardData {
     struct Day {
         std::string day; // YYYY-MM-DD, local time
         int64_t total = 0;
-        int64_t bypassed = 0;
+        int64_t bypassed = 0;   // verified differential: baseline failed, profile worked
+        int64_t learned = 0;    // a remembered profile was applied without new evidence
         int64_t unresolved = 0;
     };
     struct Attempt {
@@ -94,6 +95,7 @@ struct DashboardData {
     struct Previous {
         int64_t total = 0;
         int64_t bypassed = 0;
+        int64_t learned = 0;
         int64_t normal = 0;
         int64_t unresolved = 0;
         double averageLatencyMs = 0;
@@ -104,8 +106,12 @@ struct DashboardData {
     int64_t generatedAt = 0;
     unsigned windowDays = 30;
 
+    // `bypassed` counts only verified interference: the untouched baseline
+    // failed and a transformed hello worked in the same connection. Reusing
+    // a remembered winner is `learned`; it applies a fix but proves nothing.
     int64_t total = 0;
     int64_t bypassed = 0;
+    int64_t learned = 0;
     int64_t normal = 0;
     int64_t unresolved = 0;
     int64_t cacheHits = 0;

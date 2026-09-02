@@ -6,6 +6,7 @@
 #include <spdlog/spdlog.h>
 
 #include <format>
+#include <system_error>
 
 Relay::Relay(SOCKET clientSock, std::string workerUrl, std::string sharedSecret,
              std::string targetHost, uint16_t targetPort,
@@ -21,14 +22,15 @@ Relay::Relay(SOCKET clientSock, std::string workerUrl, std::string sharedSecret,
 
 Relay::~Relay() {
     stop();
-}
-
-void Relay::start() {
-    std::thread([this]() { run(); }).detach();
+    if (sockToWs_.joinable()) sockToWs_.join();
+    if (clientSock_ != INVALID_SOCKET) {
+        closesocket(clientSock_);
+        clientSock_ = INVALID_SOCKET;
+    }
 }
 
 void Relay::run() {
-    running_ = true;
+    if (stopping_) return;
 
     std::string tunnelUrl = workerUrl_;
     if (!tunnelUrl.ends_with("/")) tunnelUrl += "/";
@@ -43,15 +45,10 @@ void Relay::run() {
 
     const auto fail = [this](const char* reason) {
         spdlog::error("Tunel hatasi ({}): {}:{}", reason, targetHost_, targetPort_);
-        running_ = false;
-        if (clientSock_ != INVALID_SOCKET) {
-            closesocket(clientSock_);
-            clientSock_ = INVALID_SOCKET;
-        }
-        delete this;
     };
 
     if (!ws_.connect(tunnelUrl, headers, workerConnectPort_)) { fail("baglanti"); return; }
+    if (stopping_) return;
 
     const std::string command = std::format(
         R"({{"cmd":"connect","host":"{}","port":{}}})",
@@ -75,29 +72,31 @@ void Relay::run() {
         fail("ilk veri");
         return;
     }
+    std::vector<uint8_t>().swap(initialData_);
 
     spdlog::info("Tunel kuruldu: {}:{}", targetHost_, targetPort_);
 
-    sockToWs_ = std::thread([this]() { pumpSockToWs(); });
-    wsToSock_ = std::thread([this]() { pumpWsToSock(); });
+    try {
+        sockToWs_ = std::thread([this]() { pumpSockToWs(); });
+    } catch (const std::system_error& error) {
+        spdlog::error("Tunel is parcacigi baslatilamadi: {}", error.what());
+        return;
+    }
 
+    pumpWsToSock();
+
+    // Whichever direction ended first already called stop(); make sure the
+    // other one is unblocked before waiting for it.
+    stop();
     if (sockToWs_.joinable()) sockToWs_.join();
-    if (wsToSock_.joinable()) wsToSock_.join();
 
     spdlog::debug("Tunel kapandi: {}:{}", targetHost_, targetPort_);
-
-    running_ = false;
-    if (clientSock_ != INVALID_SOCKET) {
-        closesocket(clientSock_);
-        clientSock_ = INVALID_SOCKET;
-    }
-    delete this;
 }
 
 void Relay::pumpSockToWs() {
     std::vector<uint8_t> buffer(32 * 1024);
 
-    while (running_) {
+    while (!stopping_) {
         const int received = recv(clientSock_, (char*)buffer.data(), (int)buffer.size(), 0);
         if (received <= 0) break;
         if (!ws_.sendBinary(buffer.data(), (size_t)received)) break;
@@ -109,7 +108,7 @@ void Relay::pumpWsToSock() {
     std::vector<uint8_t> buffer;
     bool isText = false;
 
-    while (running_) {
+    while (!stopping_) {
         const int received = ws_.receive(buffer, isText);
         if (received <= 0) break;
         if (!tcp::sendAll(clientSock_, buffer.data(), (size_t)received)) break;
@@ -118,9 +117,8 @@ void Relay::pumpWsToSock() {
 }
 
 void Relay::stop() {
-    bool expected = true;
-    if (running_.compare_exchange_strong(expected, false)) {
-        ws_.close();
-        if (clientSock_ != INVALID_SOCKET) shutdown(clientSock_, SD_BOTH);
-    }
+    bool expected = false;
+    if (!stopping_.compare_exchange_strong(expected, true)) return;
+    ws_.close();
+    if (clientSock_ != INVALID_SOCKET) shutdown(clientSock_, SD_BOTH);
 }

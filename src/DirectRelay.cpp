@@ -7,6 +7,8 @@
 
 #include <spdlog/spdlog.h>
 
+#include <mstcpip.h>
+
 #include <algorithm>
 #include <array>
 
@@ -39,6 +41,21 @@ constexpr size_t kProbeReadBufferSize = 32 * 1024;
 constexpr size_t kPumpBufferSize = 64 * 1024;
 constexpr size_t kMaxProbeResponse = 64 * 1024;
 
+// Once one side has sent FIN the other normally follows within a round trip.
+// A peer that never does must not keep the connection alive for the full
+// idle timeout.
+constexpr unsigned kHalfClosedLingerMs = 30 * 1000;
+
+// The pump wakes at least this often so stop() is observed even when neither
+// socket produces an event.
+constexpr unsigned kPumpMaxWaitMs = 1000;
+
+// A laptop that changes networks leaves the target side of every open flow
+// black-holed; without probes the kernel would only notice on the next send.
+// Windows sends up to 10 probes, so a dead peer is detected in about 2.5 min.
+constexpr unsigned kKeepAliveIdleMs = 60 * 1000;
+constexpr unsigned kKeepAliveIntervalMs = 10 * 1000;
+
 // Addresses for hosts the Worker could not answer for. Poisoned for blocked
 // domains, but correct for everything else, so it is a useful fallback.
 std::vector<std::string> systemResolve(const std::string& host, uint16_t port) {
@@ -69,6 +86,61 @@ std::vector<std::string> systemResolve(const std::string& host, uint16_t port) {
     return out;
 }
 
+bool setNonBlocking(SOCKET sock, bool enabled) {
+    u_long mode = enabled ? 1 : 0;
+    return ioctlsocket(sock, FIONBIO, &mode) != SOCKET_ERROR;
+}
+
+// Close that reaches the peer immediately. A graceful close of a non-blocking
+// socket that still has bytes queued lets the FIN linger in the background for
+// seconds, so a peer waiting to be told the connection is gone is left hanging.
+// On an abort we are discarding the connection, so a reset is the honest and
+// prompt signal; the winning path still closes gracefully.
+void closeAbortive(SOCKET sock) {
+    linger reset{};
+    reset.l_onoff = 1;
+    reset.l_linger = 0;
+    setsockopt(sock, SOL_SOCKET, SO_LINGER, (const char*)&reset, sizeof(reset));
+    closesocket(sock);
+}
+
+void enableKeepAlive(SOCKET sock) {
+    tcp_keepalive settings{};
+    settings.onoff = 1;
+    settings.keepalivetime = kKeepAliveIdleMs;
+    settings.keepaliveinterval = kKeepAliveIntervalMs;
+    DWORD returned = 0;
+    WSAIoctl(sock, SIO_KEEPALIVE_VALS, &settings, sizeof(settings), nullptr, 0, &returned,
+             nullptr, nullptr);
+}
+
+// Non-blocking send of as much as the socket accepts right now. False only on
+// a hard error; a full send buffer simply leaves `sent` short.
+bool sendSome(SOCKET sock, const uint8_t* data, size_t length, size_t& sent) {
+    sent = 0;
+    while (sent < length) {
+        const int chunk = (int)std::min<size_t>(length - sent, 1 << 20);
+        const int written = ::send(sock, (const char*)data + sent, chunk, 0);
+        if (written == SOCKET_ERROR) return WSAGetLastError() == WSAEWOULDBLOCK;
+        if (written <= 0) return false;
+        sent += (size_t)written;
+    }
+    return true;
+}
+
+// One direction of the pump. Bytes that the destination could not take yet
+// wait in `pending`; while it is non-empty the source is not read, which is
+// how back-pressure reaches the sender.
+struct Direction {
+    SOCKET from;
+    SOCKET to;
+    std::vector<uint8_t> pending;
+    size_t offset = 0;
+    bool eof = false;       // source sent FIN
+
+    bool finished() const { return eof && pending.empty(); }
+};
+
 } // namespace
 
 DirectRelay::DirectRelay(SOCKET clientSock, const RelayContext& context,
@@ -83,11 +155,9 @@ DirectRelay::DirectRelay(SOCKET clientSock, const RelayContext& context,
     , connectPort_(connectPort == 0 ? targetPort : connectPort) {}
 
 DirectRelay::~DirectRelay() {
-    stop();
-}
-
-void DirectRelay::start() {
-    std::thread([this]() { run(); }).detach();
+    // run() normally closed everything. A relay that was cancelled before it
+    // started still owns the client socket.
+    closeSockets();
 }
 
 // ---- Address resolution ----
@@ -128,20 +198,34 @@ bool DirectRelay::prepareCandidates() {
 }
 
 bool DirectRelay::connectTarget() {
-    targetSock_ = tcp::connectAny(candidates_, connectPort_, kConnectAttemptDelayMs,
+    if (stopping_) return false;
+
+    SOCKET sock = tcp::connectAny(candidates_, connectPort_, kConnectAttemptDelayMs,
                                   kConnectTimeoutMs, connectedAddress_);
-    if (targetSock_ == INVALID_SOCKET) {
+    if (sock == INVALID_SOCKET) {
         spdlog::error("Baglanti kurulamadi: {}:{}", targetHost_, targetPort_);
         return false;
     }
+
+    std::lock_guard<std::mutex> lock(socketMutex_);
+    if (stopping_) {
+        // stop() ran while we were connecting and could not see this handle.
+        closesocket(sock);
+        return false;
+    }
+    enableKeepAlive(sock);
+    targetSock_ = sock;
     spdlog::debug("Baglandi: {} ({}:{})", connectedAddress_, targetHost_, targetPort_);
     return true;
 }
 
 bool DirectRelay::reconnect() {
-    if (targetSock_ != INVALID_SOCKET) {
-        closesocket(targetSock_);
-        targetSock_ = INVALID_SOCKET;
+    {
+        std::lock_guard<std::mutex> lock(socketMutex_);
+        if (targetSock_ != INVALID_SOCKET) {
+            closesocket(targetSock_);
+            targetSock_ = INVALID_SOCKET;
+        }
     }
     return connectTarget();
 }
@@ -155,7 +239,7 @@ bool DirectRelay::collectClientHello() {
     std::array<uint8_t, 16384> chunk;
     unsigned timeoutMs = kClientFirstByteTimeoutMs;
 
-    while (true) {
+    while (!stopping_) {
         const int received = tcp::recvTimeout(clientSock_, chunk.data(), chunk.size(), timeoutMs);
 
         if (received == tcp::kTimedOut) {
@@ -207,6 +291,7 @@ bool DirectRelay::collectClientHello() {
             return true;
         }
     }
+    return false;
 }
 
 // ---- Fragmentation ----
@@ -372,11 +457,31 @@ bool DirectRelay::deliverHello() {
     const std::string remembered = context_.strategies->lookup(context_.networkId, targetHost_);
     const ULONGLONG decisionStarted = GetTickCount64();
 
+    // A pinned profile is a controlled experiment, not learning: nothing it
+    // observes feeds the verdict context or the store.
+    const bool learning = context_.forcedProfile.empty();
+    diagnosis::Context diagnosisContext;
+    if (learning) {
+        diagnosisContext.rememberedProfile = remembered;
+        diagnosisContext.baselineRecentlyHealthy =
+            context_.strategies->baselineRecentlyHealthy(context_.networkId, targetHost_);
+    }
+
+    // A failed remembered profile is only held against it once the whole
+    // event is classified: during a hiccup it fails together with the
+    // baseline, and that must not evict a winner that still works.
+    bool rememberedFailed = false;
+    const auto settleFailure = [&]() {
+        if (learning && rememberedFailed) {
+            context_.strategies->recordFailure(context_.networkId, targetHost_, remembered);
+        }
+    };
+
     size_t attempts = 0;
     std::vector<diagnosis::Attempt> evidence;
     evidence.reserve(std::min(order.size(), kMaxProbeAttempts));
     for (const std::string& profile : order) {
-        if (attempts >= kMaxProbeAttempts) break;
+        if (attempts >= kMaxProbeAttempts || stopping_) break;
 
         strategy::FragmentPlan plan;
         const bool applicable = strategy::buildPlan(profile, hello_, context_.splitDelayMs, plan);
@@ -387,7 +492,8 @@ bool DirectRelay::deliverHello() {
         if (attempts > 0) {
             Sleep(kRetryPauseMs);
             if (!reconnect()) {
-                const diagnosis::Verdict verdict = diagnosis::infer(evidence);
+                const diagnosis::Verdict verdict = diagnosis::infer(evidence, diagnosisContext);
+                settleFailure();
                 recordTelemetry(evidence, verdict, remembered, false,
                                 GetTickCount64() - decisionStarted);
                 return false;
@@ -425,27 +531,48 @@ bool DirectRelay::deliverHello() {
 
         if (outcome == diagnosis::ProbeSignal::ServerHello) {
             activeProfile_ = profile;
-            const diagnosis::Verdict verdict = diagnosis::infer(evidence);
-            if (!context_.forcedProfile.empty()) {
+            diagnosis::Verdict verdict = diagnosis::infer(evidence, diagnosisContext);
+            const unsigned elapsedMs = evidence.back().elapsedMs;
+            if (!learning) {
                 spdlog::debug("{}: '{}' (zorlanan)", targetHost_, profile);
-            } else {
-                // A healthy baseline has no state to learn. Only touch the
-                // store when recording a bypass or removing a stale winner.
-                if (profile != "none" || !remembered.empty()) {
+            } else if (profile == "none") {
+                // A healthy baseline has no state to learn, but it vouches for
+                // the host for a while and retires a winner that is no longer
+                // needed.
+                context_.strategies->noteBaselineHealthy(context_.networkId, targetHost_);
+                if (!remembered.empty()) {
                     context_.strategies->remember(context_.networkId, targetHost_, profile,
                                                   verdict.kind, verdict.confidence);
+                    spdlog::info("{}: baz cizgi yeniden gecti, '{}' profili unutuldu",
+                                 targetHost_, remembered);
+                } else if (verdict.kind == diagnosis::Kind::NoInterference) {
+                    spdlog::trace("{}: normal TLS, sure={}ms", targetHost_, elapsedMs);
+                } else {
+                    spdlog::info("{}: teshis={} guven={}% sure={}ms", targetHost_,
+                                 diagnosis::name(verdict.kind), verdict.confidence, elapsedMs);
                 }
-                const bool newlyLearned = profile != remembered || attempts > 1;
-                if (verdict.kind == diagnosis::Kind::NoInterference) {
-                    spdlog::trace("{}: normal TLS, sure={}ms", targetHost_,
-                                  evidence.back().elapsedMs);
-                } else if (newlyLearned) {
-                    spdlog::info("{}: teshis={} guven={}% profil='{}' sure={}ms ({}. deneme)",
+            } else if (verdict.kind == diagnosis::Kind::TransientFailure) {
+                spdlog::info("{}: gecici ag hatasi, '{}' ile devam edildi, ogrenilmedi ({}. deneme)",
+                             targetHost_, profile, attempts);
+            } else {
+                settleFailure();
+                const strategy::Store::Outcome learned = context_.strategies->remember(
+                    context_.networkId, targetHost_, profile, verdict.kind, verdict.confidence);
+                if (learned == strategy::Store::Outcome::Candidate) {
+                    // One differential is a suspicion. Until a later connection
+                    // reproduces it, the record says so rather than "likely".
+                    verdict.kind = diagnosis::Kind::InterferenceSuspected;
+                    verdict.confidence = std::min(verdict.confidence, 55U);
+                    spdlog::info("{}: baz cizgi gecmedi, '{}' gecti; ogrenmek icin ikinci dogrulama bekleniyor ({}. deneme)",
+                                 targetHost_, profile, attempts);
+                } else if (diagnosis::isVerifiedBypass(verdict.kind)) {
+                    spdlog::info("{}: teshis={} guven={}% profil='{}' sure={}ms ({}. deneme{})",
                                  targetHost_, diagnosis::name(verdict.kind), verdict.confidence,
-                                 profile, evidence.back().elapsedMs, attempts);
+                                 profile, elapsedMs, attempts,
+                                 learned == strategy::Store::Outcome::Learned ? ", dogrulandi" : "");
                 } else {
                     spdlog::trace("{}: ogrenilmis profil='{}' sure={}ms",
-                                  targetHost_, profile, evidence.back().elapsedMs);
+                                  targetHost_, profile, elapsedMs);
                 }
             }
             recordTelemetry(evidence, verdict, remembered, true,
@@ -453,15 +580,14 @@ bool DirectRelay::deliverHello() {
             return true;
         }
 
-        if (profile == remembered && context_.forcedProfile.empty()) {
-            context_.strategies->recordFailure(context_.networkId, targetHost_, profile);
-        }
+        if (learning && profile == remembered) rememberedFailed = true;
         spdlog::debug("{}: '{}' basarisiz - {}", targetHost_, profile,
                       diagnosis::describe(outcome));
         firstResponse_.clear();
     }
 
-    const diagnosis::Verdict verdict = diagnosis::infer(evidence);
+    const diagnosis::Verdict verdict = diagnosis::infer(evidence, diagnosisContext);
+    settleFailure();
     recordTelemetry(evidence, verdict, remembered, false,
                     GetTickCount64() - decisionStarted);
     spdlog::warn("{}:{} icin sonuc yok; teshis={} guven={}%",
@@ -473,21 +599,36 @@ bool DirectRelay::deliverHello() {
 
 bool DirectRelay::handOffToTunnel() {
     if (!context_.tunnelFallback || context_.workerUrl.empty()) return false;
+    if (clientSock_ == INVALID_SOCKET) return false;
 
     spdlog::info("{}:{} Worker tuneline devrediliyor", targetHost_, targetPort_);
 
-    auto* relay = new Relay(clientSock_, context_.workerUrl, context_.sharedSecret,
-                            targetHost_, targetPort_, std::move(clientBuffer_),
-                            context_.bypassConnectPort);
-    clientSock_ = INVALID_SOCKET; // ownership transferred
-    relay->start();
+    // The tunnel owns the client socket from here on and closes it itself.
+    Relay tunnel(clientSock_, context_.workerUrl, context_.sharedSecret,
+                 targetHost_, targetPort_, std::move(clientBuffer_),
+                 context_.bypassConnectPort);
+    {
+        std::lock_guard<std::mutex> lock(socketMutex_);
+        clientSock_ = INVALID_SOCKET;
+        if (stopping_) return false;
+        tunnel_ = &tunnel;
+    }
+
+    tunnel.run();
+
+    std::lock_guard<std::mutex> lock(socketMutex_);
+    tunnel_ = nullptr;
     return true;
 }
 
 // ---- Main flow ----
 
 void DirectRelay::run() {
-    running_ = true;
+    if (stopping_) {
+        closeSockets();
+        return;
+    }
+
     liveFlow_.begin(context_.liveStats.get());
 
     // Transparent connections initially carry only an IP address. Buffering
@@ -507,53 +648,146 @@ void DirectRelay::run() {
             const bool flushed = firstResponse_.empty() ||
                                  tcp::sendAll(clientSock_, firstResponse_.data(),
                                               firstResponse_.size());
-            if (flushed) {
-                clientToTarget_ = std::thread([this]() { pumpClientToTarget(); });
-                targetToClient_ = std::thread([this]() { pumpTargetToClient(); });
-                if (clientToTarget_.joinable()) clientToTarget_.join();
-                if (targetToClient_.joinable()) targetToClient_.join();
-            }
+            releaseHandshakeBuffers();
+            if (flushed) pump();
             spdlog::trace("Baglanti kapandi: {}:{}", targetHost_, targetPort_);
         } else {
             handOffToTunnel(); // takes clientSock_ on success
         }
     }
 
-    // Clear the handles before the destructor runs so a recycled handle value
-    // can never be shut down out from under another connection.
-    running_ = false;
-    if (clientSock_ != INVALID_SOCKET) { closesocket(clientSock_); clientSock_ = INVALID_SOCKET; }
-    if (targetSock_ != INVALID_SOCKET) { closesocket(targetSock_); targetSock_ = INVALID_SOCKET; }
-
-    delete this;
+    // Clear the handles before returning so a recycled handle value can never
+    // be shut down out from under another connection.
+    closeSockets();
 }
 
-void DirectRelay::pumpClientToTarget() {
-    std::array<uint8_t, kPumpBufferSize> buffer;
+void DirectRelay::pump() {
+    if (!setNonBlocking(clientSock_, true) || !setNonBlocking(targetSock_, true)) return;
 
-    while (running_) {
-        const int received = recv(clientSock_, (char*)buffer.data(), (int)buffer.size(), 0);
-        if (received <= 0) break;
-        if (!tcp::sendAll(targetSock_, buffer.data(), (size_t)received)) break;
+    std::array<uint8_t, kPumpBufferSize> buffer;
+    Direction upstream{clientSock_, targetSock_};
+    Direction downstream{targetSock_, clientSock_};
+    Direction* const directions[] = {&upstream, &downstream};
+
+    ULONGLONG lastActivity = GetTickCount64();
+
+    while (!stopping_) {
+        fd_set readable;
+        fd_set writable;
+        FD_ZERO(&readable);
+        FD_ZERO(&writable);
+
+        bool anyOpen = false;
+        for (Direction* direction : directions) {
+            if (direction->finished()) continue;
+            anyOpen = true;
+            if (!direction->pending.empty()) {
+                FD_SET(direction->to, &writable);
+            } else {
+                FD_SET(direction->from, &readable);
+            }
+        }
+        if (!anyOpen) return; // both sides sent FIN and everything was delivered
+
+        const bool halfClosed = upstream.eof || downstream.eof;
+        const unsigned idleLimit = halfClosed
+            ? std::min(kHalfClosedLingerMs, context_.idleTimeoutMs)
+            : context_.idleTimeoutMs;
+        const ULONGLONG now = GetTickCount64();
+        const ULONGLONG idle = now - lastActivity;
+        if (idle >= idleLimit) {
+            spdlog::debug("{}:{} {} sn boyunca sessiz kaldi, kapatiliyor",
+                          targetHost_, targetPort_, idle / 1000);
+            return;
+        }
+
+        const ULONGLONG waitMs = std::min<ULONGLONG>(idleLimit - idle, kPumpMaxWaitMs);
+        timeval tv{};
+        tv.tv_sec = (long)(waitMs / 1000);
+        tv.tv_usec = (long)((waitMs % 1000) * 1000);
+
+        const int ready = ::select(0, &readable, &writable, nullptr, &tv);
+        if (ready == SOCKET_ERROR) return; // a handle was closed under us
+        if (ready == 0) continue;
+
+        for (Direction* direction : directions) {
+            if (direction->finished()) continue;
+
+            if (!direction->pending.empty()) {
+                if (!FD_ISSET(direction->to, &writable)) continue;
+                size_t sent = 0;
+                if (!sendSome(direction->to, direction->pending.data() + direction->offset,
+                              direction->pending.size() - direction->offset, sent)) {
+                    return;
+                }
+                if (sent > 0) lastActivity = GetTickCount64();
+                direction->offset += sent;
+                if (direction->offset == direction->pending.size()) {
+                    direction->pending.clear();
+                    direction->offset = 0;
+                    if (direction->eof) shutdown(direction->to, SD_SEND);
+                }
+                continue;
+            }
+
+            if (!FD_ISSET(direction->from, &readable)) continue;
+            const int received = ::recv(direction->from, (char*)buffer.data(),
+                                        (int)buffer.size(), 0);
+            if (received == SOCKET_ERROR) {
+                if (WSAGetLastError() == WSAEWOULDBLOCK) continue;
+                return; // reset or aborted: tear down both sides
+            }
+            lastActivity = GetTickCount64();
+            if (received == 0) {
+                // Propagate the half-close; the other direction keeps flowing
+                // until the peer answers with its own FIN.
+                direction->eof = true;
+                shutdown(direction->to, SD_SEND);
+                continue;
+            }
+
+            size_t sent = 0;
+            if (!sendSome(direction->to, buffer.data(), (size_t)received, sent)) return;
+            if (sent < (size_t)received) {
+                direction->pending.assign(buffer.begin() + sent, buffer.begin() + received);
+                direction->offset = 0;
+            }
+        }
     }
-    stop();
 }
 
-void DirectRelay::pumpTargetToClient() {
-    std::array<uint8_t, kPumpBufferSize> buffer;
+void DirectRelay::releaseHandshakeBuffers() {
+    std::vector<uint8_t>().swap(clientBuffer_);
+    std::vector<uint8_t>().swap(firstResponse_);
+    candidates_.clear();
+    candidates_.shrink_to_fit();
+}
 
-    while (running_) {
-        const int received = recv(targetSock_, (char*)buffer.data(), (int)buffer.size(), 0);
-        if (received <= 0) break;
-        if (!tcp::sendAll(clientSock_, buffer.data(), (size_t)received)) break;
+void DirectRelay::closeSockets() {
+    std::lock_guard<std::mutex> lock(socketMutex_);
+    // An aborted connection is reset so the peer is told at once; a connection
+    // that ended on its own is closed gracefully to flush the last bytes.
+    const bool abort = stopping_.load();
+    if (clientSock_ != INVALID_SOCKET) {
+        if (abort) closeAbortive(clientSock_); else closesocket(clientSock_);
+        clientSock_ = INVALID_SOCKET;
     }
-    stop();
+    if (targetSock_ != INVALID_SOCKET) {
+        if (abort) closeAbortive(targetSock_); else closesocket(targetSock_);
+        targetSock_ = INVALID_SOCKET;
+    }
 }
 
 void DirectRelay::stop() {
-    bool expected = true;
-    if (running_.compare_exchange_strong(expected, false)) {
-        if (targetSock_ != INVALID_SOCKET) shutdown(targetSock_, SD_BOTH);
-        if (clientSock_ != INVALID_SOCKET) shutdown(clientSock_, SD_BOTH);
-    }
+    stopping_ = true;
+    std::lock_guard<std::mutex> lock(socketMutex_);
+    if (tunnel_) tunnel_->stop();
+    // Shut down only the receive side. That is enough to unblock a blocking
+    // recv or a select() waiting to read, so the owning thread notices the
+    // abort and runs closeSockets(); it deliberately does not send a FIN,
+    // because a graceful half-close would let the reset that closeSockets()
+    // arms degrade into a FIN that lingers for seconds on a non-blocking
+    // socket. The peer is then told the connection is gone at once, by RST.
+    if (targetSock_ != INVALID_SOCKET) shutdown(targetSock_, SD_RECEIVE);
+    if (clientSock_ != INVALID_SOCKET) shutdown(clientSock_, SD_RECEIVE);
 }

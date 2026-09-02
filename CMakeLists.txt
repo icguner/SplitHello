@@ -92,6 +92,7 @@ add_custom_command(
 add_library(splithello_core STATIC
     src/Config.cpp
     src/Diagnosis.cpp
+    src/DirectRelay.cpp
     src/Dns.cpp
     src/DnsMessage.cpp
     src/FileUtil.cpp
@@ -102,7 +103,9 @@ add_library(splithello_core STATIC
     src/ProcessFilter.cpp
     src/QuicStrategy.cpp
     src/RecoveryPolicy.cpp
+    src/Relay.cpp
     src/Secure.cpp
+    src/SocksProxy.cpp
     src/Strategy.cpp
     src/SystemProxy.cpp
     src/TcpConnect.cpp
@@ -110,6 +113,7 @@ add_library(splithello_core STATIC
     src/TlsHello.cpp
     src/TransparentFlow.cpp
     src/Wrangler.cpp
+    src/WsClient.cpp
 )
 
 target_include_directories(splithello_core PUBLIC src)
@@ -127,15 +131,11 @@ target_link_libraries(splithello_core PUBLIC
 
 add_executable(splithello
     src/main.cpp
-    src/DirectRelay.cpp
     src/DashboardPanel.cpp
-    src/Relay.cpp
-    src/SocksProxy.cpp
     src/Setup.cpp
     src/TransparentDnsProxy.cpp
     src/TrayApp.cpp
     src/WinDivertInterceptor.cpp
-    src/WsClient.cpp
     ${WORKER_HEADER}
     ${CMAKE_CURRENT_SOURCE_DIR}/src/splithello.manifest
 )
