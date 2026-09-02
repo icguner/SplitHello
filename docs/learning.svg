@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 476" width="760" height="476" role="img" aria-label="Ogrenme kurali: gecici hata elenir, iki bagimsiz kanit gerekir, ogrenilen profil 30 dakikada bir yeniden dogrulanir">
+  <defs>
+    <marker id="ma" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#5b7ba6"/>
+    </marker>
+    <marker id="mo" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#7a6320"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="760" height="476" rx="18" fill="#0d1424"/>
+  <text x="380" y="38" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="15" font-weight="600" fill="#93a1c0" letter-spacing="1.6">ÖĞRENME KURALI &#183; LEARNING RULE</text>
+  <text x="380" y="58" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="11.5" fill="#6f7f9c">Tek kanıt yetmez &#8212; ağ takılması da atlatma gibi görünür / one proof is not enough</text>
+
+  <!-- start -->
+  <rect x="100" y="78" width="400" height="54" rx="13" fill="#16203a" stroke="#2b3a5c" stroke-width="1.5"/>
+  <text x="300" y="101" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="13.5" font-weight="600" fill="#e8eefc">Baz çizgi düştü, bir profil geçti</text>
+  <text x="300" y="120" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="11.5" fill="#93a1c0">Baseline failed, a profile worked</text>
+  <path d="M300 132 L300 152" stroke="#5b7ba6" stroke-width="2" marker-end="url(#ma)"/>
+
+  <!-- check 1 -->
+  <rect x="100" y="154" width="400" height="58" rx="29" fill="#1b2745" stroke="#3d5a8a" stroke-width="1.5"/>
+  <text x="300" y="178" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="13" font-weight="600" fill="#e8eefc">Son 15 dk&#8217;da sağlıklı baz çizgi var mı?</text>
+  <text x="300" y="197" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="11.5" fill="#93a1c0">Healthy baseline in the last 15 min?</text>
+  <path d="M500 183 L528 183" stroke="#7a6320" stroke-width="2" marker-end="url(#mo)"/>
+  <text x="514" y="176" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="10.5" font-weight="600" fill="#a89768">EVET</text>
+
+  <rect x="530" y="156" width="198" height="54" rx="13" fill="#2c2411" stroke="#7a6320" stroke-width="1.5"/>
+  <text x="629" y="179" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" font-weight="700" fill="#fbbf24">Geçici hata / Transient</text>
+  <text x="629" y="197" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="11.5" fill="#a89768">öğrenilmez / not learned</text>
+
+  <path d="M300 212 L300 232" stroke="#5b7ba6" stroke-width="2" marker-end="url(#ma)"/>
+  <text x="316" y="227" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="10.5" font-weight="600" fill="#6f7f9c">HAYIR</text>
+
+  <!-- check 2 -->
+  <rect x="100" y="234" width="400" height="58" rx="29" fill="#1b2745" stroke="#3d5a8a" stroke-width="1.5"/>
+  <text x="300" y="258" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="13" font-weight="600" fill="#e8eefc">İkinci bağımsız kanıt (&#8805; 60 sn sonra)?</text>
+  <text x="300" y="277" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="11.5" fill="#93a1c0">Second independent proof, &#8805; 60 s later?</text>
+  <path d="M500 263 L528 263" stroke="#7a6320" stroke-width="2" marker-end="url(#mo)"/>
+  <text x="514" y="256" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="10.5" font-weight="600" fill="#a89768">HAYIR</text>
+
+  <rect x="530" y="236" width="198" height="54" rx="13" fill="#2c2411" stroke="#7a6320" stroke-width="1.5"/>
+  <text x="629" y="259" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" font-weight="700" fill="#fbbf24">Aday / Candidate</text>
+  <text x="629" y="277" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="11.5" fill="#a89768">henüz öğrenilmez / not yet</text>
+
+  <path d="M300 292 L300 312" stroke="#3f9c6b" stroke-width="2" marker-end="url(#ma)"/>
+  <text x="316" y="307" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="10.5" font-weight="600" fill="#4ade80">EVET</text>
+
+  <!-- learned -->
+  <rect x="100" y="314" width="400" height="58" rx="13" fill="#122b20" stroke="#2f6b46" stroke-width="1.5"/>
+  <text x="300" y="338" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="14" font-weight="700" fill="#4ade80">ÖĞRENİLDİ / LEARNED &#183; 7 gün</text>
+  <text x="300" y="357" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="11.5" fill="#7fa891">ağ kimliği + alan adı için / per network identity + hostname</text>
+  <path d="M300 372 L300 392" stroke="#5b7ba6" stroke-width="2" marker-end="url(#ma)"/>
+
+  <!-- reverify -->
+  <rect x="100" y="394" width="400" height="58" rx="13" fill="#12203a" stroke="#3d5a8a" stroke-width="1.5"/>
+  <text x="300" y="418" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="13" font-weight="600" fill="#60a5fa">Her 30 dk baz çizgiyle yeniden sınanır</text>
+  <text x="300" y="437" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="11.5" fill="#8ba3c4">Re-verified against the baseline every 30 min</text>
+  <path d="M500 423 L528 423" stroke="#5b7ba6" stroke-width="2" marker-end="url(#ma)"/>
+
+  <rect x="530" y="396" width="198" height="54" rx="13" fill="#16203a" stroke="#2b3a5c" stroke-width="1.5"/>
+  <text x="629" y="419" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="12.5" font-weight="600" fill="#cbd6ea">Baz çizgi geçerse unut</text>
+  <text x="629" y="437" text-anchor="middle" font-family="Segoe UI, system-ui, -apple-system, Helvetica, Arial, sans-serif"
+        font-size="11.5" fill="#93a1c0">baseline passes &#8594; forget</text>
+</svg>
