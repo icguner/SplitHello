@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(splithello LANGUAGES C CXX)
+project(splithello LANGUAGES C CXX RC)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -71,6 +71,10 @@ set_target_properties(windivert_import PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${windivert_SOURCE_DIR}/include"
 )
 
+add_library(splithello_packet STATIC src/WinDivertPacket.cpp)
+target_include_directories(splithello_packet PUBLIC src)
+target_link_libraries(splithello_packet PUBLIC windivert_import ws2_32)
+
 # ---- Worker source is embedded from worker/src/index.js at build time ----
 # There is exactly one copy of the Worker in this repo. `wrangler deploy` and
 # `splithello --setup` therefore always ship identical code.
@@ -131,6 +135,7 @@ target_link_libraries(splithello_core PUBLIC
 
 add_executable(splithello
     src/main.cpp
+    src/SplitHello.rc
     src/DashboardPanel.cpp
     src/Setup.cpp
     src/TransparentDnsProxy.cpp
@@ -145,6 +150,7 @@ target_include_directories(splithello PRIVATE
 )
 target_link_libraries(splithello PRIVATE
     splithello_core
+    splithello_packet
     windivert_import
     shell32
     advapi32

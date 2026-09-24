@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Config.hpp"
 #include "RecoveryPolicy.hpp"
 
 #include <memory>
@@ -57,6 +58,7 @@ private:
     bool isStartupEnabled() const;
     bool setStartupEnabled(bool enabled) const;
     void toggleStartup();
+    void setDnsMode(DnsMode mode);
     void openLogDirectory() const;
     void openDashboard();
     void restartEngineForConfiguration();

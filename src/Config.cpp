@@ -113,6 +113,8 @@ bool Config::load() {
     accountId    = json::getString(json, "account_id");
     workerName   = json::getString(json, "worker_name");
     workerUrl    = json::getString(json, "worker_url");
+    dnsMode      = json::getString(json, "dns_mode") == "system"
+        ? DnsMode::System : DnsMode::Worker;
 
     if (workerName.empty()) workerName = "splithello-relay";
 
@@ -160,6 +162,8 @@ bool Config::save() const {
     content += "  \"account_id\": \"" + json::escape(accountId) + "\",\n";
     content += "  \"worker_name\": \"" + json::escape(workerName) + "\",\n";
     content += "  \"worker_url\": \"" + json::escape(workerUrl) + "\",\n";
+    content += "  \"dns_mode\": \"" +
+        std::string(dnsMode == DnsMode::System ? "system" : "worker") + "\",\n";
     content += "  \"split_delay_ms\": " + std::to_string(splitDelayMs) + ",\n";
     content += "  \"probe_timeout_ms\": " + std::to_string(probeTimeoutMs) + ",\n";
     content += "  \"tunnel_fallback\": " + std::string(tunnelFallback ? "true" : "false") + ",\n";

@@ -1,0 +1,4 @@
+#include "SplitHelloIcon.hpp"
+
+// Multi-resolution artwork keeps the split mark legible in the system tray.
+IDI_SPLITHELLO ICON "../assets/splithello.ico"

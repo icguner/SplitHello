@@ -62,7 +62,10 @@ Resolver::Resolver(const std::string& workerUrl, std::string sharedSecret,
     , sharedSecret_(std::move(sharedSecret))
     , connectPort_(connectPort) {
     if (workerHost_.empty()) {
-        spdlog::warn("DNS: Worker URL cozumlenemedi ({}), sistem DNS kullanilacak", workerUrl);
+        if (!workerUrl.empty()) {
+            spdlog::warn("DNS: Worker URL cozumlenemedi ({}), sistem DNS kullanilacak",
+                         workerUrl);
+        }
         return;
     }
 
@@ -122,6 +125,7 @@ Result Resolver::query(const std::string& host) const {
     }
 
     const http::Response response = http::perform(request);
+    workerHealth_.observe(response.status, GetTickCount64());
 
     if (response.status == 401 || response.status == 403) {
         spdlog::error("DNS: Worker kimlik dogrulamasi reddetti (HTTP {}). "
@@ -154,6 +158,7 @@ Result Resolver::query(const std::string& host) const {
     };
     dropNonLiterals(result.v4);
     dropNonLiterals(result.v6);
+    result.allowWireFallback = result.empty();
 
     const long long ttl = json::getInt(response.body, "ttl", kMinTtlSeconds);
     result.ttlSeconds = (unsigned)std::clamp<long long>(ttl, kMinTtlSeconds, kMaxTtlSeconds);
@@ -190,6 +195,7 @@ Result Resolver::resolve(const std::string& host) {
                 return cached->second.result;
             }
 
+            if (key == lowercase(workerHost_)) return {};
             if (inFlight_.insert(key).second) break;
             cacheReady_.wait(lock, [this, &key]() {
                 return !inFlight_.contains(key);
@@ -270,6 +276,7 @@ std::vector<uint8_t> Resolver::queryWire(const uint8_t* message, size_t length) 
     request.body.assign(reinterpret_cast<const char*>(message), length);
 
     const http::Response response = http::perform(request);
+    workerHealth_.observe(response.status, GetTickCount64());
     if (response.status == 401 || response.status == 403) {
         spdlog::error("DNS wire: Worker kimlik dogrulamasi reddetti (HTTP {})",
                       response.status);
@@ -285,9 +292,16 @@ std::vector<uint8_t> Resolver::queryWire(const uint8_t* message, size_t length) 
     return {begin, begin + response.body.size()};
 }
 
+bool Resolver::isBootstrapHost(const std::string& host) const {
+    return !workerHost_.empty() && lowercase(host) == lowercase(workerHost_);
+}
+
 void Resolver::clearCache() {
     std::lock_guard<std::mutex> lock(mutex_);
-    cache_.clear();
+    const std::string bootstrapKey = lowercase(workerHost_);
+    std::erase_if(cache_, [&bootstrapKey](const auto& entry) {
+        return entry.first != bootstrapKey;
+    });
 }
 
 size_t Resolver::cacheSize() const {

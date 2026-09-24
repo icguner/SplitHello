@@ -1,6 +1,7 @@
 #include "TrayApp.hpp"
 
 #include "DashboardPanel.hpp"
+#include "SplitHelloIcon.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -21,6 +22,8 @@ constexpr UINT kCommandStartup = 1003;
 constexpr UINT kCommandOpenLogs = 1004;
 constexpr UINT kCommandExit = 1005;
 constexpr UINT kCommandDashboard = 1006;
+constexpr UINT kCommandDnsWorker = 1007;
+constexpr UINT kCommandDnsSystem = 1008;
 
 std::wstring quoteWindowsArgument(const std::wstring& argument) {
     if (argument.find_first_of(L" \t\n\v\"") == std::wstring::npos) return argument;
@@ -110,9 +113,14 @@ const wchar_t* stateText(TrayApp::EngineState state) {
 }
 
 HICON stateIcon(TrayApp::EngineState state) {
+    if (state == TrayApp::EngineState::Running ||
+        state == TrayApp::EngineState::Stopped) {
+        return static_cast<HICON>(LoadImageW(
+            GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_SPLITHELLO), IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
+    }
     LPCWSTR resource = MAKEINTRESOURCEW(32512); // IDI_APPLICATION
-    if (state == TrayApp::EngineState::Running) resource = MAKEINTRESOURCEW(32518); // IDI_SHIELD
-    else if (state == TrayApp::EngineState::Starting) resource = MAKEINTRESOURCEW(32516); // IDI_INFORMATION
+    if (state == TrayApp::EngineState::Starting) resource = MAKEINTRESOURCEW(32516); // IDI_INFORMATION
     else if (state == TrayApp::EngineState::Stopping) resource = MAKEINTRESOURCEW(32515); // IDI_WARNING
     else if (state == TrayApp::EngineState::Failed) resource = MAKEINTRESOURCEW(32513); // IDI_ERROR
     return LoadIconW(nullptr, resource);
@@ -165,6 +173,9 @@ bool TrayApp::createWindow() {
     windowClass.cbSize = sizeof(windowClass);
     windowClass.lpfnWndProc = windowProc;
     windowClass.hInstance = GetModuleHandleW(nullptr);
+    windowClass.hIcon = LoadIconW(windowClass.hInstance,
+                                  MAKEINTRESOURCEW(IDI_SPLITHELLO));
+    windowClass.hIconSm = stateIcon(EngineState::Stopped);
     windowClass.lpszClassName = kWindowClass;
     if (!RegisterClassExW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
         spdlog::error("Tray pencere sinifi olusturulamadi: {}", GetLastError());
@@ -227,6 +238,8 @@ void TrayApp::showBalloon(const std::wstring& title,
 
 void TrayApp::showMenu() {
     startupEnabled_ = isStartupEnabled();
+    Config config;
+    config.load();
 
     HMENU menu = CreatePopupMenu();
     if (!menu) return;
@@ -241,6 +254,13 @@ void TrayApp::showMenu() {
                 kCommandStart, L"Başlat");
     AppendMenuW(menu, MF_STRING | (stopped ? MF_DISABLED : 0),
                 kCommandStop, L"Durdur");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING |
+                    (config.dnsMode == DnsMode::Worker ? MF_CHECKED : 0),
+                kCommandDnsWorker, L"DNS: Worker");
+    AppendMenuW(menu, MF_STRING |
+                    (config.dnsMode == DnsMode::System ? MF_CHECKED : 0),
+                kCommandDnsSystem, L"DNS: Sistem (Worker'sız)");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (startupEnabled_ ? MF_CHECKED : 0),
                 kCommandStartup, L"Windows ile başlat");
@@ -379,6 +399,13 @@ void TrayApp::pollEngine() {
             setState(EngineState::Stopped);
             showBalloon(L"SplitHello", L"Koruma durduruldu.");
         }
+    } else if (exitCode == recovery::kWorkerUnavailableExitCode) {
+        restartPending_ = false;
+        restartAtMs_ = 0;
+        setState(EngineState::Failed);
+        showBalloon(L"SplitHello koruması durdu",
+                    L"Worker erişilemedi. Normal internet yolu açık; yeniden denemek için Başlat seçin.",
+                    NIIF_WARNING);
     } else {
         scheduleAutomaticRestart(exitCode, nowMs);
     }
@@ -488,6 +515,26 @@ void TrayApp::restartEngineForConfiguration() {
     requestStop();
 }
 
+void TrayApp::setDnsMode(DnsMode mode) {
+    Config config;
+    config.load();
+    if (config.dnsMode == mode) return;
+    if (mode == DnsMode::Worker && config.workerUrl.empty()) {
+        showBalloon(L"Worker kurulumu gerekli",
+                    L"Worker DNS için önce splithello.exe --setup çalıştırın.",
+                    NIIF_WARNING);
+        return;
+    }
+    config.dnsMode = mode;
+    if (!config.save()) {
+        showBalloon(L"DNS modu değişmedi", L"Yapılandırma kaydedilemedi.", NIIF_ERROR);
+        return;
+    }
+    canStart_ = config.isValid();
+    spdlog::info("DNS modu secildi: {}", mode == DnsMode::Worker ? "Worker" : "sistem");
+    restartEngineForConfiguration();
+}
+
 LRESULT CALLBACK TrayApp::windowProc(HWND window, UINT message,
                                      WPARAM wParam, LPARAM lParam) {
     TrayApp* app = reinterpret_cast<TrayApp*>(
@@ -525,6 +572,8 @@ LRESULT TrayApp::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case kCommandStart: startEngine(); break;
         case kCommandStop: requestStop(); break;
         case kCommandStartup: toggleStartup(); break;
+        case kCommandDnsWorker: setDnsMode(DnsMode::Worker); break;
+        case kCommandDnsSystem: setDnsMode(DnsMode::System); break;
         case kCommandOpenLogs: openLogDirectory(); break;
         case kCommandDashboard: openDashboard(); break;
         case kCommandExit: requestExit(); break;

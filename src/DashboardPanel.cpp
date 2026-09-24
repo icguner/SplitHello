@@ -1,6 +1,7 @@
 #include "DashboardPanel.hpp"
 
 #include "Config.hpp"
+#include "SplitHelloIcon.hpp"
 #include "Http.hpp"
 #include "LiveStats.hpp"
 #include "Telemetry.hpp"
@@ -620,7 +621,11 @@ struct DashboardPanel::Impl {
         windowClass.lpfnWndProc = windowProc;
         windowClass.hInstance = GetModuleHandleW(nullptr);
         windowClass.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
-        windowClass.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+        windowClass.hIcon = LoadIconW(windowClass.hInstance,
+                                      MAKEINTRESOURCEW(IDI_SPLITHELLO));
+        windowClass.hIconSm = static_cast<HICON>(LoadImageW(
+            windowClass.hInstance, MAKEINTRESOURCEW(IDI_SPLITHELLO), IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
         windowClass.hbrBackground = nullptr;
         windowClass.lpszClassName = kWindowClass;
         if (!RegisterClassExW(&windowClass) &&

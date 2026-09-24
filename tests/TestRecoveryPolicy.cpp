@@ -34,3 +34,25 @@ TEST(RecoveryPolicyStopsRestartLoopsInsideWindow) {
     budget.reset();
     CHECK_EQ(budget.consume(1101), 1U);
 }
+
+TEST(WorkerHealthTripsOnNearbyFailuresAndStaysOpen) {
+    recovery::WorkerHealth health;
+    CHECK(!health.observe(-1, 100));
+    CHECK(!health.observe(503, 200));
+    CHECK(health.observe(-1, 300));
+    CHECK(health.unavailable());
+    CHECK(health.observe(200, 400));
+}
+
+TEST(WorkerHealthResetsAfterSuccessOrQuietPeriod) {
+    recovery::WorkerHealth health;
+    CHECK(!health.observe(-1, 100));
+    CHECK(!health.observe(200, 200));
+    CHECK(!health.observe(-1, 300));
+    CHECK(!health.observe(-1, 31'000));
+    CHECK(!health.unavailable());
+    CHECK(!health.observe(404, 31'100));
+    CHECK(!health.observe(401, 31'200));
+    CHECK(!health.observe(429, 31'300));
+    CHECK(health.observe(403, 31'400));
+}

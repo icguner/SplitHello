@@ -1,5 +1,6 @@
 #include "WinDivertInterceptor.hpp"
 #include "RecoveryPolicy.hpp"
+#include "WinDivertPacket.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -77,91 +78,6 @@ process_filter::Endpoint processEndpoint(const WINDIVERT_IPHDR* ipv4,
     return endpoint;
 }
 
-std::vector<uint8_t> buildTcpVariant(
-    const uint8_t* packet, UINT packetLength, const void* payload,
-    const std::vector<uint8_t>& replacement, int32_t sequenceOffset,
-    const WINDIVERT_ADDRESS& address, uint8_t ttl, bool corruptChecksum) {
-    if (!packet || !payload) return {};
-    const auto* payloadBytes = static_cast<const uint8_t*>(payload);
-    if (payloadBytes < packet || payloadBytes > packet + packetLength) return {};
-
-    const size_t headerLength = (size_t)(payloadBytes - packet);
-    const size_t totalLength = headerLength + replacement.size();
-    if (headerLength == 0 || totalLength > WINDIVERT_MTU_MAX) {
-        return {};
-    }
-
-    std::vector<uint8_t> out(totalLength);
-    std::memcpy(out.data(), packet, headerLength);
-    if (!replacement.empty()) {
-        std::memcpy(out.data() + headerLength, replacement.data(), replacement.size());
-    }
-
-    PWINDIVERT_IPHDR variantIpv4 = nullptr;
-    PWINDIVERT_IPV6HDR variantIpv6 = nullptr;
-    PWINDIVERT_TCPHDR variantTcp = nullptr;
-    if (!WinDivertHelperParsePacket(out.data(), (UINT)out.size(), &variantIpv4,
-                                    &variantIpv6, nullptr, nullptr, nullptr,
-                                    &variantTcp, nullptr, nullptr, nullptr,
-                                    nullptr, nullptr) ||
-        !variantTcp || (!variantIpv4 && !variantIpv6)) {
-        return {};
-    }
-
-    if (variantIpv4) {
-        variantIpv4->Length = htons((uint16_t)out.size());
-        if (ttl != 0) variantIpv4->TTL = ttl;
-    } else {
-        variantIpv6->Length = htons((uint16_t)(out.size() - sizeof(WINDIVERT_IPV6HDR)));
-        if (ttl != 0) variantIpv6->HopLimit = ttl;
-    }
-
-    const uint32_t sequence = ntohl(variantTcp->SeqNum);
-    variantTcp->SeqNum = htonl(sequence + (uint32_t)sequenceOffset);
-    WINDIVERT_ADDRESS checksumAddress = address;
-    WinDivertHelperCalcChecksums(out.data(), (UINT)out.size(), &checksumAddress, 0);
-    if (corruptChecksum) variantTcp->Checksum ^= htons(0xFFFF);
-    return out;
-}
-
-std::vector<uint8_t> buildUdpVariant(
-    const uint8_t* packet, UINT packetLength, const void* payload,
-    const std::vector<uint8_t>& replacement,
-    const WINDIVERT_ADDRESS& address) {
-    if (!packet || !payload) return {};
-    const auto* payloadBytes = static_cast<const uint8_t*>(payload);
-    if (payloadBytes < packet || payloadBytes > packet + packetLength) return {};
-
-    const size_t headerLength = (size_t)(payloadBytes - packet);
-    const size_t totalLength = headerLength + replacement.size();
-    if (headerLength == 0 || totalLength > WINDIVERT_MTU_MAX) return {};
-
-    std::vector<uint8_t> out(totalLength);
-    std::memcpy(out.data(), packet, headerLength);
-    std::memcpy(out.data() + headerLength, replacement.data(), replacement.size());
-
-    PWINDIVERT_IPHDR variantIpv4 = nullptr;
-    PWINDIVERT_IPV6HDR variantIpv6 = nullptr;
-    PWINDIVERT_UDPHDR variantUdp = nullptr;
-    if (!WinDivertHelperParsePacket(out.data(), (UINT)out.size(), &variantIpv4,
-                                    &variantIpv6, nullptr, nullptr, nullptr,
-                                    nullptr, &variantUdp, nullptr, nullptr,
-                                    nullptr, nullptr) ||
-        !variantUdp || (!variantIpv4 && !variantIpv6)) {
-        return {};
-    }
-
-    if (variantIpv4) {
-        variantIpv4->Length = htons((uint16_t)out.size());
-    } else {
-        variantIpv6->Length = htons((uint16_t)(out.size() - sizeof(WINDIVERT_IPV6HDR)));
-    }
-    variantUdp->Length = htons((uint16_t)(sizeof(WINDIVERT_UDPHDR) + replacement.size()));
-    WINDIVERT_ADDRESS checksumAddress = address;
-    WinDivertHelperCalcChecksums(out.data(), (UINT)out.size(), &checksumAddress, 0);
-    return out;
-}
-
 void appendPacket(std::vector<uint8_t>& packets,
                   std::vector<WINDIVERT_ADDRESS>& addresses,
                   const uint8_t* packet, size_t packetLength,
@@ -194,7 +110,8 @@ WinDivertInterceptor::WinDivertInterceptor(transparent::FlowRegistry& flows,
                                            uint16_t dnsProxyPort,
                                            uint16_t connectPort,
                                            quic_strategy::Mode quicMode,
-                                           process_filter::Filter* processFilter)
+                                           process_filter::Filter* processFilter,
+                                           bool captureDns)
     : flows_(flows)
     , datagrams_(datagrams)
     , packetPolicies_(packetPolicies)
@@ -202,14 +119,18 @@ WinDivertInterceptor::WinDivertInterceptor(transparent::FlowRegistry& flows,
     , dnsProxyPort_(dnsProxyPort)
     , connectPort_(connectPort)
     , quicMode_(quicMode)
-    , processFilter_(processFilter) {}
+    , processFilter_(processFilter)
+    , captureDns_(captureDns) {}
 
 WinDivertInterceptor::~WinDivertInterceptor() {
     stop();
 }
 
 bool WinDivertInterceptor::start() {
+    const std::lock_guard lifecycleLock(stopMutex_);
     if (running_) return true;
+    if (worker_.joinable()) worker_.join();
+    closeHandles();
     fatalErrorCode_ = ERROR_SUCCESS;
     if (proxyPort_ == 0 || dnsProxyPort_ == 0 || connectPort_ == 0 ||
         proxyPort_ == connectPort_ || proxyPort_ == dnsProxyPort_ ||
@@ -229,14 +150,19 @@ bool WinDivertInterceptor::start() {
         ? " or (udp and ((outbound and udp.DstPort == 443) or "
           "(inbound and udp.SrcPort == 443)))"
         : "";
+    char dnsClause[128] = {};
+    if (captureDns_) {
+        std::snprintf(dnsClause, sizeof(dnsClause),
+                      " or (udp and outbound and (udp.DstPort == %u or udp.SrcPort == %u))",
+                      kDnsPort, dnsProxyPort_);
+    }
     const int written = std::snprintf(
         filter, sizeof(filter),
         "!loopback and ((tcp and ((outbound and (tcp.DstPort == %u or "
         "tcp.DstPort == %u or tcp.SrcPort == %u)) or "
-        "(inbound and tcp.SrcPort == %u))) or "
-        "(udp and outbound and (udp.DstPort == %u or udp.SrcPort == %u))%s)",
+        "(inbound and tcp.SrcPort == %u)))%s%s)",
         kHttpsPort, connectPort_, proxyPort_, kHttpsPort,
-        kDnsPort, dnsProxyPort_, capturedQuic);
+        dnsClause, capturedQuic);
     if (written <= 0 || written >= (int)sizeof(filter)) return false;
 
     std::array<char, 4096> compiledFilter{};
@@ -288,9 +214,26 @@ bool WinDivertInterceptor::start() {
     }
 
     running_ = true;
-    worker_ = std::thread([this]() { run(); });
-    spdlog::info("WinDivert aktif: TCP/443 -> localhost:{}, DNS/53 -> localhost:{}",
-                 proxyPort_, dnsProxyPort_);
+    try {
+        worker_ = std::thread([this]() {
+            try { run(); }
+            catch (...) {
+                fatalErrorCode_ = ERROR_UNHANDLED_EXCEPTION;
+                running_ = false;
+            }
+        });
+    } catch (...) {
+        running_ = false;
+        closeHandles();
+        return false;
+    }
+    if (captureDns_) {
+        spdlog::info("WinDivert aktif: TCP/443 -> localhost:{}, DNS/53 -> localhost:{}",
+                     proxyPort_, dnsProxyPort_);
+    } else {
+        spdlog::info("WinDivert aktif: TCP/443 -> localhost:{}, DNS sistemde kalir",
+                     proxyPort_);
+    }
     if (quicMode_ == quic_strategy::Mode::Block) {
         spdlog::info(processAwareQuicBlock
             ? "QUIC modu=block: yalniz surec kuraliyla secilen UDP/443 akislari dusurulecek"
@@ -339,6 +282,7 @@ void WinDivertInterceptor::run() {
     std::vector<uint8_t> outputPackets;
     std::vector<WINDIVERT_ADDRESS> outputAddresses;
     unsigned completedReadRetries = 0;
+    unsigned failedSends = 0;
 
     while (running_) {
         UINT packetsLength = 0;
@@ -367,9 +311,8 @@ void WinDivertInterceptor::run() {
             spdlog::error(
                 "WinDivert paket okuyucusu durdu: hata={}; fail-open ile filtre kapatiliyor",
                 error);
-            // Closing the handle is the critical fail-open boundary: new HTTPS
-            // and DNS packets immediately return to the normal Windows path.
-            closeHandles();
+            // The owner observes running_ within 50 ms and closes the handle
+            // after joining us. Never race stop() over raw HANDLE storage.
             break;
         }
 
@@ -456,7 +399,7 @@ void WinDivertInterceptor::run() {
                     break;
                 }
 
-                if (!processBypass) {
+                if (!processBypass && route != transparent::PacketRoute::Pass) {
                     WinDivertHelperCalcChecksums(packet, packetLength,
                                                   &addresses[index], 0);
                 }
@@ -498,7 +441,7 @@ void WinDivertInterceptor::run() {
                                 static_cast<const uint8_t*>(payload), payloadLength,
                                 segmentPolicy);
                             for (const auto& segment : segments) {
-                                const std::vector<uint8_t> variant = buildTcpVariant(
+                                const std::vector<uint8_t> variant = divert_packet::buildTcpVariant(
                                     packet, packetLength, payload, segment.payload,
                                     segment.sequenceOffset, addresses[index], 0, false);
                                 if (!variant.empty()) {
@@ -526,7 +469,7 @@ void WinDivertInterceptor::run() {
                                 mode == packet_strategy::Mode::FakeAutoTtl
                                     ? policy->fakeTtl
                                     : 0;
-                            const std::vector<uint8_t> fakePacket = buildTcpVariant(
+                            const std::vector<uint8_t> fakePacket = divert_packet::buildTcpVariant(
                                 packet, packetLength, payload, fake, sequenceOffset,
                                 addresses[index], ttl, badChecksum);
                             if (!fakePacket.empty()) {
@@ -579,7 +522,7 @@ void WinDivertInterceptor::run() {
                     break;
                 }
 
-                if (!processBypass) {
+                if (!processBypass && route != transparent::DatagramRoute::Pass) {
                     WinDivertHelperCalcChecksums(packet, packetLength,
                                                   &addresses[index], 0);
                 }
@@ -605,7 +548,7 @@ void WinDivertInterceptor::run() {
                         if (decision == quic_strategy::Decision::PrimeAndPass) {
                             const std::vector<uint8_t> prime =
                                 quic_strategy::buildPrimePayload();
-                            const std::vector<uint8_t> primePacket = buildUdpVariant(
+                            const std::vector<uint8_t> primePacket = divert_packet::buildUdpVariant(
                                 packet, packetLength, payload, prime, addresses[index]);
                             if (!primePacket.empty()) {
                                 appendPacket(outputPackets, outputAddresses,
@@ -640,12 +583,21 @@ void WinDivertInterceptor::run() {
 
         const UINT outputAddressLength =
             (UINT)(outputAddresses.size() * sizeof(WINDIVERT_ADDRESS));
-        if (!outputPackets.empty() &&
-            !WinDivertSendEx(packetHandle_, outputPackets.data(),
-                             (UINT)outputPackets.size(), nullptr, 0,
-                             outputAddresses.data(), outputAddressLength, nullptr) &&
-            running_) {
-            spdlog::warn("WinDivert paket geri gonderme hatasi: {}", GetLastError());
+        if (outputPackets.empty()) continue;
+        if (WinDivertSendEx(packetHandle_, outputPackets.data(),
+                            static_cast<UINT>(outputPackets.size()), nullptr, 0,
+                            outputAddresses.data(), outputAddressLength, nullptr)) {
+            failedSends = 0;
+        } else if (running_) {
+            const DWORD error = GetLastError();
+            if (++failedSends == 1) {
+                spdlog::warn("WinDivert paket geri gonderme hatasi: {}", error);
+            }
+            if (failedSends >= 3) {
+                fatalErrorCode_ = error;
+                running_ = false;
+                break;
+            }
         }
     }
 }

@@ -94,15 +94,15 @@ SplitHello ikisini de VPN ya da veri yolunda uzak sunucu olmadan çözer.
 
 ## DNS
 
-**TR** — UDP/53 şeffaf yakalanır. A/AAAA sorguları ortak bir çift yığın önbelleği besler; diğer sorgu tipleri özgün mesajı bozmadan kimlik doğrulamalı Worker üzerinden gider. HTTPS/SVCB (tip 65), ECH ayarları ve DNS hata kodları uygulamaya olduğu gibi ulaşır.
+**TR** — Varsayılan **Worker DNS** modunda UDP/53 şeffaf yakalanır. A/AAAA sorguları ortak bir çift yığın önbelleği besler; diğer sorgu tipleri özgün mesajı bozmadan kimlik doğrulamalı Worker üzerinden gider. HTTPS/SVCB (tip 65), ECH ayarları ve DNS hata kodları uygulamaya olduğu gibi ulaşır. Tepsi menüsündeki **DNS: Sistem (Worker'sız)** seçeneği DNS/53'ü yakalamaz, Worker isteği ve tüneli açmaz; DPI profilleri TCP/443 üzerinde çalışmaya devam eder. Sistem DNS'i zehirleniyorsa bu mod engelli siteler için uygun olmayabilir. Seçim kaydedilir ve ağ motoru yeniden başlatılır.
 
-**EN** — UDP/53 is captured transparently. A/AAAA warms a shared dual-stack cache; other query types pass through an authenticated Worker with the original wire message intact. HTTPS/SVCB (type 65), ECH config and DNS error codes reach the app unchanged.
+**EN** — The default **Worker DNS** mode transparently captures UDP/53. A/AAAA warms a shared dual-stack cache; other query types pass through an authenticated Worker with the original wire message intact. HTTPS/SVCB (type 65), ECH config and DNS error codes reach the app unchanged. The tray menu's **DNS: Sistem (Worker'sız)** option leaves DNS/53 untouched and disables Worker requests and tunneling while keeping TCP/443 DPI profiles active. It may fail for blocked sites when the system resolver is poisoned. The choice is saved and restarts the network engine.
 
 ---
 
 ## Kurulum / Setup
 
-**Gereksinimler / Requirements:** Windows 10/11 · CMake 3.20+ · Visual Studio (C++ workload) · Node.js 20+ · ücretsiz Cloudflare hesabı / free Cloudflare account · yönetici yetkisi / admin rights
+**Gereksinimler / Requirements:** Windows 10/11 · CMake 3.20+ · Visual Studio (C++ workload) · yönetici yetkisi / admin rights. Worker DNS kurulumu için ayrıca Node.js 20+ ve ücretsiz Cloudflare hesabı gerekir / Worker DNS setup additionally needs Node.js 20+ and a free Cloudflare account.
 
 ```bash
 cmake -B build -S .
@@ -115,7 +115,7 @@ build\Release\splithello.exe --setup   # Cloudflare OAuth + Worker deploy
 build\Release\splithello.exe           # normal çalıştırma / normal run
 ```
 
-**TR** — `--setup` tarayıcıda Cloudflare oturumu açar, rastgele bir paylaşılan sır üretir, Worker'ı yayınlar ve sırrı DPAPI ile şifreleyip saklar. Normal çalıştırmada bir UAC istemi çıkar ve uygulama sistem tepsisine yerleşir; ikonuna çift tıklamak tanılama panelini açar.
+**TR** — `--setup` tarayıcıda Cloudflare oturumu açar, rastgele bir paylaşılan sır üretir, Worker'ı yayınlar ve sırrı DPAPI ile şifreleyip saklar. Worker olmadan başlamak için config.json içine `"dns_mode": "system"` yazılabilir. Normal çalıştırmada bir UAC istemi çıkar ve uygulama sistem tepsisine yerleşir; ikonuna çift tıklamak tanılama panelini açar.
 
 **EN** — `--setup` runs the Cloudflare OAuth flow, generates a shared secret, deploys the Worker and stores the secret encrypted with DPAPI. A normal run shows one UAC prompt and lives in the tray; double-click opens the diagnostics dashboard.
 
@@ -181,7 +181,7 @@ build\Release\splithello.exe           # normal çalıştırma / normal run
 | | GoodbyeDPI | SplitHello |
 |---|---|---|
 | **Yöntem / Method** | Sabit paket hileleri / fixed packet tricks | Farksal baz çizgi + öğrenen profil kümesi / differential baseline + learned profiles |
-| **DNS** | Ele almaz / not handled | Şeffaf, kimlik doğrulamalı DoH |
+| **DNS** | Ele almaz / not handled | Worker DNS: şeffaf DoH; sistem modu: DNS'e dokunmaz |
 | **Kapsam / Scope** | Filtreye bağlı / filter-dependent | Tüm TCP/443; UDP/443 serbest / untouched |
 | **Oyun etkisi / Gaming** | Geniş trafiği etkileyebilir | 443 dışı trafik hiç dokunulmaz / untouched |
 | **Kanıt / Evidence** | Yok / none | Yerel SQLite teşhis kaydı + panel |

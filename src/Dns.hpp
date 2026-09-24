@@ -1,5 +1,7 @@
 #pragma once
 
+#include "RecoveryPolicy.hpp"
+
 #include <cstdint>
 #include <condition_variable>
 #include <mutex>
@@ -18,6 +20,7 @@ struct Result {
     std::vector<std::string> v4;
     std::vector<std::string> v6;
     unsigned ttlSeconds = 0;
+    bool allowWireFallback = false;
 
     bool empty() const { return v4.empty() && v6.empty(); }
 
@@ -39,8 +42,10 @@ public:
     // client-side schema changes.
     std::vector<uint8_t> queryWire(const uint8_t* message, size_t length);
 
+    bool isBootstrapHost(const std::string& host) const;
     void clearCache();
     size_t cacheSize() const;
+    bool workerUnavailable() const { return workerHealth_.unavailable(); }
     const std::string& workerHost() const { return workerHost_; }
 
 private:
@@ -57,6 +62,7 @@ private:
     std::condition_variable cacheReady_;
     std::unordered_map<std::string, Entry> cache_;
     std::unordered_set<std::string> inFlight_;
+    mutable recovery::WorkerHealth workerHealth_;
 
     Result query(const std::string& host) const;
 };

@@ -1,11 +1,17 @@
 #include "RecoveryPolicy.hpp"
 
 #define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
 #include <windows.h>
 
 #include <algorithm>
 
 namespace recovery {
+
+bool shouldContinueDnsReceive(int error) {
+    return error == WSAEMSGSIZE || error == WSAETIMEDOUT ||
+           error == WSAEWOULDBLOCK || error == WSAECONNRESET;
+}
 
 bool isTransientWinDivertReadError(uint32_t error) {
     switch (error) {
@@ -38,6 +44,30 @@ unsigned automaticRestartDelayMs(unsigned attemptNumber) {
     if (attemptNumber == 0) return 0;
     const unsigned shift = std::min(attemptNumber - 1, 3U);
     return std::min(kInitialDelayMs << shift, kMaximumDelayMs);
+}
+
+bool WorkerHealth::observe(int httpStatus, uint64_t nowMs) {
+    constexpr uint64_t kFailureWindowMs = 30'000;
+    constexpr unsigned kFailureThreshold = 3;
+    const bool failed = httpStatus < 0 || httpStatus == 401 ||
+        httpStatus == 403 || httpStatus == 429 || httpStatus >= 500;
+    std::lock_guard lock(mutex_);
+    if (unavailable_) return true;
+    if (!failed) {
+        failures_ = 0;
+        return false;
+    }
+    if (failures_ == 0 || nowMs - lastFailureMs_ > kFailureWindowMs) {
+        failures_ = 0;
+    }
+    lastFailureMs_ = nowMs;
+    unavailable_ = ++failures_ >= kFailureThreshold;
+    return unavailable_;
+}
+
+bool WorkerHealth::unavailable() const {
+    std::lock_guard lock(mutex_);
+    return unavailable_;
 }
 
 RestartBudget::RestartBudget(unsigned maxAttempts, uint64_t windowMs)

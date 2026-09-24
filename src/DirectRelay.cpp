@@ -27,6 +27,7 @@ constexpr unsigned kClientContinuationTimeoutMs = 2000;
 
 constexpr unsigned kConnectAttemptDelayMs = 250;   // RFC 8305 recommends 250ms
 constexpr unsigned kConnectTimeoutMs = 10000;
+constexpr unsigned kOriginalConnectTimeoutMs = 2000;
 
 // Known paths normally succeed on the first cached profile. An unknown path
 // may need both packet-level and TLS-record families before it can be classified.
@@ -71,7 +72,7 @@ std::vector<std::string> systemResolve(const std::string& host, uint16_t port) {
         return out;
     }
 
-    for (addrinfo* it = resolved; it; it = it->ai_next) {
+    for (addrinfo* it = resolved; it && out.size() < 8; it = it->ai_next) {
         char text[INET6_ADDRSTRLEN] = {};
         if (it->ai_family == AF_INET) {
             inet_ntop(AF_INET, &((sockaddr_in*)it->ai_addr)->sin_addr, text, sizeof(text));
@@ -80,7 +81,9 @@ std::vector<std::string> systemResolve(const std::string& host, uint16_t port) {
         } else {
             continue;
         }
-        if (text[0]) out.emplace_back(text);
+        if (text[0] && std::find(out.begin(), out.end(), text) == out.end()) {
+            out.emplace_back(text);
+        }
     }
     freeaddrinfo(resolved);
     return out;
@@ -174,9 +177,14 @@ bool DirectRelay::prepareCandidates() {
         candidates_.push_back(originalTargetAddress_);
     }
 
-    if (context_.resolver && !tcp::isIpLiteral(targetHost_)) {
-        const dns::Result result = context_.resolver->resolve(targetHost_);
-        for (const std::string& address : result.candidates()) {
+    // In system-DNS mode the application already supplied the destination IP.
+    // A second synchronous lookup here can delay every new HTTPS connection.
+    if (!tcp::isIpLiteral(targetHost_) &&
+        (context_.resolver || originalTargetAddress_.empty())) {
+        const std::vector<std::string> addresses = context_.resolver
+            ? context_.resolver->resolve(targetHost_).candidates()
+            : systemResolve(targetHost_, targetPort_);
+        for (const std::string& address : addresses) {
             if (std::find(candidates_.begin(), candidates_.end(), address) ==
                 candidates_.end()) {
                 candidates_.push_back(address);
@@ -184,9 +192,11 @@ bool DirectRelay::prepareCandidates() {
         }
     }
 
-    if (candidates_.empty()) {
+    if (candidates_.empty() && context_.resolver) {
         spdlog::warn("DNS: {} Worker uzerinden cozulemedi, sistem cozumleyicisi deneniyor",
                      targetHost_);
+        candidates_ = systemResolve(targetHost_, targetPort_);
+    } else if (candidates_.empty() && tcp::isIpLiteral(targetHost_)) {
         candidates_ = systemResolve(targetHost_, targetPort_);
     }
 
@@ -200,8 +210,33 @@ bool DirectRelay::prepareCandidates() {
 bool DirectRelay::connectTarget() {
     if (stopping_) return false;
 
+    const bool selectedByApplication = !context_.resolver &&
+        !originalTargetAddress_.empty() && !tcp::isIpLiteral(targetHost_) &&
+        candidates_.size() == 1;
     SOCKET sock = tcp::connectAny(candidates_, connectPort_, kConnectAttemptDelayMs,
-                                  kConnectTimeoutMs, connectedAddress_);
+                                  selectedByApplication ? kOriginalConnectTimeoutMs
+                                                        : kConnectTimeoutMs,
+                                  connectedAddress_);
+    if (sock == INVALID_SOCKET && selectedByApplication && !stopping_) {
+        const std::vector<std::string> resolved =
+            systemResolve(targetHost_, targetPort_);
+        for (const std::string& address : resolved) {
+            if (std::find(candidates_.begin(), candidates_.end(), address) ==
+                candidates_.end()) {
+                candidates_.push_back(address);
+            }
+        }
+        if (candidates_.size() > 1) {
+            std::rotate(candidates_.begin(), candidates_.begin() + 1,
+                        candidates_.end());
+            spdlog::debug("{}: secilen IP baglanmadi, diger sistem adresleri deneniyor",
+                          targetHost_);
+            sock = tcp::connectAny(candidates_, connectPort_,
+                                   kConnectAttemptDelayMs,
+                                   kConnectTimeoutMs - kOriginalConnectTimeoutMs,
+                                   connectedAddress_);
+        }
+    }
     if (sock == INVALID_SOCKET) {
         spdlog::error("Baglanti kurulamadi: {}:{}", targetHost_, targetPort_);
         return false;
@@ -210,6 +245,12 @@ bool DirectRelay::connectTarget() {
     std::lock_guard<std::mutex> lock(socketMutex_);
     if (stopping_) {
         // stop() ran while we were connecting and could not see this handle.
+        closesocket(sock);
+        return false;
+    }
+    const DWORD sendTimeoutMs = 5000;
+    if (setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
+                   reinterpret_cast<const char*>(&sendTimeoutMs), sizeof(sendTimeoutMs)) == SOCKET_ERROR) {
         closesocket(sock);
         return false;
     }
@@ -614,7 +655,13 @@ bool DirectRelay::handOffToTunnel() {
         tunnel_ = &tunnel;
     }
 
-    tunnel.run();
+    try {
+        tunnel.run();
+    } catch (...) {
+        const std::lock_guard lock(socketMutex_);
+        tunnel_ = nullptr;
+        throw;
+    }
 
     std::lock_guard<std::mutex> lock(socketMutex_);
     tunnel_ = nullptr;
@@ -629,6 +676,12 @@ void DirectRelay::run() {
         return;
     }
 
+    const DWORD sendTimeoutMs = 5000;
+    if (setsockopt(clientSock_, SOL_SOCKET, SO_SNDTIMEO,
+                   reinterpret_cast<const char*>(&sendTimeoutMs), sizeof(sendTimeoutMs)) == SOCKET_ERROR) {
+        closeSockets();
+        return;
+    }
     liveFlow_.begin(context_.liveStats.get());
 
     // Transparent connections initially carry only an IP address. Buffering

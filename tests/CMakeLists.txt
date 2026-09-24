@@ -1,5 +1,10 @@
 add_executable(splithello_tests
     TestMain.cpp
+    TestWsLifecycle.cpp
+    TestWinDivertPacket.cpp
+    TestWinDivertLifecycle.cpp
+    TestDnsLifecycle.cpp
+    ../src/TransparentDnsProxy.cpp
     TestDiagnosis.cpp
     TestDnsMessage.cpp
     TestJson.cpp
@@ -17,7 +22,13 @@ add_executable(splithello_tests
     TestWrangler.cpp
 )
 
-target_link_libraries(splithello_tests PRIVATE splithello_core)
+target_link_libraries(splithello_tests PRIVATE splithello_core splithello_packet)
 target_include_directories(splithello_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_test(NAME splithello_tests COMMAND splithello_tests)
+
+add_custom_command(TARGET splithello_tests POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:windivert_import>" "$<TARGET_FILE_DIR:splithello_tests>"
+)
+set_tests_properties(splithello_tests PROPERTIES TIMEOUT 120)
