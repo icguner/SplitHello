@@ -47,9 +47,9 @@ SplitHello ikisini de VPN ya da veri yolunda uzak sunucu olmadan çözer.
 
 ## Hız farkı var mı? / Is there a speed cost?
 
-**TR — Kısa cevap: normal sitelerde yok.** Aşağıdaki sayılar geliştirme makinesinde tek oturumda ölçülen **25.703 gerçek bağlantı** kararından geliyor.
+**TR — Normal sitelerde TLS verisi değiştirilmez, ancak ek gecikme olabilir.** Şeffaf mod bütün TCP/443 bağlantılarını yerel relay'e yönlendirir. Aşağıdaki sayılar geliştirme makinesinde tek oturumda ölçülen **25.703 bağlantının TLS profil kararlarından** geliyor; DNS çözümleme, hedefe TCP bağlantısı ve relay üzerinden veri aktarımı bu ölçümün dışında kalır.
 
-**EN — Short answer: none for normal sites.** Numbers below come from **25,703 real connection** decisions measured in one session.
+**EN — Ordinary sites keep their TLS bytes, but may incur added latency.** Transparent mode routes all TCP/443 connections through the local relay. The numbers below cover **TLS profile decisions for 25,703 connections** in one development session; they exclude DNS resolution, upstream TCP connection and relay transfer overhead.
 
 <p align="center">
   <img src="docs/speed.svg" alt="Hiz olcumu / measured speed" width="760">
@@ -57,14 +57,14 @@ SplitHello ikisini de VPN ya da veri yolunda uzak sunucu olmadan çözer.
 
 | | TR | EN | Ölçüm / Measured |
 |---|---|---|---|
-| **Normal site** | Hiç dokunulmaz, ek gecikme yok | Passed untouched, no added delay | ortanca **62 ms** / median 62 ms |
+| **Normal site** | TLS baytları değişmez; relay'den geçer | TLS bytes unchanged; still relayed | karar ortancası **62 ms** / decision median 62 ms |
 | **Yoğun kuyruk** | Yavaş sunucular dahil | Including slow origins | p90 **78 ms** · p99 **203 ms** |
 | **Öğrenilmiş engelli site** | Hatırlanan profil ilk denenir | Learned profile tried first | **+30–115 ms** |
 | **İlk keşif (engelli)** | Profiller taranırken bir kez | One-off while probing | **birkaç saniye / a few seconds** |
 
-**TR** — Bağlantıların **%99,3'ü** hiç değiştirilmeden geçti; yalnızca **%0,5'i** herhangi bir profile ihtiyaç duydu. "Karar süresi" sunucuya gidiş-dönüşü de kapsar, yani bu sayılar SplitHello'nun eklediği yük değil, toplam el sıkışma süresidir. Oyun ve ses trafiği (443 dışı) hiç dokunulmadan geçer; UDP/443 varsayılan olarak serbesttir, böylece YouTube gibi HTTP/3 servisleri kendi hızlı yolunda kalır.
+**TR** — Bağlantıların **%99,3'ünde ClientHello baytları değişmedi**; yalnızca **%0,5'i** bir profile ihtiyaç duydu. Bu oran, normal sitelerde sıfır maliyet olduğu anlamına gelmez: bağlantı yine relay üzerinden geçer. Oyun ve ses trafiği (443 dışı) hiç dokunulmadan geçer; UDP/443 varsayılan olarak serbesttir. Alan adına göre seçici yönlendirme için gereken mimari [ayrı bir notta](docs/selective-routing.md) açıklanıyor.
 
-**EN** — **99.3%** of connections passed unmodified; only **0.5%** needed any profile. "Decision time" includes the server round-trip, so these are total handshake times, not SplitHello overhead. Non-443 game/voice traffic is never touched, and UDP/443 passes by default so HTTP/3 services keep their native fast path.
+**EN** — **99.3%** of ClientHello payloads were unchanged; only **0.5%** needed a profile. This is not evidence of zero overhead for ordinary sites: their connections still traverse the relay. Non-443 game and voice traffic is untouched, and UDP/443 passes by default. A [design note](docs/selective-routing.md) explains what domain-selective routing requires.
 
 ---
 
