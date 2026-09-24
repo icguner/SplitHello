@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+enum class DnsMode { Worker, System };
+
 // Persistent configuration in %APPDATA%\splithello\config.json.
 //
 // The Worker shared secret is DPAPI-encrypted on disk - see Secure.hpp. API
@@ -15,6 +17,7 @@ struct Config {
     std::string workerName = "splithello-relay";
     std::string workerUrl;                       // wss://name.subdomain.workers.dev
     std::string sharedSecret;                    // bearer secret the Worker requires
+    DnsMode dnsMode = DnsMode::Worker;            // system leaves DNS/53 untouched
 
     // Tuning
     unsigned splitDelayMs = 20;                  // pause between fragmented records
@@ -30,7 +33,7 @@ struct Config {
     bool load();
     bool save() const;
 
-    bool isValid() const { return !workerUrl.empty(); }
+    bool isValid() const { return dnsMode == DnsMode::System || !workerUrl.empty(); }
 
     // Compatibility command for configs created before Wrangler OAuth.
     bool forgetToken();

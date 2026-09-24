@@ -392,6 +392,14 @@ private:
 
         std::string image = processImage(processId);
         std::lock_guard lock(mutex_);
+        if (processNames_.size() >= kMaximumCachedEndpoints) {
+            std::erase_if(processNames_, [now](const auto& item) {
+                return item.second.expiresAtMs <= now;
+            });
+            if (processNames_.size() >= kMaximumCachedEndpoints) {
+                processNames_.erase(processNames_.begin());
+            }
+        }
         processNames_[processId] = {image, now + kProcessNameTtlMs};
         return image;
     }

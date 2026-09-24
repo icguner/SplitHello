@@ -23,6 +23,9 @@ void WsClient::cleanup() {
 bool WsClient::connect(std::string_view url,
                        const std::vector<std::pair<std::string, std::string>>& headers,
                        uint16_t connectPortOverride) {
+    const std::lock_guard sendLock(sendMutex_);
+    if (stopping_ || connectAttempted_) return false;
+    connectAttempted_ = true;
     cleanup();
 
     // Parse URL: wss://host[:port]/path
@@ -85,6 +88,10 @@ bool WsClient::connect(std::string_view url,
         spdlog::error("WinHttpOpen failed: {}", GetLastError());
         return false;
     }
+
+    // Bound synchronous HTTP setup phases. WebSocket receive completion
+    // still depends on the peer/runtime after send-side shutdown.
+    WinHttpSetTimeouts(session_, 5000, 5000, 5000, 30000);
 
     // Create connection
     connect_ = WinHttpConnect(session_, wHost.c_str(), transportPort, 0);
@@ -171,13 +178,18 @@ bool WsClient::connect(std::string_view url,
     WinHttpCloseHandle(request_);
     request_ = nullptr;
 
+    if (stopping_) {
+        cleanup();
+        return false;
+    }
     connected_ = true;
     spdlog::info("WebSocket connected to {}", urlStr);
     return true;
 }
 
 bool WsClient::sendText(std::string_view data) {
-    if (!websocket_ || !connected_) return false;
+    const std::lock_guard sendLock(sendMutex_);
+    if (!connected_ || stopping_ || !websocket_) return false;
 
     DWORD err = WinHttpWebSocketSend(websocket_,
                                      WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
@@ -191,7 +203,8 @@ bool WsClient::sendText(std::string_view data) {
 }
 
 bool WsClient::sendBinary(const uint8_t* data, size_t len) {
-    if (!websocket_ || !connected_) return false;
+    const std::lock_guard sendLock(sendMutex_);
+    if (!connected_ || stopping_ || !websocket_) return false;
 
     DWORD err = WinHttpWebSocketSend(websocket_,
                                      WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
@@ -205,7 +218,7 @@ bool WsClient::sendBinary(const uint8_t* data, size_t len) {
 }
 
 int WsClient::receive(std::vector<uint8_t>& out, bool& isText) {
-    if (!websocket_ || !connected_) return -1;
+    if (!connected_ || stopping_) return -1;
 
     out.clear();
 
@@ -231,6 +244,11 @@ int WsClient::receive(std::vector<uint8_t>& out, bool& isText) {
             return 0;
         }
 
+        constexpr size_t kMaxMessageBytes = 1024 * 1024;
+        if (bytesRead > kMaxMessageBytes - out.size()) {
+            connected_ = false;
+            return -1;
+        }
         out.insert(out.end(), chunk, chunk + bytesRead);
 
     } while (bufType == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE ||
@@ -241,8 +259,13 @@ int WsClient::receive(std::vector<uint8_t>& out, bool& isText) {
 }
 
 void WsClient::close() {
-    if (websocket_ && connected_) {
-        WinHttpWebSocketClose(websocket_, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, nullptr, 0);
-        connected_ = false;
+    if (stopping_.exchange(true)) return;
+    const std::lock_guard sendLock(sendMutex_);
+    connected_ = false;
+    if (websocket_) {
+        // Unlike Close, Shutdown may overlap a Receive. Serialize it with
+        // Send and keep the handle alive until both tunnel threads join.
+        WinHttpWebSocketShutdown(websocket_, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS,
+                                 nullptr, 0);
     }
 }

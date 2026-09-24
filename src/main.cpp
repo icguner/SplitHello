@@ -42,17 +42,12 @@ namespace {
 
 constexpr int kEngineFailOpenExitCode = 2;
 
-SocksProxy* g_proxy = nullptr;
-TransparentDnsProxy* g_dnsProxy = nullptr;
-WinDivertInterceptor* g_interceptor = nullptr;
+std::atomic<bool> g_shutdownRequested{false};
+static_assert(std::atomic<bool>::is_always_lock_free);
 HANDLE g_elevationShutdownEvent = nullptr;
 
 void cleanup(int = 0) {
-    // Stop redirection before closing the listener. No new flow may be sent to
-    // a port that is already shutting down.
-    if (g_interceptor) g_interceptor->stop();
-    if (g_dnsProxy) g_dnsProxy->stop();
-    if (g_proxy) g_proxy->stop();
+    g_shutdownRequested.store(true);
 }
 
 BOOL WINAPI consoleHandler(DWORD event) {
@@ -545,8 +540,7 @@ int main(int argc, char* argv[]) {
 
         Config trayConfig;
         trayConfig.load();
-        const bool configured = !options.workerUrl.empty() ||
-            !trayConfig.workerUrl.empty();
+        const bool configured = !options.workerUrl.empty() || trayConfig.isValid();
         const std::wstring logDirectory =
             std::filesystem::path(Config::logPath()).parent_path().wstring();
         TrayApp tray(collectEngineArguments(), logDirectory,
@@ -617,14 +611,14 @@ int main(int argc, char* argv[]) {
 
     std::string workerUrl = options.workerUrl.empty() ? config.workerUrl : options.workerUrl;
 
-    if (workerUrl.empty()) {
+    if (workerUrl.empty() && config.dnsMode == DnsMode::Worker) {
         std::cout << "SplitHello - TLS ClientHello fragmentation for censorship bypass\n\n"
                   << "Yapilandirma bulunamadi. Setup baslatiliyor...\n";
         if (!runSetup(config)) return 1;
         workerUrl = config.workerUrl;
     }
 
-    if (config.sharedSecret.empty()) {
+    if (config.dnsMode == DnsMode::Worker && config.sharedSecret.empty()) {
         spdlog::warn("Worker gizli anahtari yok. Worker istekleri guvenli bicimde "
                      "reddeder; kullanmak icin '--redeploy' calistirin.");
     }
@@ -651,7 +645,9 @@ int main(int argc, char* argv[]) {
     const uint16_t dnsProxyPort = options.port == kPreferredDnsProxyPort
         ? kAlternateDnsProxyPort : kPreferredDnsProxyPort;
 
-    dns::Resolver resolver(workerUrl, config.sharedSecret,
+    const bool useWorkerDns = config.dnsMode == DnsMode::Worker;
+    dns::Resolver resolver(useWorkerDns ? workerUrl : std::string{},
+                           useWorkerDns ? config.sharedSecret : std::string{},
                            options.manualProxy ? 0 : connectPort);
     strategy::Store strategies(Config::strategyPath());
     auto telemetryStore = std::make_shared<telemetry::Store>(Config::telemetryPath());
@@ -678,22 +674,23 @@ int main(int argc, char* argv[]) {
     }
 
     RelayContext context;
-    context.workerUrl = workerUrl;
-    context.sharedSecret = config.sharedSecret;
+    context.workerUrl = useWorkerDns ? workerUrl : std::string{};
+    context.sharedSecret = useWorkerDns ? config.sharedSecret : std::string{};
     context.networkId = networkId;
-    context.resolver = &resolver;
+    context.resolver = useWorkerDns ? &resolver : nullptr;
     context.strategies = &strategies;
     context.packetPolicies = options.manualProxy ? nullptr : &packetPolicies;
     context.telemetry = telemetryStore;
     context.liveStats = liveStats;
     context.splitDelayMs = config.splitDelayMs;
     context.probeTimeoutMs = config.probeTimeoutMs;
-    context.tunnelFallback = config.tunnelFallback;
+    context.tunnelFallback = useWorkerDns && config.tunnelFallback;
     context.bypassConnectPort = options.manualProxy ? 0 : connectPort;
     context.forcedProfile = options.forcedStrategy;
 
     spdlog::info("SplitHello baslatiliyor");
-    spdlog::info("Worker: {}", workerUrl);
+    spdlog::info("DNS modu: {}", useWorkerDns ? "Worker" : "sistem (Worker yok)");
+    if (useWorkerDns) spdlog::info("Worker: {}", workerUrl);
     spdlog::info("Ag profili: {}", networkId);
     spdlog::info("Relay portu: {} | split-delay: {} ms | ogrenilen alan adi: {}",
                  options.port, config.splitDelayMs, strategies.size());
@@ -707,8 +704,6 @@ int main(int argc, char* argv[]) {
     transparent::DatagramRegistry datagrams;
     SocksProxy proxy(context, options.port, options.manualProxy ? nullptr : &flows);
     TransparentDnsProxy dnsProxy(resolver, datagrams, dnsProxyPort);
-    g_proxy = &proxy;
-    g_dnsProxy = options.manualProxy ? nullptr : &dnsProxy;
 
     std::signal(SIGINT, cleanup);
     std::signal(SIGTERM, cleanup);
@@ -717,12 +712,19 @@ int main(int argc, char* argv[]) {
     int runtimeExitCode = 0;
     if (options.manualProxy) {
         spdlog::warn("Manuel proxy modu: yalniz SOCKS5/HTTP CONNECT kullanan uygulamalar yakalanir");
-        proxy.run();
+        std::atomic<bool> exited{false};
+        std::thread proxyThread([&]() {
+            try { proxy.run(); } catch (...) {}
+            exited = true;
+        });
+        while (!g_shutdownRequested && !exited) Sleep(50);
+        proxy.stop();
+        proxyThread.join();
     } else {
         std::atomic<bool> proxyExited{false};
         bool proxyResult = false;
         std::thread proxyThread([&]() {
-            proxyResult = proxy.run();
+            try { proxyResult = proxy.run(); } catch (...) { proxyResult = false; }
             proxyExited = true;
         });
 
@@ -739,39 +741,42 @@ int main(int argc, char* argv[]) {
             return proxyResult ? 0 : 1;
         }
 
-        if (!dnsProxy.start()) {
+        if (useWorkerDns && !dnsProxy.start()) {
             proxy.stop();
             if (proxyThread.joinable()) proxyThread.join();
-            g_dnsProxy = nullptr;
             spdlog::error("Transparent DNS relay baslatilamadi");
             return 1;
         }
 
         WinDivertInterceptor interceptor(flows, datagrams, packetPolicies, options.port,
                                          dnsProxyPort, connectPort,
-                                         options.quicMode, &processFilter);
-        g_interceptor = &interceptor;
+                                         options.quicMode, &processFilter, useWorkerDns);
         if (!interceptor.start()) {
             dnsProxy.stop();
             proxy.stop();
             if (proxyThread.joinable()) proxyThread.join();
-            g_interceptor = nullptr;
-            g_dnsProxy = nullptr;
             return 1;
         }
 
         signalReadyEvent(options.readyEventName);
 
-        // Do not block only on the relay. If the packet reader dies, its
-        // WinDivert handle closes first (fail-open), then this loop tears down
-        // the remaining local listeners so the tray can restart a clean engine.
-        while (!proxyExited && interceptor.running()) {
+        // One owner closes interception before any listeners. Observe both
+        // packet and DNS reader health so either failure releases interception.
+        while (!g_shutdownRequested && !proxyExited && interceptor.running() &&
+               (!useWorkerDns || (dnsProxy.running() && !resolver.workerUnavailable()))) {
             Sleep(50);
         }
 
         const DWORD fatalWinDivertError = interceptor.fatalErrorCode();
         const bool relayExitedUnexpectedly = proxyExited && interceptor.running();
-        if (fatalWinDivertError != ERROR_SUCCESS) {
+        if (!g_shutdownRequested && useWorkerDns && resolver.workerUnavailable()) {
+            runtimeExitCode = recovery::kWorkerUnavailableExitCode;
+            spdlog::error("Worker erisilemiyor; trafik yakalama kapatiliyor. "
+                          "Tray otomatik yeniden baslatmayacak");
+        } else if (!g_shutdownRequested && useWorkerDns && !dnsProxy.running()) {
+            runtimeExitCode = kEngineFailOpenExitCode;
+            spdlog::error("DNS alicisi durdu; trafik yakalama kapatiliyor");
+        } else if (fatalWinDivertError != ERROR_SUCCESS) {
             runtimeExitCode = kEngineFailOpenExitCode;
             spdlog::error(
                 "Ag motoru fail-open ile kapandi: WinDivert hata={}; tray yeniden baslatabilir",
@@ -786,12 +791,9 @@ int main(int argc, char* argv[]) {
         dnsProxy.stop();
         proxy.stop();
         if (proxyThread.joinable()) proxyThread.join();
-        g_interceptor = nullptr;
-        g_dnsProxy = nullptr;
     }
 
     cleanup();
-    g_proxy = nullptr;
     spdlog::info("SplitHello durduruldu");
     return runtimeExitCode;
 }

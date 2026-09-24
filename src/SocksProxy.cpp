@@ -201,8 +201,15 @@ bool SocksProxy::run() {
         SOCKET clientSock = accept(listener, reinterpret_cast<sockaddr*>(&clientAddr), &addrLen);
 
         if (clientSock == INVALID_SOCKET) {
-            if (running_) spdlog::warn("Accept hatasi: {}", WSAGetLastError());
-            continue;
+            if (!running_) break;
+            const int error = WSAGetLastError();
+            if (error == WSAECONNRESET || error == WSAEINTR) {
+                Sleep(10);
+                continue;
+            }
+            spdlog::error("Accept durdu: {}", error);
+            running_ = false;
+            return false;
         }
 
         spawnSession(clientSock);
@@ -285,7 +292,15 @@ void SocksProxy::spawnSession(SOCKET clientSock) {
 }
 
 void SocksProxy::sessionMain(uint64_t id, Session* session) {
-    serve(*session);
+    try {
+        serve(*session);
+    } catch (...) {
+        const std::lock_guard lock(sessionsMutex_);
+        if (session->clientSock != INVALID_SOCKET) {
+            closesocket(session->clientSock);
+            session->clientSock = INVALID_SOCKET;
+        }
+    }
 
     std::vector<std::thread> reap;
     {
@@ -337,7 +352,13 @@ void SocksProxy::serve(Session& session) {
         session.relay = &relay;
     }
 
-    relay.run();
+    try {
+        relay.run();
+    } catch (...) {
+        const std::lock_guard lock(sessionsMutex_);
+        session.relay = nullptr;
+        throw;
+    }
 
     std::lock_guard<std::mutex> lock(sessionsMutex_);
     session.relay = nullptr;

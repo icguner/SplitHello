@@ -27,7 +27,8 @@ public:
                          uint16_t proxyPort, uint16_t dnsProxyPort,
                          uint16_t connectPort,
                          quic_strategy::Mode quicMode = quic_strategy::Mode::Allow,
-                         process_filter::Filter* processFilter = nullptr);
+                         process_filter::Filter* processFilter = nullptr,
+                         bool captureDns = true);
     ~WinDivertInterceptor();
 
     WinDivertInterceptor(const WinDivertInterceptor&) = delete;
@@ -47,6 +48,7 @@ private:
     uint16_t connectPort_;
     quic_strategy::Mode quicMode_;
     process_filter::Filter* processFilter_;
+    bool captureDns_;
     quic_strategy::AdaptiveRegistry quicRegistry_;
 
     HANDLE packetHandle_ = INVALID_HANDLE_VALUE;

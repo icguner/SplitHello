@@ -7,6 +7,7 @@
 #include <functional>
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -40,7 +41,7 @@ public:
     // out is resized to fit. isText is set to true for text frames.
     int receive(std::vector<uint8_t>& out, bool& isText);
 
-    // Close the WebSocket gracefully.
+    // Request send-side shutdown; handle cleanup waits for the owning threads.
     void close();
 
     bool isConnected() const { return connected_.load(); }
@@ -51,6 +52,9 @@ private:
     HINTERNET request_  = nullptr;
     HINTERNET websocket_ = nullptr;
     std::atomic<bool> connected_{false};
+    std::atomic<bool> stopping_{false};
+    std::mutex sendMutex_;
+    bool connectAttempted_ = false; // a tunnel owns one connection attempt
 
     void cleanup();
 };

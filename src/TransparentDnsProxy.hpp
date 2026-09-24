@@ -49,10 +49,13 @@ private:
     std::thread receiver_;
     std::vector<std::thread> workers_;
 
+    std::mutex lifecycleMutex_;
     std::mutex queueMutex_;
     std::condition_variable queueReady_;
     std::deque<Job> jobs_;
 
+    void stopLocked();
+    void fail();
     void receiveLoop();
     void workerLoop();
     void process(const Job& job);

@@ -146,7 +146,9 @@ SOCKET connectAny(const std::vector<std::string>& addresses,
         }
 
         ULONGLONG waitUntil = deadline;
-        if (candidatesLeft) waitUntil = std::min(waitUntil, nextStartAt);
+        if (candidatesLeft && inFlight.size() < kMaxParallelAttempts) {
+            waitUntil = std::min(waitUntil, nextStartAt);
+        }
         const ULONGLONG waitMs = waitUntil > now ? waitUntil - now : 0;
 
         timeval tv{};
@@ -169,7 +171,10 @@ SOCKET connectAny(const std::vector<std::string>& addresses,
 
             int soError = 0;
             int soErrorSize = sizeof(soError);
-            getsockopt(sock, SOL_SOCKET, SO_ERROR, (char*)&soError, &soErrorSize);
+            if (getsockopt(sock, SOL_SOCKET, SO_ERROR,
+                           reinterpret_cast<char*>(&soError), &soErrorSize) == SOCKET_ERROR) {
+                soError = WSAGetLastError();
+            }
 
             if (signalledWritable && soError == 0) {
                 winner = sock;

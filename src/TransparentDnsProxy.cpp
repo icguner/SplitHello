@@ -1,6 +1,7 @@
 #include "TransparentDnsProxy.hpp"
 
 #include "DnsMessage.hpp"
+#include "RecoveryPolicy.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -50,7 +51,9 @@ TransparentDnsProxy::~TransparentDnsProxy() {
 }
 
 bool TransparentDnsProxy::start() {
+    const std::lock_guard lifecycleLock(lifecycleMutex_);
     if (running_) return true;
+    stopLocked();
     if (port_ == 0 || port_ == 53) return false;
 
     const SOCKET socket = ::socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
@@ -77,22 +80,51 @@ bool TransparentDnsProxy::start() {
         return false;
     }
 
+    // Periodically observe stop without closing a socket underneath sendto.
+    const DWORD timeoutMs = 250;
+    if (setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs)) == SOCKET_ERROR) {
+        closesocket(socket);
+        return false;
+    }
     socket_.store(socket);
     running_ = true;
-    workers_.reserve(kWorkerCount);
-    for (size_t index = 0; index < kWorkerCount; ++index) {
-        workers_.emplace_back([this]() { workerLoop(); });
+    try {
+        workers_.reserve(kWorkerCount);
+        for (size_t index = 0; index < kWorkerCount; ++index) {
+            workers_.emplace_back([this]() {
+                try { workerLoop(); }
+                catch (...) { fail(); }
+            });
+        }
+        receiver_ = std::thread([this]() {
+            try { receiveLoop(); }
+            catch (...) { fail(); }
+        });
+    } catch (...) {
+        stopLocked();
+        return false;
     }
-    receiver_ = std::thread([this]() { receiveLoop(); });
     spdlog::info("Transparent DNS relay dinliyor: [::]:{} -> Cloudflare Worker",
                  port_);
     return true;
 }
 
 void TransparentDnsProxy::stop() {
+    const std::lock_guard lifecycleLock(lifecycleMutex_);
+    stopLocked();
+}
+
+void TransparentDnsProxy::fail() {
+    {
+        const std::lock_guard lock(queueMutex_);
+        running_ = false;
+    }
+    queueReady_.notify_all();
+}
+
+void TransparentDnsProxy::stopLocked() {
     running_ = false;
-    const SOCKET socket = socket_.exchange(INVALID_SOCKET);
-    if (socket != INVALID_SOCKET) closesocket(socket);
 
     {
         std::lock_guard lock(queueMutex_);
@@ -105,6 +137,8 @@ void TransparentDnsProxy::stop() {
         if (worker.joinable()) worker.join();
     }
     workers_.clear();
+    const SOCKET socket = socket_.exchange(INVALID_SOCKET);
+    if (socket != INVALID_SOCKET) closesocket(socket);
     datagrams_.clear();
 }
 
@@ -121,9 +155,11 @@ void TransparentDnsProxy::receiveLoop() {
             socket, reinterpret_cast<char*>(buffer.data()), (int)buffer.size(), 0,
             reinterpret_cast<sockaddr*>(&job.peer), &job.peerLength);
         if (received == SOCKET_ERROR) {
-            if (running_) {
-                spdlog::warn("DNS relay okuma hatasi: {}", WSAGetLastError());
-            }
+            const int error = WSAGetLastError();
+            if (!running_) break;
+            if (recovery::shouldContinueDnsReceive(error)) continue;
+            spdlog::error("DNS relay alicisi durdu: {}", error);
+            fail();
             break;
         }
 
@@ -136,6 +172,14 @@ void TransparentDnsProxy::receiveLoop() {
         }
 
         job.data.assign(buffer.begin(), buffer.begin() + received);
+        dns_message::Query query;
+        if (dns_message::parseQuery(job.data.data(), job.data.size(), query) &&
+            resolver_.isBootstrapHost(query.name)) {
+            // WinHTTP workers may all be waiting for this DNS answer. Answer
+            // from the bootstrap cache here rather than queuing behind them.
+            process(job);
+            continue;
+        }
         {
             std::lock_guard lock(queueMutex_);
             if (jobs_.size() >= kMaxQueuedQueries) {
@@ -170,12 +214,14 @@ void TransparentDnsProxy::process(const Job& job) {
     }
 
     std::vector<uint8_t> response;
+    bool allowWireFallback = false;
     if (query.type == dns_message::kTypeA ||
         query.type == dns_message::kTypeAaaa) {
         // /resolve returns both address families at once and warms the same
         // cache used by DirectRelay. That lets the relay restore Happy
         // Eyeballs without a second network lookup for every TLS connection.
         const dns::Result resolved = resolver_.resolve(query.name);
+        allowWireFallback = resolved.allowWireFallback;
         const std::vector<std::string>& addresses =
             query.type == dns_message::kTypeA ? resolved.v4 : resolved.v6;
         if (!resolved.empty()) {
@@ -187,7 +233,8 @@ void TransparentDnsProxy::process(const Job& job) {
     }
     if (response.empty() &&
         (query.type == dns_message::kTypeA ||
-         query.type == dns_message::kTypeAaaa)) {
+         query.type == dns_message::kTypeAaaa) &&
+        allowWireFallback) {
         // Preserve the raw DoH path as a fallback for an older Worker whose
         // /resolve response does not contain the modern multi-address shape.
         response = resolver_.queryWire(job.data.data(), job.data.size());
