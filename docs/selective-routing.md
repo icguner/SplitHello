@@ -1,23 +1,23 @@
-# Alan adına göre seçici yönlendirme
+# Domain-selective routing
 
-## Hedef
+## Goal
 
-Yalnız gerçekten engellendiği doğrulanan HTTPS alan adlarının TLS ClientHello'sunu değiştirmek. Normal alan adları uygulamanın kendi TCP bağlantısında kalmalı; tarayıcı, Discord veya başka bir uygulamanın exe'si ya da proxy ayarı değişmemeli. Yeni bir engel ilk bağlantıda hemen bilinemeyeceği için pasif gözlem ve sonraki denemede doğrulama gerekir.
+Modify the TLS ClientHello only for HTTPS hostnames that are verified as blocked. Normal hostnames should stay on the application's own TCP connection, with no change to any program's executable or proxy settings. A new block cannot be known on the first connection, so this needs passive observation and a check on a later attempt.
 
-## Mevcut sınır
+## Current limit
 
-Şeffaf WinDivert modu TCP/443 SYN paketini alan adı bilinmeden yerel relay'e yönlendiriyor. SNI, TCP bağlantısı kurulduktan sonra ClientHello içinde geliyor. Relay normal sitelerde TLS baytlarını değiştirmese de o bağlantı boyunca veri yolunda kalıyor. Dolayısıyla mevcut relay ile alan adına göre karar verip normal sitelerde sıfır relay yükü sağlamak mümkün değil. WinDivert'in network katmanında süreç kimliği de doğrudan bulunmuyor. [WinDivert katmanları ve filtreleri](https://reqrypt.org/windivert-doc.html).
+Transparent WinDivert mode redirects the TCP/443 SYN to the local relay before the hostname is known. The SNI only arrives in the ClientHello after the TCP connection is up. The relay does not change TLS bytes for normal sites, but it stays in the data path for the life of the connection. So with the current relay it is not possible to decide per hostname and also have zero relay cost for normal sites. WinDivert's network layer also has no process ID directly. See the [WinDivert layers and filters](https://reqrypt.org/windivert-doc.html).
 
-## Denenen ara yol
+## Intermediate approach that was tried
 
-PAC dosyası normal alan adlarında `DIRECT`, Discord'da yerel proxy döndürdü. Chromium yeni oturumda bu kararı uyguladı. Bu makinedeki Discord masaüstü sürümü sistem PAC ayarını ağ bağlantılarında kullanmadı; Discord sunucularına yerel proxy üzerinden bağlanmadı. Electron'un açık `--proxy-server` seçeneği çalıştı, fakat Discord sürecinin diğer alan adlarını da proxy'ye aldı. Kullanıcı exe'ye veya uygulamaya özel ayar istemediği için bu çözüm devreye alınmadı. Deneme kodu yerel Git stash'inde saklandı; çalışan sürüm etkilenmedi. [Electron proxy seçenekleri](https://www.electronjs.org/docs/latest/api/command-line-switches).
+A PAC file returned `DIRECT` for normal hostnames and the local proxy for Discord. Chromium applied this in a fresh session. The Discord desktop client on the test machine did not use the system PAC setting for its network connections and did not connect to Discord servers through the local proxy. Electron's explicit `--proxy-server` switch worked, but it also sent the Discord process's other hostnames through the proxy. Per-executable or per-application settings were ruled out, so this was not shipped. The experiment code was kept in a local Git stash and the working build was not affected. See the [Electron proxy switches](https://www.electronjs.org/docs/latest/api/command-line-switches).
 
-## Önerilen mimari
+## Proposed architecture
 
-Belgelerden ve mevcut relay sınırından yaptığımız çıkarıma göre en uygun katman, küçük bir **WFP stream callout** ve kullanıcı modunda kalan politika servisidir. Callout ilk TLS verisini gerektiğinde biriktirip SNI'yi okuyabilir; normal akışları hemen `PERMIT` eder. Yalnız doğrulanmış hedefin ilk TLS kaydını engelleyip değiştirilmiş akış verisini enjekte eder. Böylece TCP sıra numaralarının yönetimi ağ yığınına bırakılır; bütün bağlantıyı kullanıcı modundaki relay'e taşımak gerekmez. Microsoft, stream verisini bekleme ve değiştirme/enjekte etme akışını belgeler: [stream inspection](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/stream-inspection), [modifying stream data](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/modifying-stream-data).
+Based on the documentation and the relay's limits, the best fit is a small **WFP stream callout** plus a user-mode policy service. The callout can hold the first TLS data, read the SNI, and immediately `PERMIT` normal flows. For a verified target it blocks only the first TLS record and injects the modified stream data. TCP sequence number handling stays with the network stack, and the whole connection does not have to move to a user-mode relay. Microsoft documents waiting on and modifying stream data: [stream inspection](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/stream-inspection), [modifying stream data](https://learn.microsoft.com/en-us/windows-hardware/drivers/network/modifying-stream-data).
 
-Kullanıcı modu DNS/DoH, ağ kimliği, aday alan adları, iki bağımsız başarısızlık, çalışan profil doğrulaması ve günlüklerden sorumlu kalmalı. Sürücü yalnız kısa, sınırlandırılmış ilk el sıkışmayı incelemeli; ayrıştırma veya servis hatasında akışı değiştirmeden geçirmeli. QUIC/UDP/443 ve gerçek ECH ayrı tasarım gerektirir. İlk engelli istek, öğrenme tamamlanmadan başarısız olabilir.
+User mode would keep DNS/DoH, network identity, candidate hostnames, the two-failure rule, verification of the working profile, and logging. The driver should only inspect the short, bounded first handshake, and on a parse or service failure it should pass the flow through unchanged. QUIC/UDP/443 and real ECH need a separate design. The first request to a blocked host can still fail before learning completes.
 
-## Uygulama önkoşulu
+## Prerequisites
 
-Bu makinede WDK'nin `fwpsk.h` başlıkları ve kernel kütüphaneleri bulunmuyor. Ayrıca yeni bir Windows kernel sürücüsünün yüklenmesi için uygun imza gerekir; Secure Boot açık sistemde test imzası tek başına yeterli olmayabilir. Bu nedenle üretim bilgisayarında hemen yükleme denenmemeli. Önce WDK yüklü bir test ortamında Microsoft'un WFP örneği temel alınarak küçük permit/continue sürücüsü, ardından tek yönde TLS kaydı değiştirme ve fail-open kapanış doğrulanmalı. [Windows sürücü imzalama gereksinimleri](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/kernel-mode-code-signing-requirements--windows-vista-and-later-).
+The WDK `fwpsk.h` headers and kernel libraries are not installed on the development machine. A new Windows kernel driver also needs a suitable signature, and on a Secure Boot system a test signature alone may not be enough. So it should not be installed on a production machine yet. First, in a test environment with the WDK, build a small permit/continue driver from Microsoft's WFP sample. Then verify modifying a TLS record in one direction and a fail-open shutdown. See the [Windows driver signing requirements](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/kernel-mode-code-signing-requirements--windows-vista-and-later-).
