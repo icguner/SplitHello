@@ -398,6 +398,39 @@ std::vector<std::wstring> npxArguments(const std::wstring& npxCli,
     return result;
 }
 
+// Wrangler 4.149 will not store OAuth in the OS keyring without the
+// @napi-rs/keyring native binding, and it only installs it itself when stdin is a
+// terminal. We pipe stdin, so install it globally (the fix Wrangler itself names)
+// before logging in. Same version Wrangler pins; update both together.
+constexpr std::wstring_view kKeyringVersion = L"1.3.0";
+
+bool ensureKeyringBinding(const std::wstring& node, const std::wstring& npxCli) {
+    const fs::path npmCli = fs::path(npxCli).parent_path() / L"npm-cli.js";
+    std::error_code ec;
+    if (!fs::is_regular_file(npmCli, ec)) return true; // let Wrangler report it
+
+    ProcessResult root = runProcess(node, {npmCli.wstring(), L"root", L"-g"}, {}, {}, false,
+                                    kProbeTimeoutMs);
+    if (root.ok()) {
+        std::string path = root.output;
+        while (!path.empty() && std::isspace(static_cast<unsigned char>(path.back()))) path.pop_back();
+        while (!path.empty() && std::isspace(static_cast<unsigned char>(path.front()))) path.erase(path.begin());
+        if (!path.empty() &&
+            fs::is_regular_file(fs::path(fileutil::widen(path)) / L"@napi-rs" / L"keyring" / L"index.js", ec)) {
+            return true;
+        }
+    }
+
+    std::cout << "Windows anahtar zinciri modulu (@napi-rs/keyring) kuruluyor...\n";
+    const ProcessResult install = runProcess(
+        node,
+        {npmCli.wstring(), L"install", L"-g", L"@napi-rs/keyring@" + std::wstring(kKeyringVersion),
+         L"--no-audit", L"--no-fund", L"--loglevel=error"},
+        {}, {}, true, kProbeTimeoutMs);
+    if (!install.ok()) std::cerr << "@napi-rs/keyring kurulamadi.\n";
+    return install.ok();
+}
+
 std::vector<std::string> arrayObjects(const std::string& array) {
     std::vector<std::string> objects;
     size_t depth = 0;
@@ -505,6 +538,7 @@ bool Client::available(std::string& error) const {
 }
 
 bool Client::loginWithKeyring() const {
+    if (!ensureKeyringBinding(nodePath_, npxCliPath_)) return false;
     const ProcessResult result = runProcess(
         nodePath_, npxArguments(npxCliPath_, {L"login", L"--use-keyring"}), {}, {}, true,
         kLoginTimeoutMs);
