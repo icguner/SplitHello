@@ -52,11 +52,46 @@ One failure is not evidence. A network hiccup fails the baseline and whatever pr
 
 A profile counts as working only after a complete ServerHello arrives. TLS alerts, block pages, partial records, silent drops and RST are recorded as separate signals.
 
-## DNS
+## DNS and the Worker
 
-In the default **Worker DNS** mode, UDP/53 is captured and resolved through a Cloudflare Worker you deploy yourself. A/AAAA answers fill a shared cache. Other query types go to the Worker as the original wire message, and real response codes (NXDOMAIN, HTTPS/SVCB records, ECH configs) reach the application unchanged.
+### The problem
 
-The tray menu has **DNS: Sistem (Worker'sız)**. In that mode DNS/53 is not captured, no Worker request is ever made, and the DPI profiles on TCP/443 still work. If your system resolver is poisoned, blocked sites will not resolve in this mode. The choice is saved and the engine restarts.
+Beating SNI inspection is not enough if the site never resolves to the right address. Many ISPs poison DNS: you ask their resolver for a blocked hostname and get back a fake IP, or nothing. Changing your DNS server by hand often does not help either, because the ISP can intercept plain UDP/53 to any server, and it can block the well-known public DoH endpoints.
+
+### What the Worker does
+
+In the default **Worker DNS** mode SplitHello captures UDP/53 on your machine and answers it itself:
+
+```
+app --DNS query--> WinDivert --> SplitHello --HTTPS--> your Worker --> upstream resolver
+                                      |                     (Cloudflare, on your account)
+                                      '-- answers the app with the real result
+```
+
+The Worker is a small piece of code (`worker/src/index.js`) that runs on your own Cloudflare account. SplitHello sends it the DNS question over ordinary HTTPS, the Worker asks Cloudflare's resolver, and the real answer comes back. From the ISP's side this is just a TLS connection to a `*.workers.dev` hostname that belongs to you, not a DNS query it can rewrite, and not a known DoH server it can blacklist.
+
+Details that matter:
+
+- **Only DNS goes through it.** Your actual traffic still goes straight from your machine to the destination. The Worker never sees page content.
+- **It is yours.** `--setup` deploys it to your Cloudflare account with a random secret. Nobody else's Worker is used, and no SplitHello server exists. Without the secret the Worker answers 401, so it cannot be used as an open DNS proxy by anyone who finds the URL.
+- **It is free for normal use.** The Cloudflare free plan covers typical home usage. Answers are cached locally, so repeated lookups do not hit the Worker.
+- **Nothing else changes.** A/AAAA answers fill a shared cache. Other query types (HTTPS/SVCB, TXT, MX and so on) are forwarded as the original wire message, and real response codes, including NXDOMAIN and ECH configs, reach the application unchanged.
+- **No chicken-and-egg problem.** SplitHello looks up the Worker's own address itself, so it does not depend on the DNS it is replacing.
+- **Private answers are filtered.** The Worker drops private and loopback addresses from public answers.
+
+### When to pick which mode
+
+| | Worker DNS (default) | System DNS (Worker'sız) |
+|---|---|---|
+| Poisoned DNS | Fixed | Not fixed |
+| Needs a Cloudflare account | Yes, free | No |
+| DNS/53 captured | Yes | No, left alone |
+| TCP/443 DPI profiles | Active | Active |
+| Extra hop for DNS | One HTTPS request per uncached lookup | None |
+
+Choose **Worker DNS** if your ISP poisons DNS, which is the usual case for blocked sites in Turkey. Choose **System DNS** if your resolver already returns correct answers (for example you use a trusted resolver or your own DoH setup), or if you do not want a Cloudflare account involved. In System mode no request is ever made to a Worker, but if your resolver is poisoned, blocked sites will not resolve.
+
+Switch with **DNS: Worker** / **DNS: Sistem (Worker'sız)** in the tray menu, or set `"dns_mode": "system"` in `config.json`. The choice is saved and the engine restarts. Picking Worker with no Worker configured starts the Cloudflare setup.
 
 ## Install
 

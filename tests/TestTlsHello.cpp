@@ -160,3 +160,39 @@ TEST(HttpBlockPageIsNotAHandshakeSuccess) {
     CHECK(tls::classifyServerResponse((const uint8_t*)response.data(), response.size()) ==
           tls::ServerResponseStatus::Unexpected);
 }
+
+// Found by the CI fuzzer: extensions_length (3) is shorter than one extension
+// header (4), so the parser used to read past the record into the heap.
+TEST(ExtensionHeaderLongerThanDeclaredBlockIsMalformed) {
+    std::vector<uint8_t> record = {0x16, 0x03, 0x10, 0x00, 0x3e,       // record header, 62 bytes
+                                   0x01, 0x00, 0x00, 0x3a,             // ClientHello, 58 bytes
+                                   0x02, 0xff};                        // client_version
+    record.insert(record.end(), 32, 0x00);                             // random
+    record.insert(record.end(), {0x00,                                 // session_id length
+                                 0x00, 0x00,                           // cipher_suites length
+                                 0x00,                                 // compression length
+                                 0x00, 0x03,                           // extensions length: 3
+                                 0x00, 0x00, 0x7e, 0x00});             // server_name, length 0x7e00
+    record.resize(5 + 62, 0x00);
+
+    tls::ClientHello hello;
+    CHECK(tls::parseClientHello(record.data(), record.size(), hello) ==
+          tls::ParseStatus::Malformed);
+    CHECK(!hello.hasSni());
+}
+
+TEST(ServerNameListShorterThanEntryHeaderIsIgnored) {
+    std::vector<uint8_t> record = {0x16, 0x03, 0x01, 0x00, 0x34,
+                                   0x01, 0x00, 0x00, 0x30,
+                                   0x03, 0x03};
+    record.insert(record.end(), 32, 0x00);
+    record.insert(record.end(), {0x00, 0x00, 0x00, 0x00,               // sid, suites, compression
+                                 0x00, 0x08,                           // extensions length
+                                 0x00, 0x00, 0x00, 0x04,               // server_name, 4 bytes
+                                 0x00, 0x02, 0x00, 0x00});             // list length 2 < entry header
+    record.resize(5 + 0x34, 0x00);
+
+    tls::ClientHello hello;
+    (void)tls::parseClientHello(record.data(), record.size(), hello);
+    CHECK(!hello.hasSni());
+}
