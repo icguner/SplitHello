@@ -1,5 +1,6 @@
 #include "Setup.hpp"
 
+#include "Console.hpp"
 #include "Http.hpp"
 #include "Json.hpp"
 #include "Secure.hpp"
@@ -18,6 +19,26 @@ namespace {
 
 constexpr size_t kSharedSecretBytes = 32;   // 256 bits, hex-encoded
 
+void step(int number, const std::string& text) {
+    std::cout << console::dim("[" + std::to_string(number) + "/6] ") << text << std::flush;
+}
+
+void stepOk(const std::string& detail = {}) {
+    std::cout << " " << console::green("OK")
+              << (detail.empty() ? std::string{} : " " + console::dim(detail)) << "\n";
+}
+
+void stepFailed() { std::cout << " " << console::red("HATA") << "\n"; }
+
+// Default answer is yes; end of input (no console) counts as no.
+bool askRetry(const std::string& question) {
+    std::cout << "\n" << console::yellow(question) << " [E/h] " << std::flush;
+    std::string answer;
+    if (!std::getline(std::cin, answer)) return false;
+    return answer.empty() || answer[0] == 'e' || answer[0] == 'E' || answer[0] == 'y' ||
+           answer[0] == 'Y';
+}
+
 std::optional<std::string> selectAccount(const wrangler::Identity& identity,
                                          const std::string& preferredId) {
     if (!preferredId.empty()) {
@@ -30,14 +51,14 @@ std::optional<std::string> selectAccount(const wrangler::Identity& identity,
     if (identity.accounts.size() == 1) return identity.accounts.front().id;
     if (identity.accounts.empty()) return std::nullopt;
 
-    std::cout << "Birden fazla Cloudflare hesabi bulundu:\n";
+    std::cout << "\nBirden fazla Cloudflare hesabi var:\n";
     for (size_t i = 0; i < identity.accounts.size(); ++i) {
         const auto& account = identity.accounts[i];
-        std::cout << "  " << (i + 1) << ". "
-                  << (account.name.empty() ? account.id : account.name) << " ("
-                  << account.id.substr(0, 8) << "...)\n";
+        std::cout << "  " << console::cyan(std::to_string(i + 1)) << "  "
+                  << (account.name.empty() ? account.id : account.name) << " "
+                  << console::dim("(" + account.id.substr(0, 8) + "...)") << "\n";
     }
-    std::cout << "Kullanilacak hesap [1-" << identity.accounts.size() << "]: ";
+    std::cout << "Kullanilacak hesap [1-" << identity.accounts.size() << "]: " << std::flush;
 
     std::string answer;
     std::getline(std::cin, answer);
@@ -51,7 +72,7 @@ std::optional<std::string> selectAccount(const wrangler::Identity& identity,
     } catch (...) {
     }
 
-    std::cerr << "Gecersiz hesap secimi.\n";
+    std::cerr << console::red("Gecersiz hesap secimi.") << "\n";
     return std::nullopt;
 }
 
@@ -69,13 +90,11 @@ bool verifyDeployment(const std::string& workerUrl, const std::string& sharedSec
     const http::Response response = http::perform(request);
     secure::wipe(request.headers.back().second);   // the "Bearer <secret>" copy
     if (response.status == 401 || response.status == 403) {
-        std::cerr << "\nWorker gizli anahtari kabul etmedi (HTTP " << response.status << ").\n";
+        std::cerr << "\n" << console::red("Worker gizli anahtari kabul etmedi (HTTP " +
+                                          std::to_string(response.status) + ").") << "\n";
         return false;
     }
-    if (!response.ok()) {
-        std::cerr << "\nWorker dogrulama basarisiz (HTTP " << response.status << ").\n";
-        return false;
-    }
+    if (!response.ok()) return false;
     return !json::getStringArray(response.body, "a").empty();
 }
 
@@ -83,57 +102,59 @@ bool deployAndVerify(Config& config, const wrangler::Client& client) {
     if (config.sharedSecret.empty()) {
         config.sharedSecret = secure::randomHex(kSharedSecretBytes);
         if (config.sharedSecret.empty()) {
-            std::cerr << "Rastgele anahtar uretilemedi.\n";
+            std::cerr << console::red("Rastgele anahtar uretilemedi.") << "\n";
             return false;
         }
     }
 
-    std::cout << "[4/6] Worker ve gizli anahtar deploy ediliyor (" << config.workerName
-              << ")...\n";
+    step(4, "Worker yukleniyor (" + config.workerName + ")...");
     const wrangler::DeployResult deployment =
         client.deploy(config.accountId, config.workerName, kWorkerSource,
                       config.sharedSecret, config.workerUrl);
     if (!deployment.success) {
-        std::cerr << "Worker deploy edilemedi. --verbose ile ayrinti gorebilirsiniz.\n";
+        stepFailed();
+        std::cerr << console::dim("Ayrinti icin --verbose ile calistirin.") << "\n";
         return false;
     }
+    stepOk();
 
     config.workerUrl = deployment.workerUrl;
-    std::cout << "[5/6] Worker URL: " << config.workerUrl << "\n";
+    step(5, "Adres kaydediliyor...");
+    stepOk(config.workerUrl);
 
     // Persist the rotated secret before the network check. A transient outage
     // must not strand a successfully updated remote Worker with a lost secret.
     if (!config.save()) {
-        std::cerr << "Worker deploy edildi ama yeni gizli anahtar config'e kaydedilemedi.\n"
-                  << "Dosya izinlerini duzeltip --redeploy calistirin.\n";
+        std::cerr << console::red("Worker yuklendi ama yeni gizli anahtar config'e kaydedilemedi.")
+                  << "\n" << "Dosya izinlerini duzeltip --redeploy calistirin.\n";
         return false;
     }
 
-    std::cout << "[6/6] Uctan uca dogrulaniyor... ";
+    step(6, "Uctan uca dogrulaniyor...");
     for (int attempt = 0; attempt < 5; ++attempt) {
         if (verifyDeployment(config.workerUrl, config.sharedSecret)) {
-            std::cout << "OK\n";
+            stepOk();
             return true;
         }
         Sleep(2000);
     }
 
-    std::cout << "HATA\n";
-    std::cerr << "Worker deploy edildi ama /resolve henuz yanit vermedi.\n"
-              << "Yeni anahtar guvenle kaydedildi; biraz sonra tekrar deneyebilir veya "
-                 "--redeploy calistirabilirsiniz.\n";
+    stepFailed();
+    std::cerr << console::yellow("Worker yuklendi ama henuz yanit vermiyor.") << "\n"
+              << console::dim("Yeni anahtar kaydedildi; biraz sonra tekrar deneyin veya --redeploy "
+                              "calistirin.") << "\n";
     return false;
 }
 
 bool prepareClient(wrangler::Client& client) {
     std::string error;
-    std::cout << "[1/6] Wrangler 4 kontrol ediliyor... ";
+    step(1, "Wrangler kontrol ediliyor...");
     if (!client.available(error)) {
-        std::cout << "HATA\n";
-        std::cerr << error << "\n";
+        stepFailed();
+        std::cerr << console::red(error) << "\n";
         return false;
     }
-    std::cout << "OK\n";
+    stepOk();
     return true;
 }
 
@@ -143,15 +164,17 @@ std::optional<wrangler::Identity> loginAndReadIdentity(const wrangler::Client& c
         if (auto identity = client.whoami()) return identity;
     }
 
-    std::cout << "[2/6] Cloudflare OAuth aciliyor; tarayicida izin verin.\n";
-    if (!client.loginWithKeyring()) {
-        std::cerr << "Cloudflare OAuth girisi tamamlanamadi.\n";
-        return std::nullopt;
+    // A closed tab or a denied consent is common; offer another go instead of
+    // making the user restart the whole setup.
+    for (;;) {
+        step(2, "Cloudflare girisi: tarayicida acilan sayfada izin verin.\n");
+        if (client.loginWithKeyring()) break;
+        if (!askRetry("Tekrar denensin mi?")) return std::nullopt;
     }
 
     auto identity = client.whoami();
     if (!identity) {
-        std::cerr << "OAuth tamamlandi ancak Wrangler hesap bilgisini okuyamadi.\n";
+        std::cerr << console::red("Giris tamamlandi ama hesap bilgisi okunamadi.") << "\n";
         return std::nullopt;
     }
     return identity;
@@ -160,7 +183,7 @@ std::optional<wrangler::Identity> loginAndReadIdentity(const wrangler::Client& c
 } // namespace
 
 bool runSetup(Config& config) {
-    std::cout << "\n=== SplitHello Setup ===\n\n";
+    std::cout << "\n" << console::cyan("SplitHello kurulumu") << "\n\n";
 
     wrangler::Client client;
     if (!prepareClient(client)) return false;
@@ -168,15 +191,18 @@ bool runSetup(Config& config) {
     const auto identity = loginAndReadIdentity(client, true);
     if (!identity) return false;
 
-    std::cout << "[3/6] Cloudflare hesabi seciliyor... ";
+    step(3, "Cloudflare hesabi seciliyor...");
     const auto accountId = selectAccount(*identity, config.accountId);
-    if (!accountId) return false;
+    if (!accountId) {
+        stepFailed();
+        return false;
+    }
     config.accountId = *accountId;
-    std::cout << "OK (" << config.accountId.substr(0, 8) << "...)\n";
+    stepOk(config.accountId.substr(0, 8) + "...");
 
     if (config.workerName.empty()) config.workerName = "splithello-relay";
     if (!wrangler::isValidWorkerName(config.workerName)) {
-        std::cerr << "Gecersiz Worker adi: " << config.workerName << "\n";
+        std::cerr << console::red("Gecersiz Worker adi: " + config.workerName) << "\n";
         return false;
     }
 
@@ -186,11 +212,9 @@ bool runSetup(Config& config) {
     config.sharedSecret = secure::randomHex(kSharedSecretBytes);
     if (!deployAndVerify(config, client)) return false;
 
-    std::cout << "\n=== Setup Tamamlandi ===\n"
-              << "Worker URL : " << config.workerUrl << "\n"
-              << "Config     : " << Config::configPath() << "\n"
-              << "OAuth      : Wrangler + Windows Credential Manager\n"
-              << "Worker sirri: Windows DPAPI ile sifreli\n\n";
+    std::cout << "\n" << console::green("Kurulum tamamlandi.") << "\n"
+              << console::dim("  Worker  ") << config.workerUrl << "\n"
+              << console::dim("  Ayarlar ") << Config::configPath() << "\n\n";
     return true;
 }
 
@@ -206,20 +230,20 @@ bool redeployWorker(Config& config) {
     config.accountId = *accountId;
 
     if (!wrangler::isValidWorkerName(config.workerName)) {
-        std::cerr << "Gecersiz Worker adi: " << config.workerName << "\n";
+        std::cerr << console::red("Gecersiz Worker adi: " + config.workerName) << "\n";
         return false;
     }
 
     secure::wipe(config.apiToken);
     config.sharedSecret = secure::randomHex(kSharedSecretBytes);
     if (config.sharedSecret.empty()) {
-        std::cerr << "Rastgele anahtar uretilemedi.\n";
+        std::cerr << console::red("Rastgele anahtar uretilemedi.") << "\n";
         return false;
     }
 
-    std::cout << "Worker yeniden deploy ediliyor (" << config.workerName << ")...\n";
     if (!deployAndVerify(config, client)) return false;
 
-    std::cout << "Redeploy tamamlandi. Yeni gizli anahtar kaydedildi.\n";
+    std::cout << "\n" << console::green("Yeniden yukleme tamamlandi.")
+              << " Yeni gizli anahtar kaydedildi.\n";
     return true;
 }
