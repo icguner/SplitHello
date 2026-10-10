@@ -276,7 +276,10 @@ public:
             parent_ = OpenProcess(SYNCHRONIZE, FALSE, parentPid);
         }
         if (!stopEvent_ || (!event_ && !parent_)) {
-            spdlog::warn("Ebeveyn kapanis olayi acilamadi: {}", GetLastError());
+            // A console run asks for no monitor at all; only a real failure is news.
+            if (!name.empty() || parentPid != 0) {
+                spdlog::warn("Ebeveyn kapanis olayi acilamadi: {}", GetLastError());
+            }
             return;
         }
         worker_ = std::thread([this]() {
