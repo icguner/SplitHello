@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
@@ -36,6 +37,17 @@ public:
     void inbound(const std::string& server, uint16_t localPort, uint64_t nowMs);
     void clear();
 
+    // Lock-free pre-checks for the datagram hot path, so a caller can skip
+    // building the server text and taking the mutex when the call would be a
+    // no-op: only Initials create state, and only an unanswered flow or a
+    // blocked server can change what a datagram needs.
+    bool needsOutbound(bool initial) const noexcept {
+        return initial || blockedServers_.load(std::memory_order_relaxed) != 0;
+    }
+    bool needsInbound() const noexcept {
+        return unansweredFlows_.load(std::memory_order_relaxed) != 0;
+    }
+
 private:
     struct Flow {
         uint64_t startedMs = 0;
@@ -45,10 +57,15 @@ private:
 
     std::string flowKey(const std::string& server, uint16_t localPort) const;
     void purgeIfDue(uint64_t nowMs);
+    void publishBlockedLocked() {
+        blockedServers_.store(blockedUntil_.size(), std::memory_order_relaxed);
+    }
 
     uint64_t responseTimeoutMs_;
     uint64_t fallbackMs_;
     uint64_t nextPurgeAtMs_ = 0;
+    std::atomic<size_t> unansweredFlows_{0};
+    std::atomic<size_t> blockedServers_{0};
     std::mutex mutex_;
     std::unordered_map<std::string, Flow> flows_;
     std::unordered_map<std::string, uint64_t> blockedUntil_;

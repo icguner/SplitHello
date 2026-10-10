@@ -71,6 +71,7 @@ namespace {
 
 constexpr wchar_t kWindowClass[] = L"SplitHello.DashboardWindow";
 constexpr UINT kTestCompletedMessage = WM_APP + 20;
+constexpr UINT kDataReadyMessage = WM_APP + 21;
 
 constexpr int kIdRange24 = 3001;
 constexpr int kIdRange7 = 3002;
@@ -374,12 +375,18 @@ enum class Ordering { Recent, Slowest, Attempts };
 
 struct DashboardPanel::Impl {
     Impl(std::string databasePath, std::wstring statsName,
-         std::function<void()> rulesChanged)
+         std::function<void()> rulesChanged, unsigned cliRules)
         : telemetryPath(std::move(databasePath)),
           liveStatsName(std::move(statsName)),
-          onProcessRulesChanged(std::move(rulesChanged)) {}
+          onProcessRulesChanged(std::move(rulesChanged)),
+          cliProcessRules(cliRules) {}
 
     ~Impl() {
+        // Both workers only touch members of this object and a copied HWND, so
+        // they are joined before the window goes away. The snapshot query cannot
+        // be interrupted; the join waits for the current query (short, local DB).
+        dataWorker.request_stop();
+        if (dataWorker.joinable()) dataWorker.join();
         testWorker.request_stop();
         if (testWorker.joinable()) testWorker.join();
         if (window) DestroyWindow(window);
@@ -390,9 +397,11 @@ struct DashboardPanel::Impl {
 
     bool show() {
         if (!ensureWindow()) return false;
-        loadData();
+        loadLive();
         loadProcessRules();
-        ShowWindow(window, SW_SHOW);
+        refresh();
+        // SW_SHOW leaves a minimized window minimized.
+        ShowWindow(window, IsIconic(window) ? SW_RESTORE : SW_SHOW);
         SetForegroundWindow(window);
         SetTimer(window, kTimerLive, 1000, nullptr);
         SetTimer(window, kTimerData, 10000, nullptr);
@@ -401,11 +410,43 @@ struct DashboardPanel::Impl {
         return true;
     }
 
+    // A hidden panel must not keep waking the process or querying the database.
+    void hide() {
+        if (!window) return;
+        KillTimer(window, kTimerLive);
+        KillTimer(window, kTimerData);
+        ShowWindow(window, SW_HIDE);
+    }
+
+    bool translateMessage(MSG& message) {
+        return window && IsDialogMessageW(window, &message) != FALSE;
+    }
+
+    // Starts a snapshot on the worker; the result is applied from
+    // kDataReadyMessage on the UI thread. Requests made while one is running are
+    // coalesced into a single follow-up.
     void refresh() {
         if (!window) return;
-        loadData();
-        relayout();
-        invalidate();
+        loadLive();
+        if (dataBusy.exchange(true)) {
+            dataRefreshQueued = true;
+            return;
+        }
+        if (dataWorker.joinable()) dataWorker.join(); // previous run has finished
+        const HWND target = window;
+        const std::string path = telemetryPath;
+        const unsigned days = windowDays;
+        dataWorker = std::jthread([this, target, path, days](std::stop_token stop) {
+            telemetry::DashboardData snapshot =
+                telemetry::Store::dashboardSnapshot(path, days);
+            {
+                std::scoped_lock lock(dataMutex);
+                pendingData = std::move(snapshot);
+                pendingDays = days;
+            }
+            dataBusy = false;
+            if (!stop.stop_requested()) PostMessageW(target, kDataReadyMessage, 0, 0);
+        });
     }
 
     void invalidate() const {
@@ -414,11 +455,44 @@ struct DashboardPanel::Impl {
 
     // ---- data --------------------------------------------------------------
 
-    void loadData() {
-        data = telemetry::Store::dashboardSnapshot(telemetryPath, windowDays);
-        live = live_stats::read(liveStatsName);
+    void applyPendingData() {
+        bool stale = false;
+        {
+            std::scoped_lock lock(dataMutex);
+            stale = pendingDays != windowDays;
+            if (!stale) data = std::move(pendingData);
+        }
+        if (dataRefreshQueued || stale) {
+            dataRefreshQueued = false;
+            refresh(); // the range changed (or was asked again) while we were busy
+            if (stale) return;
+        }
         applyFilters();
         syncTestButton();
+        // Re-measure only when the content's shape changed; most 10 s refreshes
+        // just move numbers.
+        const size_t signature = layoutSignature();
+        if (signature != lastLayoutSignature) {
+            lastLayoutSignature = signature;
+            relayout();
+        }
+        invalidate();
+    }
+
+    size_t layoutSignature() const {
+        size_t signature = data.ready ? 1 : 0;
+        const auto mix = [&signature](size_t value) {
+            signature = signature * 1000003u + value + 1;
+        };
+        mix(visible.size());
+        mix(data.diagnoses.size());
+        mix(data.signals.size());
+        mix(data.topHosts.size());
+        mix(data.profiles.size());
+        for (const size_t index : visible) {
+            mix(data.recent[index].attempts.empty() ? 1 : 2);
+        }
+        return signature;
     }
 
     void loadLive() {
@@ -488,6 +562,15 @@ struct DashboardPanel::Impl {
         if (excludeEdit) SetWindowTextW(excludeEdit, exclude.c_str());
         ruleStatus = L"Kurallar hazır. Boş include tüm süreçleri kapsar.";
         ruleStatusKind = 0;
+        if (config.processIncludeInvalid) {
+            ruleStatus = L"Include listesindeki hiçbir girdi geçerli değil; motor "
+                         L"başlamaz. Düzeltin veya boşaltıp kaydedin.";
+            ruleStatusKind = 2;
+        } else if (cliProcessRules > 0) {
+            // shortcut: command-line rules are not editable/visible here, only counted.
+            ruleStatus += L" Komut satırından " + std::to_wstring(cliProcessRules) +
+                          L" ek kural da var (burada görünmez).";
+        }
     }
 
     std::wstring editText(HWND edit) const {
@@ -525,7 +608,7 @@ struct DashboardPanel::Impl {
             invalidate();
             return;
         }
-        ruleStatus = L"Kurallar kaydedildi; ağ motoru yenileniyor…";
+        ruleStatus = L"Kurallar kaydedildi; çalışan ağ motoru yenileniyor…";
         ruleStatusKind = 1;
         invalidate();
         if (onProcessRulesChanged) onProcessRulesChanged();
@@ -801,8 +884,12 @@ struct DashboardPanel::Impl {
         const D2D1_SIZE_U size = D2D1::SizeU(
             static_cast<UINT32>(std::max<LONG>(1, client.right - client.left)),
             static_cast<UINT32>(std::max<LONG>(1, client.bottom - client.top)));
+        // All geometry here is in physical pixels (GetClientRect and S() already
+        // apply the window DPI), so the target must be 1 DIP = 1 pixel. The
+        // default would apply the system DPI a second time.
         if (FAILED(d2dFactory->CreateHwndRenderTarget(
-                D2D1::RenderTargetProperties(),
+                D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                                             D2D1::PixelFormat(), 96.0f, 96.0f),
                 D2D1::HwndRenderTargetProperties(window, size),
                 renderTarget.GetAddressOf()))) {
             return false;
@@ -1405,6 +1492,7 @@ struct DashboardPanel::Impl {
         double current;
         double previous;
         int polarity; // +1 rising is good, -1 rising is bad, 0 neutral
+        bool trend = true; // false: no comparable previous-period value, hide the delta
     };
 
     void drawSummary() {
@@ -1442,9 +1530,11 @@ struct DashboardPanel::Impl {
              L"başarılı karşı-deney yok", theme.failed,
              static_cast<double>(data.unresolved),
              static_cast<double>(data.previous.unresolved), -1},
+            // shortcut: Telemetry keeps only the previous period's average
+            // latency, and a median must not be compared with a mean. Add
+            // Previous::p50 and drop `false` to show this trend.
             {L"KARAR SÜRESİ p50", formatMs(data.latency.p50), tailNote,
-             theme.ink, static_cast<double>(data.latency.p50),
-             data.previous.averageLatencyMs, -1},
+             theme.ink, static_cast<double>(data.latency.p50), 0.0, -1, false},
         }};
 
         const float cellW = contentW / summaryCols;
@@ -1471,6 +1561,7 @@ struct DashboardPanel::Impl {
 
     // Period-over-period change, coloured only when the direction has meaning.
     void drawDelta(const D2D1_RECT_F& rect, const Figure& figure) {
+        if (!figure.trend) return;
         if (!data.ready || figure.previous <= 0) {
             text(L"önceki dönem yok", fmtMonoSm, rect, theme.inkFaint);
             return;
@@ -2253,6 +2344,7 @@ struct DashboardPanel::Impl {
         const int id = LOWORD(wParam);
         const int notification = HIWORD(wParam);
         switch (id) {
+        case IDCANCEL: hide(); break; // Esc via IsDialogMessage
         case kIdRange24: windowDays = 1; refresh(); break;
         case kIdRange7: windowDays = 7; refresh(); break;
         case kIdRange30: windowDays = 30; refresh(); break;
@@ -2367,6 +2459,9 @@ struct DashboardPanel::Impl {
         }
         case WM_COMMAND:
             return self->handleCommand(wParam);
+        case kDataReadyMessage:
+            self->applyPendingData();
+            return 0;
         case kTestCompletedMessage:
             self->applyTestResult();
             self->loadLive();
@@ -2375,7 +2470,7 @@ struct DashboardPanel::Impl {
             return 0;
         case WM_KEYDOWN:
             if (wParam == VK_F5) { self->refresh(); return 0; }
-            if (wParam == VK_ESCAPE) { ShowWindow(target, SW_HIDE); return 0; }
+            if (wParam == VK_ESCAPE) { self->hide(); return 0; }
             break;
         case WM_TIMER:
             if (wParam == kTimerLive) {
@@ -2386,7 +2481,7 @@ struct DashboardPanel::Impl {
             }
             return 0;
         case WM_CLOSE:
-            ShowWindow(target, SW_HIDE);
+            self->hide();
             return 0;
         case WM_DESTROY:
             KillTimer(target, kTimerLive);
@@ -2409,7 +2504,18 @@ struct DashboardPanel::Impl {
     std::string telemetryPath;
     std::wstring liveStatsName;
     std::function<void()> onProcessRulesChanged;
+    unsigned cliProcessRules = 0;
     unsigned windowDays = 30;
+
+    // Telemetry snapshot worker: results are handed over under dataMutex and
+    // applied on the UI thread by kDataReadyMessage.
+    std::jthread dataWorker;
+    std::mutex dataMutex;
+    telemetry::DashboardData pendingData;
+    unsigned pendingDays = 0;
+    std::atomic<bool> dataBusy{false};
+    bool dataRefreshQueued = false;
+    size_t lastLayoutSignature = static_cast<size_t>(-1);
 
     HWND window = nullptr;
     HWND range24 = nullptr, range7 = nullptr, range30 = nullptr;
@@ -2493,15 +2599,21 @@ struct DashboardPanel::Impl {
 
 DashboardPanel::DashboardPanel(std::string telemetryPath,
                                std::wstring liveStatsName,
-                               std::function<void()> onProcessRulesChanged)
+                               std::function<void()> onProcessRulesChanged,
+                               unsigned cliProcessRules)
     : impl_(std::make_unique<Impl>(std::move(telemetryPath),
                                    std::move(liveStatsName),
-                                   std::move(onProcessRulesChanged))) {}
+                                   std::move(onProcessRulesChanged),
+                                   cliProcessRules)) {}
 
 DashboardPanel::~DashboardPanel() = default;
 
 bool DashboardPanel::show() {
     return impl_->show();
+}
+
+bool DashboardPanel::translateMessage(tagMSG& message) {
+    return impl_->translateMessage(message);
 }
 
 void DashboardPanel::refresh() {

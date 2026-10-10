@@ -65,6 +65,39 @@ TEST(variant_rejects_ipv4_wire_length_overflow) {
         original.data() + 40, std::vector<uint8_t>(65500), 0, address, 0, false).empty());
 }
 
+TEST(bad_checksum_variant_carries_only_a_wrong_tcp_checksum) {
+    auto original = packet(false, false, 100);
+    WINDIVERT_ADDRESS address{};
+    const std::vector<uint8_t> payload(20, 0xab);
+    const auto good = divert_packet::buildTcpVariant(
+        original.data(), static_cast<UINT>(original.size()), original.data() + 40,
+        payload, 0, address, 0, false);
+    auto bad = divert_packet::buildTcpVariant(
+        original.data(), static_cast<UINT>(original.size()), original.data() + 40,
+        payload, 0, address, 0, true);
+    CHECK_EQ(bad.size(), good.size());
+
+    // Exactly the two TCP checksum bytes differ; the IP header stays valid.
+    size_t differing = 0;
+    for (size_t i = 0; i < good.size(); ++i) {
+        if (good[i] != bad[i]) {
+            CHECK(i == 20 + 16 || i == 20 + 17);
+            ++differing;
+        }
+    }
+    CHECK_EQ(differing, 2U);
+
+    // A packet whose address flags claim valid checksums is injected as-is, so
+    // recomputing the checksums here must repair it - proving it really was wrong.
+    WINDIVERT_ADDRESS claimsValid{};
+    claimsValid.IPChecksum = 1;
+    claimsValid.TCPChecksum = 1;
+    auto repaired = bad;
+    CHECK(WinDivertHelperCalcChecksums(repaired.data(), static_cast<UINT>(repaired.size()),
+                                       &claimsValid, 0));
+    CHECK(repaired == good);
+}
+
 TEST(variant_rejects_invalid_payload_pointer) {
     auto original = packet(false, false, 100);
     WINDIVERT_ADDRESS address{};

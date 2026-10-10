@@ -35,6 +35,22 @@ TEST(ExtractsWorkersDevUrlFromWranglerOutput) {
     CHECK(wrangler::parseWorkersDevUrl("https://dash.cloudflare.com/workers").empty());
 }
 
+TEST(WorkersDevUrlMustBelongToTheDeployedWorker) {
+    const std::string output =
+        "See https://docs.other-account.workers.dev/help for details\\n"
+        "Deployed splithello-relay\\n"
+        "  https://splithello-relay.can-subdomain.workers.dev\\n";
+    CHECK_EQ(wrangler::parseWorkersDevUrl(output, "splithello-relay"),
+             std::string("wss://splithello-relay.can-subdomain.workers.dev"));
+    // Without a name the first workers.dev link wins (the old behaviour).
+    CHECK_EQ(wrangler::parseWorkersDevUrl(output),
+             std::string("wss://docs.other-account.workers.dev"));
+    CHECK(wrangler::parseWorkersDevUrl(output, "another-worker").empty());
+    // A bare "<name>.workers.dev" has no account subdomain: not a deploy URL.
+    CHECK(wrangler::parseWorkersDevUrl("https://splithello-relay.workers.dev",
+                                       "splithello-relay").empty());
+}
+
 TEST(ValidatesCloudflareWorkerNames) {
     CHECK(wrangler::isValidWorkerName("splithello-relay"));
     CHECK(wrangler::isValidWorkerName("a1"));

@@ -19,6 +19,8 @@
 // private connect port is mapped back to TCP/443. UDP/443 is optionally dropped
 // so HTTP/3 clients fall back to the diagnosable TCP path. Process rules are
 // resolved once per new tuple and cached; the packet loop never opens a process.
+// Only connections whose SYN was seen after start() are rewritten, so engine
+// (re)starts leave existing HTTPS connections alone instead of resetting them.
 class WinDivertInterceptor {
 public:
     WinDivertInterceptor(transparent::FlowRegistry& flows,
@@ -50,6 +52,9 @@ private:
     process_filter::Filter* processFilter_;
     bool captureDns_;
     quic_strategy::AdaptiveRegistry quicRegistry_;
+    // Tuples whose SYN this engine rewrote; only these keep being rewritten.
+    // Touched by the packet loop, cleared by start()/stop() around its lifetime.
+    transparent::TcpFlowTable tcpFlows_;
 
     HANDLE packetHandle_ = INVALID_HANDLE_VALUE;
     HANDLE quicDropHandle_ = INVALID_HANDLE_VALUE;

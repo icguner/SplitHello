@@ -154,9 +154,11 @@ class ProxyHarness {
 public:
     ~ProxyHarness() { stop(); }
 
-    bool start(size_t maxConnections, unsigned idleTimeoutMs = 10 * 60 * 1000) {
+    bool start(size_t maxConnections, unsigned idleTimeoutMs = 10 * 60 * 1000,
+               unsigned handshakeTimeoutMs = 10 * 1000) {
         RelayContext context;
         context.idleTimeoutMs = idleTimeoutMs;
+        context.handshakeTimeoutMs = handshakeTimeoutMs;
         proxy = std::make_unique<SocksProxy>(context, (uint16_t)0, nullptr, maxConnections);
         thread_ = std::thread([this]() {
             proxy->run();
@@ -305,10 +307,13 @@ TEST(SocksProxyRejectsConnectionsOverTheLimit) {
     CHECK(first.get() != INVALID_SOCKET);
     CHECK_EQ(proxy.proxy->activeConnections(), (size_t)1);
 
-    // The limit is reached: the next connection is accepted and closed at once.
+    // The limit is reached: the next connection is accepted and reset at once,
+    // not closed with a FIN that reads like a clean, empty response.
     SocketScope second(connectLoopback(proxy.proxy->port()));
     CHECK(second.get() != INVALID_SOCKET);
-    CHECK(waitForClose(second.get(), 5000));
+    uint8_t byte = 0;
+    CHECK(tcp::recvTimeout(second.get(), &byte, 1, 5000) < 0);
+    CHECK_EQ(WSAGetLastError(), WSAECONNRESET);
     CHECK_EQ(proxy.proxy->rejectedConnections(), (uint64_t)1);
     CHECK_EQ(proxy.proxy->activeConnections(), (size_t)1);
 
@@ -364,3 +369,33 @@ TEST(SocksProxyClosesIdleConnections) {
     CHECK(waitForClose(client.get(), 5000));
     CHECK(waitUntil([&]() { return proxy.proxy->activeConnections() == 0; }, 5000));
 }
+
+TEST(SocksProxyDropsClientsThatStallTheHandshake) {
+    WinsockScope winsock;
+    CHECK(winsock.ready);
+    ProxyHarness proxy;
+    CHECK(proxy.start(8, /*idleTimeoutMs=*/10 * 60 * 1000, /*handshakeTimeoutMs=*/300));
+
+    // Silent: never sends the first byte.
+    SocketScope silent(connectLoopback(proxy.proxy->port()));
+    CHECK(silent.get() != INVALID_SOCKET);
+
+    // Starts a SOCKS5 greeting and stops after the version byte.
+    SocketScope halfSocks(connectLoopback(proxy.proxy->port()));
+    CHECK(halfSocks.get() != INVALID_SOCKET);
+    const uint8_t version = 0x05;
+    CHECK(tcp::sendAll(halfSocks.get(), &version, 1));
+
+    // CONNECT whose headers never end: it must not be answered with a 200.
+    SocketScope halfHttp(connectLoopback(proxy.proxy->port()));
+    CHECK(halfHttp.get() != INVALID_SOCKET);
+    const std::string request = "CONNECT 127.0.0.1:9 HTTP/1.1\r\nHost: x\r\n";
+    CHECK(tcp::sendAll(halfHttp.get(), request.data(), request.size()));
+
+    CHECK(waitUntil([&]() { return proxy.proxy->activeConnections() == 0; }, 5000));
+    CHECK(waitForClose(silent.get(), 5000));
+    CHECK(waitForClose(halfSocks.get(), 5000));
+    uint8_t reply[16] = {};
+    CHECK(tcp::recvTimeout(halfHttp.get(), reply, sizeof(reply), 5000) <= 0);
+}
+

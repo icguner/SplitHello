@@ -1,6 +1,8 @@
+#include "CommandLine.hpp"
 #include "Config.hpp"
 #include "Dns.hpp"
 #include "DirectRelay.hpp"
+#include "EngineExitCodes.hpp"
 #include "LiveStats.hpp"
 #include "NetworkIdentity.hpp"
 #include "PacketStrategy.hpp"
@@ -167,6 +169,12 @@ bool parseUnsigned(const char* text, unsigned& out) {
     return true;
 }
 
+// Same limits Config applies when it reads process rules from disk.
+bool validProcessPattern(const char* pattern) {
+    const size_t length = std::string_view(pattern).size();
+    return length > 0 && length <= 1024;
+}
+
 bool isElevated() {
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
@@ -180,29 +188,15 @@ bool isElevated() {
     return elevated;
 }
 
-std::wstring quoteWindowsArgument(const std::wstring& argument) {
-    if (argument.find_first_of(L" \t\n\v\"") == std::wstring::npos) return argument;
-
-    std::wstring result = L"\"";
-    size_t backslashes = 0;
-    for (const wchar_t character : argument) {
-        if (character == L'\\') {
-            backslashes++;
-            continue;
-        }
-        if (character == L'\"') {
-            result.append(backslashes * 2 + 1, L'\\');
-            result.push_back(character);
-            backslashes = 0;
-            continue;
-        }
-        result.append(backslashes, L'\\');
-        backslashes = 0;
-        result.push_back(character);
+// The tray holds this mutex for its whole lifetime. A tray running elevated
+// owns an admin-only DACL, so an access-denied open also means "exists".
+bool trayInstanceRunning() {
+    HANDLE existing = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\SplitHello-Tray");
+    if (existing) {
+        CloseHandle(existing);
+        return true;
     }
-    result.append(backslashes * 2, L'\\');
-    result.push_back(L'\"');
-    return result;
+    return GetLastError() == ERROR_ACCESS_DENIED;
 }
 
 int relaunchElevated(bool waitForExit = true) {
@@ -213,7 +207,7 @@ int relaunchElevated(bool waitForExit = true) {
     std::wstring parameters;
     for (int i = 1; i < argumentCount; ++i) {
         if (!parameters.empty()) parameters.push_back(L' ');
-        parameters += quoteWindowsArgument(arguments[i]);
+        parameters += cmdline::quoteArgument(arguments[i]);
     }
 
     HANDLE shutdownEvent = nullptr;
@@ -228,7 +222,7 @@ int relaunchElevated(bool waitForExit = true) {
             return -1;
         }
         parameters += L" --shutdown-event ";
-        parameters += quoteWindowsArgument(shutdownEventName);
+        parameters += cmdline::quoteArgument(shutdownEventName);
         parameters += L" --parent-pid ";
         parameters += std::to_wstring(GetCurrentProcessId());
     }
@@ -310,6 +304,9 @@ public:
 
     ShutdownEventMonitor(const ShutdownEventMonitor&) = delete;
     ShutdownEventMonitor& operator=(const ShutdownEventMonitor&) = delete;
+
+    // True once a thread is watching the event and/or the parent process.
+    bool active() const { return worker_.joinable(); }
 
 private:
     HANDLE event_ = nullptr;
@@ -399,9 +396,21 @@ bool parseArgs(int argc, char* argv[], Options& options, int& exitCode) {
         } else if (arg == "--tunnel-fallback") {
             options.tunnelFallback = true;
         } else if (arg == "--include-process" && hasValue) {
-            options.processInclude.push_back(argv[++i]);
+            // An empty/oversized pattern would be dropped later, and a dropped
+            // include list silently widens the scope to every process.
+            if (!validProcessPattern(argv[++i])) {
+                std::cerr << "Gecersiz surec deseni (bos veya 1024 bayttan uzun)\n";
+                exitCode = 1;
+                return false;
+            }
+            options.processInclude.push_back(argv[i]);
         } else if (arg == "--exclude-process" && hasValue) {
-            options.processExclude.push_back(argv[++i]);
+            if (!validProcessPattern(argv[++i])) {
+                std::cerr << "Gecersiz surec deseni (bos veya 1024 bayttan uzun)\n";
+                exitCode = 1;
+                return false;
+            }
+            options.processExclude.push_back(argv[i]);
         } else if (arg == "--restore-proxy") {
             options.restoreProxy = true;
         } else if (arg == "--forget-token") {
@@ -492,6 +501,9 @@ void signalReadyEvent(const std::string& eventName) {
 } // namespace
 
 int main(int argc, char* argv[]) {
+    // WinDivert.dll is a static import and is already mapped by the loader; this
+    // only restricts later LoadLibrary calls to System32 and the exe directory.
+    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     spdlog::set_pattern("[%H:%M:%S.%e] [%^%l%$] %v");
 
@@ -499,13 +511,22 @@ int main(int argc, char* argv[]) {
     int exitCode = 0;
     if (!parseArgs(argc, argv, options, exitCode)) return exitCode;
     const bool trayMode = shouldRunTray(options);
-    // The tray controller and engine are separate processes. Only the engine
-    // owns the rotating file sink, avoiding inter-process rotation races.
-    initializeLogging(options.verbose, !trayMode);
 
+    // This is a console-subsystem exe: hide the window as early as possible so
+    // a tray/engine start does not flash a console.
     if (trayMode || options.engine) {
         if (HWND console = GetConsoleWindow()) ShowWindow(console, SW_HIDE);
     }
+
+    // Installed before the elevation relaunch so Ctrl+C / console close reach
+    // the elevated child through g_elevationShutdownEvent while we wait on it.
+    std::signal(SIGINT, cleanup);
+    std::signal(SIGTERM, cleanup);
+    SetConsoleCtrlHandler(consoleHandler, TRUE);
+
+    // The tray controller and engine are separate processes. Only the engine
+    // owns the rotating file sink, avoiding inter-process rotation races.
+    initializeLogging(options.verbose, !trayMode);
 
     if (options.listStrategies) {
         printStrategies();
@@ -515,6 +536,12 @@ int main(int argc, char* argv[]) {
     const bool exitsWithoutInterception = options.restoreProxy || options.forgetToken ||
         options.forgetStrategies || options.redeploy;
     if (!options.manualProxy && !exitsWithoutInterception && !isElevated()) {
+        // Decide "already running" before the UAC prompt; otherwise a second
+        // launch asks for elevation and then exits without a word.
+        if (trayMode && trayInstanceRunning()) {
+            spdlog::info("SplitHello tray zaten calisiyor");
+            return 0;
+        }
         spdlog::info("WinDivert icin yonetici izni isteniyor");
         const int elevatedExitCode = relaunchElevated(!trayMode);
         if (elevatedExitCode < 0) {
@@ -540,9 +567,11 @@ int main(int argc, char* argv[]) {
 
         Config trayConfig;
         trayConfig.load();
-        const bool configured = !options.workerUrl.empty() || trayConfig.isValid();
-        const std::wstring logDirectory =
-            std::filesystem::path(Config::logPath()).parent_path().wstring();
+        // An unreadable config is not "setup missing": let the engine start and
+        // report the precise reason (exit code 16) instead of asking for --setup.
+        const bool configured = !options.workerUrl.empty() || trayConfig.isValid() ||
+                                trayConfig.loadFailed;
+        const std::wstring logDirectory = Config::configDirPath().wstring();
         TrayApp tray(collectEngineArguments(), logDirectory,
                      Config::telemetryPath(), configured);
         const int trayExitCode = tray.run();
@@ -553,6 +582,15 @@ int main(int argc, char* argv[]) {
 
     ShutdownEventMonitor shutdownMonitor(options.shutdownEventName,
                                          options.parentPid);
+    // The hidden engine must always be stoppable by its tray. If neither the
+    // shutdown event nor the parent process could be opened, running on would
+    // leave WinDivert interception that nobody can turn off: exit (fail-open).
+    const bool monitorRequested = options.engine || !options.shutdownEventName.empty() ||
+                                  options.parentPid != 0;
+    if (monitorRequested && !shutdownMonitor.active()) {
+        spdlog::error("Tray kapatma kanali acilamadi; denetimsiz calismamak icin cikiliyor");
+        return engine_exit::kMonitorUnavailable;
+    }
 
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -566,6 +604,13 @@ int main(int argc, char* argv[]) {
 
     Config config;
     config.load();
+    if (config.loadFailed && !options.restoreProxy) {
+        // Defaults would be saved over the real file by the migration/--forget
+        // paths below, and the engine would run with the wrong settings.
+        spdlog::error("Yapilandirma dosyasi var ama okunamadi: {}", Config::configPath());
+        std::cerr << "Yapilandirma okunamadi: " << Config::configPath() << "\n";
+        return engine_exit::kConfigUnreadable;
+    }
 
     // Current releases delegate Cloudflare OAuth storage to Wrangler's OS
     // keyring. Rewrite old configs once to remove every legacy API-token field
@@ -612,6 +657,11 @@ int main(int argc, char* argv[]) {
     std::string workerUrl = options.workerUrl.empty() ? config.workerUrl : options.workerUrl;
 
     if (workerUrl.empty() && config.dnsMode == DnsMode::Worker) {
+        if (options.engine) {
+            // The hidden engine has no console; never block it on interactive setup.
+            spdlog::error("Worker yapilandirmasi yok; once splithello.exe --setup calistirin");
+            return engine_exit::kSetupRequired;
+        }
         std::cout << "SplitHello - TLS ClientHello fragmentation for censorship bypass\n\n"
                   << "Yapilandirma bulunamadi. Setup baslatiliyor...\n";
         if (!runSetup(config)) return 1;
@@ -625,6 +675,20 @@ int main(int argc, char* argv[]) {
 
     if (options.splitDelaySet) config.splitDelayMs = options.splitDelayMs;
     if (options.tunnelFallback) config.tunnelFallback = true;
+
+    // An include list that is present but entirely unusable must not turn into
+    // "no include rules" (= intercept every process). Refuse to intercept; the
+    // network stays on its normal path. Fix or clear process_include to start.
+    if (config.processIncludeInvalid) {
+        spdlog::error("process_include dolu ama tum girdiler gecersiz; kapsam "
+                      "genisletilmeyecek, ag motoru baslatilmiyor");
+        std::cerr << "process_include gecersiz: duzeltin veya bosaltin ("
+                  << Config::configPath() << ")\n";
+        return engine_exit::kInvalidProcessRules;
+    }
+
+    // shortcut: CLI rules are merged for this run only and are not shown in the
+    // dashboard; the tray tells the dashboard how many were passed.
     config.processInclude.insert(config.processInclude.end(),
                                  options.processInclude.begin(),
                                  options.processInclude.end());
@@ -677,6 +741,9 @@ int main(int argc, char* argv[]) {
     context.workerUrl = useWorkerDns ? workerUrl : std::string{};
     context.sharedSecret = useWorkerDns ? config.sharedSecret : std::string{};
     context.networkId = networkId;
+    // The network can change while the engine runs (Wi-Fi roaming, VPN); the
+    // relay asks for the identity per decision instead of using the start value.
+    context.networkIdProvider = [] { return network_identity::currentCached(); };
     context.resolver = useWorkerDns ? &resolver : nullptr;
     context.strategies = &strategies;
     context.packetPolicies = options.manualProxy ? nullptr : &packetPolicies;
@@ -704,10 +771,6 @@ int main(int argc, char* argv[]) {
     transparent::DatagramRegistry datagrams;
     SocksProxy proxy(context, options.port, options.manualProxy ? nullptr : &flows);
     TransparentDnsProxy dnsProxy(resolver, datagrams, dnsProxyPort);
-
-    std::signal(SIGINT, cleanup);
-    std::signal(SIGTERM, cleanup);
-    SetConsoleCtrlHandler(consoleHandler, TRUE);
 
     int runtimeExitCode = 0;
     if (options.manualProxy) {
@@ -737,15 +800,17 @@ int main(int argc, char* argv[]) {
         if (!proxy.running()) {
             proxy.stop();
             if (proxyThread.joinable()) proxyThread.join();
-            spdlog::error("Transparent relay baslatilamadi");
-            return proxyResult ? 0 : 1;
+            spdlog::error("Transparent relay baslatilamadi (port {} kullanimda olabilir)",
+                          options.port);
+            return proxyResult ? 0 : engine_exit::kRelayPortInUse;
         }
 
         if (useWorkerDns && !dnsProxy.start()) {
             proxy.stop();
             if (proxyThread.joinable()) proxyThread.join();
-            spdlog::error("Transparent DNS relay baslatilamadi");
-            return 1;
+            spdlog::error("Transparent DNS relay baslatilamadi (port {} kullanimda olabilir)",
+                          dnsProxyPort);
+            return engine_exit::kDnsRelayPortInUse;
         }
 
         WinDivertInterceptor interceptor(flows, datagrams, packetPolicies, options.port,
@@ -755,7 +820,7 @@ int main(int argc, char* argv[]) {
             dnsProxy.stop();
             proxy.stop();
             if (proxyThread.joinable()) proxyThread.join();
-            return 1;
+            return engine_exit::kWinDivertOpenFailed;
         }
 
         signalReadyEvent(options.readyEventName);

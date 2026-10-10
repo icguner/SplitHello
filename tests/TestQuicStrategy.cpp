@@ -48,3 +48,35 @@ TEST(AdaptiveQuicFallsBackAfterNoResponse) {
     CHECK(registry.outbound("203.0.113.2", 50001, true, 7000) ==
           quic_strategy::Decision::PrimeAndPass);
 }
+
+TEST(AdaptiveQuicPrechecksLetSettledTrafficSkipTheRegistry) {
+    quic_strategy::AdaptiveRegistry registry(900, 5000);
+    CHECK(!registry.needsInbound());
+    CHECK(!registry.needsOutbound(false));
+    CHECK(registry.needsOutbound(true));
+
+    registry.outbound("203.0.113.4", 50000, true, 1000);
+    CHECK(registry.needsInbound());
+    registry.inbound("203.0.113.4", 50000, 1100);
+    // Answered: the data datagrams that follow need neither direction.
+    CHECK(!registry.needsInbound());
+    CHECK(!registry.needsOutbound(false));
+
+    // An unanswered Initial gets blocked; non-Initial datagrams must then be
+    // checked against the block list until it expires.
+    registry.outbound("203.0.113.5", 50001, true, 2000);
+    CHECK(registry.outbound("203.0.113.5", 50001, true, 2900) ==
+          quic_strategy::Decision::Drop);
+    CHECK(registry.needsOutbound(false));
+    CHECK(registry.outbound("203.0.113.5", 50002, false, 3000) ==
+          quic_strategy::Decision::Drop);
+    CHECK(registry.outbound("203.0.113.5", 50002, false, 8000) ==
+          quic_strategy::Decision::Pass);
+    CHECK(!registry.needsOutbound(false));
+    CHECK(!registry.needsInbound());
+
+    registry.outbound("203.0.113.6", 50003, true, 9000);
+    CHECK(registry.needsInbound());
+    registry.clear();
+    CHECK(!registry.needsInbound());
+}

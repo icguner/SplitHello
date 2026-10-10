@@ -11,11 +11,16 @@
 // Every request is made with WINHTTP_ACCESS_TYPE_NO_PROXY on purpose: this
 // process *is* the system proxy, so honouring the system proxy setting would
 // make it call itself.
+//
+// All requests share one WinHTTP session, so keep-alive connections to the same
+// host are reused across calls (no TCP+TLS handshake per DNS query). Redirects
+// are never followed: the Authorization header must not travel to another host.
 namespace http {
 
 struct Response {
     int status = 0;
     std::string body;
+    unsigned retryAfterSeconds = 0;   // Retry-After (delta-seconds form), 0 = absent
     bool ok() const { return status >= 200 && status < 300; }
     bool transportFailed() const { return status < 0; }
 };

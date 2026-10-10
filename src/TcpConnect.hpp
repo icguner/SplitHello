@@ -18,6 +18,12 @@ inline constexpr int kTimedOut = -2;
 // bytes than asked for, which silently truncates a TLS record if ignored.
 bool sendAll(SOCKET sock, const void* data, size_t length);
 
+// Close that reaches the peer immediately as a reset (SO_LINGER {1,0}). Use it
+// when the connection is being discarded or ended by an error: a graceful close
+// would show the peer a clean EOF, which looks like a complete (truncated) body,
+// and on a non-blocking socket with queued bytes lets the FIN linger for seconds.
+void closeAbortive(SOCKET sock);
+
 // recv() bounded by a deadline.
 int recvTimeout(SOCKET sock, void* buffer, size_t length, unsigned timeoutMs);
 

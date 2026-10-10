@@ -3,8 +3,10 @@
 #include "Config.hpp"
 #include "RecoveryPolicy.hpp"
 
+#include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define WIN32_LEAN_AND_MEAN
@@ -51,12 +53,15 @@ private:
     void requestStop();
     void requestExit();
     void pollEngine();
-    void scheduleAutomaticRestart(DWORD exitCode, uint64_t nowMs);
+    void handleEngineExit(DWORD exitCode, uint64_t nowMs);
+    void scheduleAutomaticRestart(DWORD exitCode, uint64_t nowMs,
+                                  const wchar_t* reason = nullptr);
     void closeEngineHandles();
     void setState(EngineState state);
 
-    bool isStartupEnabled() const;
-    bool setStartupEnabled(bool enabled) const;
+    // The Task Scheduler is only ever touched from startupWorker_ (with finite
+    // timeouts); the UI thread reads the cached startupEnabled_.
+    void refreshStartupAsync();
     void toggleStartup();
     void setDnsMode(DnsMode mode);
     void openLogDirectory() const;
@@ -73,7 +78,9 @@ private:
     bool exiting_ = false;
     bool restartPending_ = false;
     bool configurationRestartPending_ = false;
+    bool engineKilled_ = false;
     uint64_t restartAtMs_ = 0;
+    uint64_t stateSinceMs_ = 0;
     recovery::RestartBudget restartBudget_;
     EngineState state_ = EngineState::Stopped;
 
@@ -83,4 +90,8 @@ private:
     HANDLE engineProcess_ = nullptr;
     HANDLE shutdownEvent_ = nullptr;
     HANDLE readyEvent_ = nullptr;
+
+    // Declared last so it is joined before any member it could touch.
+    std::atomic<bool> startupBusy_{false};
+    std::jthread startupWorker_;
 };

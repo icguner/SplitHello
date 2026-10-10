@@ -82,6 +82,14 @@ bool sendAll(SOCKET sock, const void* data, size_t length) {
     return true;
 }
 
+void closeAbortive(SOCKET sock) {
+    linger reset{};
+    reset.l_onoff = 1;
+    reset.l_linger = 0;
+    setsockopt(sock, SOL_SOCKET, SO_LINGER, (const char*)&reset, sizeof(reset));
+    closesocket(sock);
+}
+
 int recvTimeout(SOCKET sock, void* buffer, size_t length, unsigned timeoutMs) {
     fd_set readable;
     FD_ZERO(&readable);
@@ -127,7 +135,9 @@ SOCKET connectAny(const std::vector<std::string>& addresses,
             } else {
                 spdlog::debug("Baglanti denemesi baslatilamadi: {}", address);
             }
-            nextStartAt = now + attemptDelayMs;
+            // Only a live attempt earns the stagger. An address that fails at
+            // once (no IPv6 route) must not delay the next candidate by 250 ms.
+            if (sock != INVALID_SOCKET) nextStartAt = now + attemptDelayMs;
             continue;
         }
 
@@ -186,6 +196,7 @@ SOCKET connectAny(const std::vector<std::string>& addresses,
             spdlog::debug("Baglanti basarisiz: {} (WSA {})", inFlight[i].address, soError);
             closesocket(sock);
             inFlight.erase(inFlight.begin() + (ptrdiff_t)i);
+            nextStartAt = 0; // RFC 8305: a failed attempt starts the next one now
         }
     }
 

@@ -34,11 +34,20 @@ public:
     bool running() const { return running_.load(); }
     uint16_t port() const { return port_; }
 
+    // The whole resolution policy, without a socket: the DNS reply for one
+    // client datagram (A/AAAA via /resolve with real NXDOMAIN/NODATA, wire relay
+    // for everything else, FORMERR/NOTIMP for unusable queries, TC=1 when the
+    // answer exceeds the client's UDP size). Empty means "send nothing".
+    // `deadlineMs` is on the GetTickCount64 scale, 0 = none.
+    std::vector<uint8_t> buildReply(const uint8_t* data, size_t length,
+                                    unsigned long long deadlineMs = 0);
+
 private:
     struct Job {
         std::vector<uint8_t> data;
         sockaddr_storage peer{};
         int peerLength = 0;
+        unsigned long long enqueuedMs = 0;
     };
 
     dns::Resolver& resolver_;

@@ -94,18 +94,20 @@ bool setNonBlocking(SOCKET sock, bool enabled) {
     return ioctlsocket(sock, FIONBIO, &mode) != SOCKET_ERROR;
 }
 
-// Close that reaches the peer immediately. A graceful close of a non-blocking
-// socket that still has bytes queued lets the FIN linger in the background for
-// seconds, so a peer waiting to be told the connection is gone is left hanging.
-// On an abort we are discarding the connection, so a reset is the honest and
-// prompt signal; the winning path still closes gracefully.
-void closeAbortive(SOCKET sock) {
-    linger reset{};
-    reset.l_onoff = 1;
-    reset.l_linger = 0;
-    setsockopt(sock, SOL_SOCKET, SO_LINGER, (const char*)&reset, sizeof(reset));
-    closesocket(sock);
+// Nagle plus the peer's delayed ACK stalls small back-to-back writes (a TLS
+// Finished followed by the first request) for up to ~200 ms. A relay forwards
+// whatever it reads, so coalescing is never wanted.
+void setNoDelay(SOCKET sock) {
+    const int on = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (const char*)&on, sizeof(on));
 }
+
+bool isPacketProfile(const std::string& profile) {
+    return profile.starts_with("packet-");
+}
+
+// 1 in kHealthySampleRate healthy single-attempt flows is persisted.
+std::atomic<unsigned> healthySampleCounter{0};
 
 void enableKeepAlive(SOCKET sock) {
     tcp_keepalive settings{};
@@ -255,6 +257,7 @@ bool DirectRelay::connectTarget() {
         return false;
     }
     enableKeepAlive(sock);
+    setNoDelay(sock); // also keeps every fragment of writePlan() its own segment
     targetSock_ = sock;
     spdlog::debug("Baglandi: {} ({}:{})", connectedAddress_, targetHost_, targetPort_);
     return true;
@@ -337,12 +340,6 @@ bool DirectRelay::collectClientHello() {
 
 // ---- Fragmentation ----
 
-void DirectRelay::setNoDelay(bool enabled) {
-    if (targetSock_ == INVALID_SOCKET) return;
-    int value = enabled ? 1 : 0;
-    setsockopt(targetSock_, IPPROTO_TCP, TCP_NODELAY, (const char*)&value, sizeof(value));
-}
-
 bool DirectRelay::writeFragmented(const strategy::FragmentPlan& plan) {
     const uint8_t* data = clientBuffer_.data();
     const uint8_t contentType = data[0];
@@ -382,20 +379,15 @@ bool DirectRelay::writeFragmented(const strategy::FragmentPlan& plan) {
 }
 
 bool DirectRelay::writePlan(const strategy::FragmentPlan& plan) {
-    // Each send() has to leave as its own segment, so Nagle must be off while
-    // we are laying out the fragments.
-    setNoDelay(true);
-
-    bool ok = true;
-
+    // TCP_NODELAY is on for the socket's whole life (connectTarget), so each
+    // send() below leaves as its own segment.
     if (helloComplete_ && plan.splitsAnything()) {
-        ok = writeFragmented(plan);
-    } else if (helloComplete_) {
-        ok = tcp::sendAll(targetSock_, clientBuffer_.data(), hello_.recordTotalLength);
+        return writeFragmented(plan);
     }
-
-    setNoDelay(false);
-    return ok;
+    if (helloComplete_) {
+        return tcp::sendAll(targetSock_, clientBuffer_.data(), hello_.recordTotalLength);
+    }
+    return true;
 }
 
 diagnosis::ProbeSignal DirectRelay::awaitResponse(std::vector<uint8_t>& out) {
@@ -430,6 +422,12 @@ diagnosis::ProbeSignal DirectRelay::awaitResponse(std::vector<uint8_t>& out) {
     return diagnosis::ProbeSignal::Unexpected;
 }
 
+bool DirectRelay::packetPolicyApplied() const {
+    // A no-op packet-* "win" (policy never rewrote a packet) must not be learned.
+    return context_.packetPolicies && armedLocalPort_ != 0 &&
+           context_.packetPolicies->consumeApplied(connectedAddress_, armedLocalPort_);
+}
+
 bool DirectRelay::flushTrailingClientData() {
     if (!helloComplete_ || hello_.spansRecords ||
         clientBuffer_.size() <= hello_.recordTotalLength) return true;
@@ -450,13 +448,25 @@ void DirectRelay::recordTelemetry(
     if (success && !verdict.winningProfile.empty()) {
         liveFlow_.setProfile(verdict.winningProfile);
     }
-    liveFlow_.decision(
-        success, success && verdict.winningProfile != "none");
+    // Only a verified bypass counts, matching the dashboard's definition:
+    // cache hits and transient successes also win with a non-"none" profile.
+    liveFlow_.decision(success, success && diagnosis::isVerifiedBypass(verdict.kind));
 
     if (!context_.telemetry) return;
 
+    // A healthy first-try baseline carries no information beyond its count and
+    // would fill the event cap within hours. The live counters above saw it;
+    // persist one in kHealthySampleRate so latency averages stay representative.
+    const bool healthy = success && evidence.size() == 1 &&
+                         verdict.kind == diagnosis::Kind::NoInterference &&
+                         verdict.winningProfile == "none" && rememberedProfile.empty();
+    if (healthy &&
+        healthySampleCounter.fetch_add(1, std::memory_order_relaxed) % kHealthySampleRate != 0) {
+        return;
+    }
+
     telemetry::ProbeRecord record;
-    record.networkId = context_.networkId;
+    record.networkId = networkId_;
     record.host = targetHost_;
     record.rememberedProfile = rememberedProfile;
     record.verdict = verdict;
@@ -491,11 +501,11 @@ bool DirectRelay::deliverHello() {
     // fragmented) still goes out rather than failing the connection.
     const std::vector<std::string> order =
         context_.forcedProfile.empty()
-            ? context_.strategies->probeOrder(context_.networkId, targetHost_, hello_)
+            ? context_.strategies->probeOrder(networkId_, targetHost_, hello_)
             : (context_.forcedProfile == "none"
                    ? std::vector<std::string>{"none"}
                    : std::vector<std::string>{context_.forcedProfile, "none"});
-    const std::string remembered = context_.strategies->lookup(context_.networkId, targetHost_);
+    const std::string remembered = context_.strategies->lookup(networkId_, targetHost_);
     const ULONGLONG decisionStarted = GetTickCount64();
 
     // A pinned profile is a controlled experiment, not learning: nothing it
@@ -505,7 +515,7 @@ bool DirectRelay::deliverHello() {
     if (learning) {
         diagnosisContext.rememberedProfile = remembered;
         diagnosisContext.baselineRecentlyHealthy =
-            context_.strategies->baselineRecentlyHealthy(context_.networkId, targetHost_);
+            context_.strategies->baselineRecentlyHealthy(networkId_, targetHost_);
     }
 
     // A failed remembered profile is only held against it once the whole
@@ -514,7 +524,7 @@ bool DirectRelay::deliverHello() {
     bool rememberedFailed = false;
     const auto settleFailure = [&]() {
         if (learning && rememberedFailed) {
-            context_.strategies->recordFailure(context_.networkId, targetHost_, remembered);
+            context_.strategies->recordFailure(networkId_, targetHost_, remembered);
         }
     };
 
@@ -527,6 +537,10 @@ bool DirectRelay::deliverHello() {
         strategy::FragmentPlan plan;
         const bool applicable = strategy::buildPlan(profile, hello_, context_.splitDelayMs, plan);
         if (!applicable && profile != "none") continue;
+
+        // Without a packet driver (manual mode) a packet-* profile would send the
+        // hello untouched: it can only "win" falsely, and a dead one costs a probe.
+        if (!context_.packetPolicies && isPacketProfile(profile)) continue;
 
         // Every retry needs a fresh connection: the previous one was reset or
         // blackholed, and the server has already seen a partial handshake.
@@ -542,6 +556,7 @@ bool DirectRelay::deliverHello() {
         }
         attempts++;
 
+        armedLocalPort_ = 0;
         packet_strategy::Policy packetPolicy;
         if (context_.packetPolicies &&
             packet_strategy::policyForProfile(profile, hello_, packetPolicy)) {
@@ -556,6 +571,7 @@ bool DirectRelay::deliverHello() {
                     localPort = ntohs(reinterpret_cast<sockaddr_in6*>(&local)->sin6_port);
                 }
             }
+            armedLocalPort_ = localPort;
             context_.packetPolicies->arm(connectedAddress_, localPort, packetPolicy);
         }
 
@@ -580,9 +596,9 @@ bool DirectRelay::deliverHello() {
                 // A healthy baseline has no state to learn, but it vouches for
                 // the host for a while and retires a winner that is no longer
                 // needed.
-                context_.strategies->noteBaselineHealthy(context_.networkId, targetHost_);
+                context_.strategies->noteBaselineHealthy(networkId_, targetHost_);
                 if (!remembered.empty()) {
-                    context_.strategies->remember(context_.networkId, targetHost_, profile,
+                    context_.strategies->remember(networkId_, targetHost_, profile,
                                                   verdict.kind, verdict.confidence);
                     spdlog::info("{}: baz cizgi yeniden gecti, '{}' profili unutuldu",
                                  targetHost_, remembered);
@@ -592,13 +608,16 @@ bool DirectRelay::deliverHello() {
                     spdlog::info("{}: teshis={} guven={}% sure={}ms", targetHost_,
                                  diagnosis::name(verdict.kind), verdict.confidence, elapsedMs);
                 }
+            } else if (isPacketProfile(profile) && !packetPolicyApplied()) {
+                spdlog::info("{}: '{}' yanit aldi ama paket politikasi uygulanmadi, ogrenilmedi ({}. deneme)",
+                             targetHost_, profile, attempts);
             } else if (verdict.kind == diagnosis::Kind::TransientFailure) {
                 spdlog::info("{}: gecici ag hatasi, '{}' ile devam edildi, ogrenilmedi ({}. deneme)",
                              targetHost_, profile, attempts);
             } else {
                 settleFailure();
                 const strategy::Store::Outcome learned = context_.strategies->remember(
-                    context_.networkId, targetHost_, profile, verdict.kind, verdict.confidence);
+                    networkId_, targetHost_, profile, verdict.kind, verdict.confidence);
                 if (learned == strategy::Store::Outcome::Candidate) {
                     // One differential is a suspicion. Until a later connection
                     // reproduces it, the record says so rather than "likely".
@@ -682,7 +701,13 @@ void DirectRelay::run() {
         closeSockets();
         return;
     }
+    setNoDelay(clientSock_);
     liveFlow_.begin(context_.liveStats.get());
+
+    // One lookup per connection: every learn/lookup/record below must agree
+    // on the network even if the machine roams while this flow is open.
+    networkId_ = context_.networkIdProvider ? context_.networkIdProvider() : std::string();
+    if (networkId_.empty()) networkId_ = context_.networkId;
 
     // Transparent connections initially carry only an IP address. Buffering
     // first lets us recover SNI, resolve it over the Worker, and keep adaptive
@@ -702,7 +727,7 @@ void DirectRelay::run() {
                                  tcp::sendAll(clientSock_, firstResponse_.data(),
                                               firstResponse_.size());
             releaseHandshakeBuffers();
-            if (flushed) pump();
+            if (flushed) pump(); else abortive_ = true;
             spdlog::trace("Baglanti kapandi: {}:{}", targetHost_, targetPort_);
         } else {
             handOffToTunnel(); // takes clientSock_ on success
@@ -771,6 +796,7 @@ void DirectRelay::pump() {
                 size_t sent = 0;
                 if (!sendSome(direction->to, direction->pending.data() + direction->offset,
                               direction->pending.size() - direction->offset, sent)) {
+                    abortive_ = true;
                     return;
                 }
                 if (sent > 0) lastActivity = GetTickCount64();
@@ -788,7 +814,10 @@ void DirectRelay::pump() {
                                         (int)buffer.size(), 0);
             if (received == SOCKET_ERROR) {
                 if (WSAGetLastError() == WSAEWOULDBLOCK) continue;
-                return; // reset or aborted: tear down both sides
+                // Reset or aborted: tear down both sides. The client is reset too,
+                // otherwise it reads a clean EOF and takes a cut-off body as complete.
+                abortive_ = true;
+                return;
             }
             lastActivity = GetTickCount64();
             if (received == 0) {
@@ -800,7 +829,10 @@ void DirectRelay::pump() {
             }
 
             size_t sent = 0;
-            if (!sendSome(direction->to, buffer.data(), (size_t)received, sent)) return;
+            if (!sendSome(direction->to, buffer.data(), (size_t)received, sent)) {
+                abortive_ = true;
+                return;
+            }
             if (sent < (size_t)received) {
                 direction->pending.assign(buffer.begin() + sent, buffer.begin() + received);
                 direction->offset = 0;
@@ -818,15 +850,16 @@ void DirectRelay::releaseHandshakeBuffers() {
 
 void DirectRelay::closeSockets() {
     std::lock_guard<std::mutex> lock(socketMutex_);
-    // An aborted connection is reset so the peer is told at once; a connection
-    // that ended on its own is closed gracefully to flush the last bytes.
-    const bool abort = stopping_.load();
+    // An aborted or failed connection is reset so the peer is told at once; a
+    // connection that ended on its own is closed gracefully to flush the last
+    // bytes.
+    const bool abort = stopping_.load() || abortive_;
     if (clientSock_ != INVALID_SOCKET) {
-        if (abort) closeAbortive(clientSock_); else closesocket(clientSock_);
+        if (abort) tcp::closeAbortive(clientSock_); else closesocket(clientSock_);
         clientSock_ = INVALID_SOCKET;
     }
     if (targetSock_ != INVALID_SOCKET) {
-        if (abort) closeAbortive(targetSock_); else closesocket(targetSock_);
+        if (abort) tcp::closeAbortive(targetSock_); else closesocket(targetSock_);
         targetSock_ = INVALID_SOCKET;
     }
 }

@@ -5,6 +5,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <format>
 #include <system_error>
 
@@ -111,6 +112,12 @@ void Relay::pumpWsToSock() {
     while (!stopping_) {
         const int received = ws_.receive(buffer, isText);
         if (received <= 0) break;
+        if (isText) {
+            // Control JSON from the Worker (e.g. an error just before it closes)
+            // is not payload; written to the client it would corrupt the TLS stream.
+            spdlog::warn("Tunel mesaji: {}", std::string(buffer.begin(), buffer.begin() + std::min<size_t>(buffer.size(), 256)));
+            continue;
+        }
         if (!tcp::sendAll(clientSock_, buffer.data(), (size_t)received)) break;
     }
     stop();

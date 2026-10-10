@@ -1,0 +1,1 @@
+{"success":true,"errors":[],"result":{"id":"0123456789abcdef0123456789abcdef","name":"a\"b\\c"},"accounts":[{"id":"fedcba9876543210fedcba9876543210","name":"Personal ü"}],"email":"can@example.com"}

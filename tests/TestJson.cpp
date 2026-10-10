@@ -59,6 +59,25 @@ TEST(BracesInsideStringsDoNotConfuseScoping) {
     CHECK_EQ(json::getString(json::getRaw(document, "result"), "id"), std::string("good"));
 }
 
+// A host called "a"/"aaaa"/"ttl" puts the key text in front of the real key as
+// a *value*; the lookup must keep scanning for the occurrence followed by ':'.
+TEST(FindsKeyEvenWhenAnEarlierValueEqualsIt) {
+    const std::string document =
+        R"({"host":"a","a":["1.2.3.4"],"aaaa":[],"ttl":300})";
+    const std::vector<std::string> v4 = json::getStringArray(document, "a");
+    CHECK_EQ(v4.size(), (size_t)1);
+    CHECK_EQ(v4[0], std::string("1.2.3.4"));
+
+    const std::string ttlHost = R"({"host":"ttl","ttl":120})";
+    CHECK_EQ(json::getInt(ttlHost, "ttl", 0), (long long)120);
+
+    const std::string aaaaHost = R"({"host":"aaaa","aaaa":["2001:db8::1"]})";
+    CHECK_EQ(json::getStringArray(aaaaHost, "aaaa").size(), (size_t)1);
+
+    // Only a value, never a key: still not found.
+    CHECK_EQ(json::getString(R"({"host":"a"})", "a"), std::string());
+}
+
 TEST(HandlesTruncatedInputWithoutReadingPastTheEnd) {
     CHECK_EQ(json::getString(R"({"a":"unterminated)", "a"), std::string("unterminated"));
     CHECK_EQ(json::getString(R"({"a")", "a"), std::string());

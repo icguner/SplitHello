@@ -1,5 +1,6 @@
 #include "Test.hpp"
 
+#include "FileUtil.hpp"
 #include "HelloBuilder.hpp"
 #include "Strategy.hpp"
 #include "TlsHello.hpp"
@@ -8,6 +9,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -40,6 +42,21 @@ void learn(strategy::Store& store, const std::string& network, const std::string
     const uint64_t first = at ? at : wallClockSeconds();
     store.remember(network, host, profile, diagnosis::Kind::SniInterferenceLikely, 92, first);
     store.remember(network, host, profile, diagnosis::Kind::SniInterferenceLikely, 92, first + 61);
+}
+
+void writeFile(const std::string& path, const std::string& content) {
+    std::FILE* file = nullptr;
+    fopen_s(&file, path.c_str(), "wb");
+    if (!file) throw std::runtime_error("cannot create " + path);
+    fwrite(content.data(), 1, content.size(), file);
+    fclose(file);
+}
+
+// strategies.json line for a version-2 entry; verifiedAt 0 marks a legacy one.
+std::string entryLine(const std::string& key, const std::string& profile,
+                      uint64_t expiresAt, uint64_t verifiedAt) {
+    return "\"" + key + "\":\"" + profile + ";sni-interference-likely;92;" +
+           std::to_string(expiresAt) + ";0;" + std::to_string(verifiedAt) + "\"";
 }
 
 } // namespace
@@ -513,4 +530,221 @@ TEST(StaleCandidateDoesNotConfirm) {
                          diagnosis::Kind::SniInterferenceLikely, 92, kEpoch + 7 * 3600) ==
           strategy::Store::Outcome::Candidate);
     CHECK_EQ(store.lookup("home", "rare.test"), std::string());
+}
+
+TEST(ReverifyWithFailingBaselineThenWinnerSucceedsIsReverified) {
+    strategy::Store store("");
+    const std::vector<uint8_t> data = buildClientHello();
+    const tls::ClientHello hello = parse(data);
+    learn(store, "home", "blocked.test", "sni-mid", kEpoch);
+    const uint64_t later = kEpoch + 61 + 31 * 60;
+
+    // Due for a re-check: baseline first, then the winner.
+    const std::vector<std::string> order =
+        store.probeOrder("home", "blocked.test", hello, later);
+    CHECK_EQ(order[0], std::string("none"));
+    CHECK_EQ(order[1], std::string("sni-mid"));
+
+    // The baseline failed again and the winner got through: the relay reports
+    // the differential and the winner re-proves itself instead of being replaced.
+    CHECK(store.remember("home", "blocked.test", "sni-mid",
+                         diagnosis::Kind::SniInterferenceLikely, 92, later + 3) ==
+          strategy::Store::Outcome::Reverified);
+    CHECK_EQ(store.lookup("home", "blocked.test"), std::string("sni-mid"));
+    CHECK_EQ(store.candidateCount(), (size_t)0);
+    CHECK_EQ(store.probeOrder("home", "blocked.test", hello, later + 60).front(),
+             std::string("sni-mid"));
+    CHECK_EQ(store.probeOrder("home", "blocked.test", hello, later + 3 + 31 * 60).front(),
+             std::string("none"));
+}
+
+TEST(StrikesInsideTheConfirmationGapNeverLearn) {
+    strategy::Store store("");
+
+    // A hiccup fails a burst of parallel connections within seconds.
+    for (uint64_t offset = 0; offset < 60; offset += 3) {
+        CHECK(store.remember("home", "burst.test", "sni-mid",
+                             diagnosis::Kind::SniInterferenceLikely, 92, kEpoch + offset) ==
+              strategy::Store::Outcome::Candidate);
+    }
+    CHECK_EQ(store.lookup("home", "burst.test"), std::string());
+    CHECK_EQ(store.size(), (size_t)0);
+
+    // The first strike's clock was never refreshed by the burst.
+    CHECK(store.remember("home", "burst.test", "sni-mid",
+                         diagnosis::Kind::SniInterferenceLikely, 92, kEpoch + 60) ==
+          strategy::Store::Outcome::Learned);
+}
+
+TEST(CandidatesAreCappedAndTheStalestIsEvictedFirst) {
+    strategy::Store store("");
+    constexpr size_t kCap = 1000;
+    const auto host = [](size_t i) { return "h" + std::to_string(i) + ".test"; };
+
+    for (size_t i = 0; i < kCap + 100; ++i) {
+        CHECK(store.remember("home", host(i), "sni-mid",
+                             diagnosis::Kind::SniInterferenceLikely, 92, kEpoch + i) ==
+              strategy::Store::Outcome::Candidate);
+    }
+    CHECK_EQ(store.candidateCount(), kCap);
+
+    // The oldest nomination is gone: its next strike starts over instead of
+    // confirming, however much later it arrives.
+    CHECK(store.remember("home", host(0), "sni-mid",
+                         diagnosis::Kind::SniInterferenceLikely, 92, kEpoch + 5000) ==
+          strategy::Store::Outcome::Candidate);
+    CHECK_EQ(store.candidateCount(), kCap);
+
+    // The newest one survived and still confirms.
+    CHECK(store.remember("home", host(kCap + 99), "sni-mid",
+                         diagnosis::Kind::SniInterferenceLikely, 92,
+                         kEpoch + kCap + 99 + 61) == strategy::Store::Outcome::Learned);
+}
+
+TEST(FullCacheEvictsTheOldestVerifiedWinnerNotARandomOne) {
+    strategy::Store store("");
+    constexpr size_t kCap = 1000;
+    const auto host = [](size_t i) { return "e" + std::to_string(i) + ".test"; };
+
+    for (size_t i = 0; i < kCap; ++i) {
+        learn(store, "home", host(i), "sni-mid", kEpoch + i * 200);
+    }
+    CHECK_EQ(store.size(), kCap);
+
+    learn(store, "home", host(kCap), "sni-mid", kEpoch + kCap * 200);
+    CHECK_EQ(store.size(), kCap);
+    CHECK_EQ(store.lookup("home", host(0)), std::string());
+    CHECK_EQ(store.lookup("home", host(1)), std::string("sni-mid"));
+    CHECK_EQ(store.lookup("home", host(kCap - 1)), std::string("sni-mid"));
+    CHECK_EQ(store.lookup("home", host(kCap)), std::string("sni-mid"));
+}
+
+TEST(CorruptOrPartialStrategyFilesLoadWhatIsIntact) {
+    const std::string path = tempStorePath("splithello_test_corrupt.json");
+    const uint64_t now = wallClockSeconds();
+    const std::string good = entryLine("home|a.test", "sni-mid", now + 3600, now);
+
+    // Torn write: the second value has no closing quote and must not be trusted.
+    std::filesystem::remove(path);
+    writeFile(path, "{\"version\":2,\"domains\":{" + good +
+                    ",\"home|b.test\":\"record-1;sni-interf");
+    {
+        strategy::Store store(path);
+        store.load();
+        CHECK_EQ(store.lookup("home", "a.test"), std::string("sni-mid"));
+        CHECK_EQ(store.lookup("home", "b.test"), std::string());
+        CHECK_EQ(store.candidateCount(), (size_t)0);
+    }
+
+    // Garbage and an empty file leave an empty, usable store.
+    for (const char* junk : {"", "not json at all {{{", "{\"domains\":{\"x\":",
+                             "{\"domains\":[1,2]}"}) {
+        writeFile(path, junk);
+        strategy::Store store(path);
+        store.load();
+        CHECK_EQ(store.size(), (size_t)0);
+        CHECK_EQ(store.candidateCount(), (size_t)0);
+        store.remember("after.test", "sni-mid");
+        CHECK_EQ(store.lookup("after.test"), std::string("sni-mid"));
+    }
+
+    // Fields that do not parse fall back to defaults and never earn trust.
+    writeFile(path, "{\"domains\":{\"home|c.test\":\"sni-mid;bogus-kind;abc;xyz;?;-5\"}}");
+    {
+        strategy::Store store(path);
+        store.load();
+        CHECK_EQ(store.lookup("home", "c.test"), std::string());
+    }
+
+    std::filesystem::remove(path);
+}
+
+TEST(DiskTimestampsAreClampedAndFutureVerificationIsNotTrusted) {
+    const std::string path = tempStorePath("splithello_test_clamp.json");
+    std::filesystem::remove(path);
+    const uint64_t now = wallClockSeconds();
+    const uint64_t farFuture = now + 365ULL * 86400ULL;
+    writeFile(path, "{\"version\":2,\"domains\":{" +
+                    entryLine("home|far.test", "sni-mid", farFuture, now) + "," +
+                    entryLine("home|skewed.test", "record-1", now + 3600,
+                              now + 10ULL * 86400ULL) + "}}");
+
+    const std::vector<uint8_t> data = buildClientHello();
+    const tls::ClientHello hello = parse(data);
+    strategy::Store store(path);
+    store.load();
+
+    // A verification stamp from the future proves nothing: candidate, not winner.
+    CHECK_EQ(store.lookup("home", "skewed.test"), std::string());
+    const std::vector<std::string> pending = store.probeOrder("home", "skewed.test", hello);
+    CHECK_EQ(pending[0], std::string("none"));
+    CHECK_EQ(pending[1], std::string("record-1"));
+
+    // The absurd expiry is cut to one TTL; saving shows what was kept.
+    CHECK_EQ(store.lookup("home", "far.test"), std::string("sni-mid"));
+    store.remember("trigger.test", "sni-mid");
+    std::string saved;
+    CHECK(fileutil::readAll(path, saved));
+    CHECK(saved.find(std::to_string(farFuture)) == std::string::npos);
+
+    std::filesystem::remove(path);
+}
+
+TEST(WallClockStepBackMakesAWinnerOverdueInsteadOfImmortal) {
+    strategy::Store store("");
+    const std::vector<uint8_t> data = buildClientHello();
+    const tls::ClientHello hello = parse(data);
+    learn(store, "home", "blocked.test", "sni-mid", kEpoch);
+
+    // The persisted stamp is hours ahead of the (stepped-back) clock.
+    CHECK_EQ(store.probeOrder("home", "blocked.test", hello, kEpoch - 3 * 3600).front(),
+             std::string("none"));
+}
+
+TEST(LegacyCandidatesSurviveSavesUntilPromotedOrCancelled) {
+    const std::string path = tempStorePath("splithello_test_legacy_persist.json");
+    std::filesystem::remove(path);
+    const uint64_t now = wallClockSeconds();
+    const std::vector<uint8_t> data = buildClientHello();
+    const tls::ClientHello hello = parse(data);
+    writeFile(path, "{\"version\":2,\"domains\":{" +
+                    entryLine("home|old.test", "record-1", now + 3600, 0) + "}}");
+
+    const auto isPending = [&](const std::string& host) {
+        strategy::Store reloaded(path);
+        reloaded.load();
+        const std::vector<std::string> order =
+            reloaded.probeOrder("home", host, hello, now + 60);
+        return order.size() >= 2 && order[0] == "none" && order[1] == "record-1";
+    };
+
+    strategy::Store store(path);
+    store.load();
+    CHECK(isPending("old.test"));
+
+    // An unrelated save rewrites the file; the nomination must still be in it.
+    learn(store, "home", "other.test", "sni-mid", now);
+    CHECK(isPending("old.test"));
+
+    // A healthy baseline cancels it for good.
+    store.noteBaselineHealthy("home", "old.test");
+    CHECK(!isPending("old.test"));
+
+    std::filesystem::remove(path);
+}
+
+TEST(SequentialSavesLeaveTheNewestStateOnDisk) {
+    const std::string path = tempStorePath("splithello_test_snapshot_order.json");
+    std::filesystem::remove(path);
+
+    strategy::Store store(path);
+    store.remember("first.test", "sni-mid");
+    store.remember("second.test", "record-1");
+
+    strategy::Store reloaded(path);
+    reloaded.load();
+    CHECK_EQ(reloaded.lookup("first.test"), std::string("sni-mid"));
+    CHECK_EQ(reloaded.lookup("second.test"), std::string("record-1"));
+
+    std::filesystem::remove(path);
 }

@@ -93,9 +93,13 @@ private:
                    std::string& originalAddress, uint16_t& connectPort);
 
     // Protocol handlers
-    bool socks5Handshake(SOCKET sock, std::string& targetHost, uint16_t& targetPort);
-    bool httpConnectHandshake(SOCKET sock, std::string& targetHost, uint16_t& targetPort);
+    // `deadline` is a GetTickCount64() value bounding the whole handshake.
+    bool socks5Handshake(SOCKET sock, std::string& targetHost, uint16_t& targetPort,
+                         ULONGLONG deadline);
+    bool httpConnectHandshake(SOCKET sock, std::string& targetHost, uint16_t& targetPort,
+                              ULONGLONG deadline);
 
-    static bool recvExact(SOCKET sock, uint8_t* buf, int n);
-    static std::string recvLine(SOCKET sock); // read until \r\n
+    static bool recvExact(SOCKET sock, uint8_t* buf, int n, ULONGLONG deadline);
+    // Reads one line without its \r\n; false on timeout, close or an over-long line.
+    static bool recvLine(SOCKET sock, std::string& line, ULONGLONG deadline);
 };

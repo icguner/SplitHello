@@ -15,12 +15,13 @@ namespace live_stats {
 namespace {
 
 constexpr LONG kMagic = 0x53484C53; // SHLS
-constexpr LONG kVersion = 1;
+constexpr LONG kVersion = 2;
 constexpr size_t kMaxProfiles = 16;
 
 struct SharedState {
     volatile LONG magic = 0;
     LONG version = 0;
+    LONG size = 0;          // sizeof(SharedState) of the writer: a layout mismatch reads as offline
     LONG enginePid = 0;
     LONG startedAt = 0;
     volatile LONG activeFlows = 0;
@@ -40,8 +41,15 @@ uint32_t unixSeconds32() {
     return static_cast<uint32_t>(std::clamp<int64_t>(seconds, 0, 0x7FFFFFFF));
 }
 
+// Gauges (active flows/profiles) can transiently dip below zero under races.
 uint32_t nonNegative(LONG value) {
     return value < 0 ? 0U : static_cast<uint32_t>(value);
+}
+
+// Cumulative counters only ever increase: read them as unsigned so they wrap
+// at 2^32 instead of reading as 0 once the signed value overflows at 2^31.
+uint32_t cumulative(LONG value) {
+    return static_cast<uint32_t>(value);
 }
 
 } // namespace
@@ -63,6 +71,9 @@ Publisher::Publisher(std::wstring mappingName)
     : impl_(std::make_unique<Impl>()) {
     if (mappingName.empty()) return;
 
+    // shortcut: default (token) DACL, i.e. Administrators + SYSTEM for the
+    // elevated engine; revisit with an explicit descriptor if it ever runs
+    // unelevated or the tray stops running elevated.
     impl_->mapping = CreateFileMappingW(
         INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
         static_cast<DWORD>(sizeof(SharedState)), mappingName.c_str());
@@ -76,6 +87,7 @@ Publisher::Publisher(std::wstring mappingName)
     // never runs two engines for that name, so a new publisher owns/reset it.
     ZeroMemory(impl_->state, sizeof(SharedState));
     impl_->state->version = kVersion;
+    impl_->state->size = static_cast<LONG>(sizeof(SharedState));
     impl_->state->enginePid = static_cast<LONG>(GetCurrentProcessId());
     impl_->state->startedAt = static_cast<LONG>(unixSeconds32());
     InterlockedExchange(&impl_->state->magic, kMagic);
@@ -181,17 +193,18 @@ Snapshot read(std::wstring_view mappingName) {
         return snapshot;
     }
 
-    if (state->magic == kMagic && state->version == kVersion) {
+    if (state->magic == kMagic && state->version == kVersion &&
+        state->size == static_cast<LONG>(sizeof(SharedState))) {
         snapshot.online = true;
         snapshot.enginePid = nonNegative(state->enginePid);
         snapshot.startedAt = nonNegative(state->startedAt);
         snapshot.activeFlows = nonNegative(state->activeFlows);
-        snapshot.openedFlows = nonNegative(state->openedFlows);
-        snapshot.decisions = nonNegative(state->decisions);
-        snapshot.successfulDecisions = nonNegative(state->successfulDecisions);
-        snapshot.bypassedDecisions = nonNegative(state->bypassedDecisions);
-        snapshot.unresolvedDecisions = nonNegative(state->unresolvedDecisions);
-        snapshot.lastDecisionAt = nonNegative(state->lastDecisionAt);
+        snapshot.openedFlows = cumulative(state->openedFlows);
+        snapshot.decisions = cumulative(state->decisions);
+        snapshot.successfulDecisions = cumulative(state->successfulDecisions);
+        snapshot.bypassedDecisions = cumulative(state->bypassedDecisions);
+        snapshot.unresolvedDecisions = cumulative(state->unresolvedDecisions);
+        snapshot.lastDecisionAt = cumulative(state->lastDecisionAt);
 
         uint32_t classifiedActive = 0;
         const auto& table = strategy::profiles();
@@ -201,7 +214,7 @@ Snapshot read(std::wstring_view mappingName) {
             ProfileSnapshot profile;
             profile.name = table[index].name;
             profile.active = nonNegative(state->activeProfiles[index]);
-            profile.decisions = nonNegative(state->profileDecisions[index]);
+            profile.decisions = cumulative(state->profileDecisions[index]);
             classifiedActive += profile.active;
             snapshot.profiles.push_back(std::move(profile));
         }

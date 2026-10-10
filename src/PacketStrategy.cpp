@@ -10,14 +10,12 @@ namespace packet_strategy {
 namespace {
 
 constexpr uint64_t kPolicyTtlMs = 15000;
+constexpr uint64_t kAppliedTtlMs = 60000;
+constexpr uint64_t kPruneIntervalMs = 1000;
 constexpr size_t kMaxEntries = 8192;
 
 uint64_t clockMs(uint64_t supplied) {
     return supplied == 0 ? GetTickCount64() : supplied;
-}
-
-std::string key(const std::string& address, uint16_t port) {
-    return address + "|" + std::to_string(port);
 }
 
 void append16(std::vector<uint8_t>& out, uint16_t value) {
@@ -71,6 +69,10 @@ bool policyForProfile(const std::string& profile, const tls::ClientHello& hello,
     // The ClientHello may span several IP packets. The interceptor clamps this
     // stream-relative hint into the first packet if the SNI is not there yet.
     out.splitOffset = std::max<size_t>(2, preferredSplit);
+    if (hello.hasSni()) {
+        out.sniBegin = hello.sniOffset;
+        out.sniEnd = hello.sniOffset + hello.sniLength;
+    }
     return true;
 }
 
@@ -113,10 +115,20 @@ std::vector<uint8_t> buildFakeClientHello(const std::string& hostname) {
     return record;
 }
 
+size_t segmentSplit(const Policy& policy, size_t length) {
+    if (length < 2) return 0;
+    return std::clamp(policy.splitOffset, (size_t)1, length - 1);
+}
+
+bool splitsSni(const Policy& policy, size_t split) {
+    return policy.sniEnd == 0 ||
+        (split > policy.sniBegin && split < policy.sniEnd);
+}
+
 std::vector<Segment> buildSegments(const uint8_t* payload, size_t length,
                                    const Policy& policy) {
     if (!payload || length < 2) return {};
-    const size_t split = std::clamp(policy.splitOffset, (size_t)1, length - 1);
+    const size_t split = segmentSplit(policy, length);
 
     if (policy.mode == Mode::ReverseOrder) {
         return {
@@ -142,6 +154,36 @@ std::vector<Segment> buildSegments(const uint8_t* payload, size_t length,
     return {};
 }
 
+size_t ipv4FragmentBoundary(size_t transportHeaderLength, const Policy& policy,
+                            size_t payloadLength) {
+    if (payloadLength < 2) return 0;
+    // Cut offsets that leave bytes on both sides, and that cut the hostname.
+    size_t lo = 1;
+    size_t hi = payloadLength - 1;
+    if (policy.sniEnd > policy.sniBegin) {
+        lo = std::max(lo, policy.sniBegin + 1);
+        hi = std::min(hi, policy.sniEnd - 1);
+    }
+    if (lo > hi) return 0;
+
+    const size_t target = transportHeaderLength + std::clamp(policy.splitOffset, lo, hi);
+    const size_t down = target & ~(size_t)7;
+    const size_t up = (target + 7) & ~(size_t)7;
+    const auto distance = [target](size_t value) {
+        return value > target ? value - target : target - value;
+    };
+
+    size_t best = 0;
+    for (const size_t candidate : {down, up}) {
+        if (candidate < transportHeaderLength + lo ||
+            candidate > transportHeaderLength + hi) {
+            continue;
+        }
+        if (best == 0 || distance(candidate) < distance(best)) best = candidate;
+    }
+    return best;
+}
+
 std::vector<std::vector<uint8_t>> buildIpv4Fragments(
     const uint8_t* packet, size_t length, size_t ipHeaderLength,
     size_t firstFragmentEnd) {
@@ -155,6 +197,8 @@ std::vector<std::vector<uint8_t>> buildIpv4Fragments(
         (uint16_t)(((uint16_t)packet[6] << 8) | packet[7]);
     if ((existingFragment & 0x3FFF) != 0) return {};
 
+    // Fragment offsets count 8-byte units; callers that care where the cut
+    // lands pass a multiple of 8 (see ipv4FragmentBoundary).
     const size_t ipPayloadLength = length - ipHeaderLength;
     size_t firstPayloadLength = firstFragmentEnd - ipHeaderLength;
     firstPayloadLength = (firstPayloadLength + 7) & ~(size_t)7;
@@ -192,72 +236,158 @@ std::vector<std::vector<uint8_t>> buildIpv4Fragments(
     return {std::move(first), std::move(second)};
 }
 
+template <typename Map>
+void PolicyRegistry::makeRoomLocked(Map& entries, uint64_t nowMs) {
+    std::erase_if(entries, [nowMs](const auto& item) {
+        return item.second.expiresAtMs <= nowMs;
+    });
+    if (entries.size() < kMaxEntries) return;
+    // Genuinely full of live entries: drop the one closest to expiry instead
+    // of wiping the table and every in-flight policy with it.
+    const auto oldest = std::min_element(
+        entries.begin(), entries.end(), [](const auto& left, const auto& right) {
+            return left.second.expiresAtMs < right.second.expiresAtMs;
+        });
+    if (oldest != entries.end()) entries.erase(oldest);
+}
+
+// Lookups check their own entry's expiry, so this sweep only bounds memory and
+// does not have to run for every packet of the hot path.
+void PolicyRegistry::pruneIfDueLocked(uint64_t nowMs) {
+    if (nowMs < nextPruneMs_) return;
+    nextPruneMs_ = nowMs + kPruneIntervalMs;
+    const auto expired = [nowMs](const auto& item) {
+        return item.second.expiresAtMs <= nowMs;
+    };
+    std::erase_if(policies_, expired);
+    std::erase_if(hops_, expired);
+}
+
 void PolicyRegistry::arm(const std::string& targetAddress, uint16_t sourcePort,
                          const Policy& policy, uint64_t nowMs) {
-    if (targetAddress.empty() || sourcePort == 0 || policy.mode == Mode::None) return;
+    Address address;
+    if (sourcePort == 0 || policy.mode == Mode::None ||
+        !transparent::parseAddress(targetAddress, address)) {
+        return;
+    }
     const uint64_t now = clockMs(nowMs);
+    const transparent::PeerKey entryKey{address, sourcePort, 0};
     std::lock_guard lock(mutex_);
-    pruneLocked(now);
-    if (policies_.size() >= kMaxEntries) policies_.clear();
-    policies_[key(targetAddress, sourcePort)] = {policy, now + kPolicyTtlMs};
+    pruneIfDueLocked(now);
+    if (policies_.size() >= kMaxEntries && !policies_.contains(entryKey)) {
+        makeRoomLocked(policies_, now);
+    }
+    policies_[entryKey] = Entry{policy, now + kPolicyTtlMs};
 }
 
 void PolicyRegistry::observeHop(const std::string& targetAddress,
                                 uint16_t sourcePort, uint8_t receivedTtl,
                                 uint64_t nowMs) {
-    if (targetAddress.empty() || sourcePort == 0 || receivedTtl == 0) return;
+    Address address;
+    if (transparent::parseAddress(targetAddress, address)) {
+        observeHop(address, sourcePort, receivedTtl, nowMs);
+    }
+}
+
+void PolicyRegistry::observeHop(const Address& target, uint16_t sourcePort,
+                                uint8_t receivedTtl, uint64_t nowMs) {
+    if (sourcePort == 0 || receivedTtl == 0) return;
     const uint8_t hops = inferPathHops(receivedTtl);
     if (hops == 0) return;
 
     const uint64_t now = clockMs(nowMs);
+    const transparent::PeerKey entryKey{target, sourcePort, 0};
     std::lock_guard lock(mutex_);
-    pruneLocked(now);
-    if (hops_.size() >= kMaxEntries) hops_.clear();
-    hops_[key(targetAddress, sourcePort)] = {hops, now + kPolicyTtlMs};
+    pruneIfDueLocked(now);
+    if (hops_.size() >= kMaxEntries && !hops_.contains(entryKey)) {
+        makeRoomLocked(hops_, now);
+    }
+    hops_[entryKey] = {hops, now + kPolicyTtlMs};
 }
 
 std::optional<Policy> PolicyRegistry::take(const std::string& targetAddress,
+                                           uint16_t sourcePort, uint64_t nowMs) {
+    Address address;
+    if (!transparent::parseAddress(targetAddress, address)) return std::nullopt;
+    return take(address, sourcePort, std::nullopt, nowMs);
+}
+
+std::optional<Policy> PolicyRegistry::take(const Address& target,
                                            uint16_t sourcePort,
+                                           std::optional<uint32_t> sequence,
                                            uint64_t nowMs) {
     const uint64_t now = clockMs(nowMs);
+    const transparent::PeerKey entryKey{target, sourcePort, 0};
     std::lock_guard lock(mutex_);
-    pruneLocked(now);
 
-    const std::string entryKey = key(targetAddress, sourcePort);
     const auto found = policies_.find(entryKey);
     if (found == policies_.end()) return std::nullopt;
+    Entry& entry = found->second;
+    if (entry.expiresAtMs <= now) {
+        policies_.erase(found);
+        return std::nullopt;
+    }
 
-    Policy policy = found->second.policy;
-    policies_.erase(found);
-    if (policy.mode == Mode::FakeAutoTtl) {
+    if (entry.taken) {
+        // A retransmitted ClientHello must get the same treatment as the
+        // original; sending it clear would leak the SNI the profile hides.
+        if (sequence && entry.hasSequence && entry.sequence == *sequence) {
+            return entry.policy;
+        }
+        return std::nullopt;
+    }
+
+    entry.taken = true;
+    if (sequence) {
+        entry.hasSequence = true;
+        entry.sequence = *sequence;
+    }
+    if (entry.policy.mode == Mode::FakeAutoTtl) {
         const auto hop = hops_.find(entryKey);
-        if (hop == hops_.end() || hop->second.pathHops < 3) {
+        if (hop == hops_.end() || hop->second.expiresAtMs <= now ||
+            hop->second.pathHops < 3) {
             // Never let a missing SYN/ACK sample turn the AutoTTL profile into
             // an untouched hello that could be learned as a false winner.
-            policy.mode = Mode::FakeBadSequence;
-            policy.fakeSequenceDelta = -10000;
+            entry.policy.mode = Mode::FakeBadSequence;
+            entry.policy.fakeSequenceDelta = -10000;
         } else {
-            policy.fakeTtl = (uint8_t)std::max<unsigned>(2, hop->second.pathHops - 1);
+            entry.policy.fakeTtl =
+                (uint8_t)std::max<unsigned>(2, hop->second.pathHops - 1);
         }
     }
-    return policy;
+    return entry.policy;
+}
+
+void PolicyRegistry::noteApplied(const Address& target, uint16_t sourcePort,
+                                 uint64_t nowMs) {
+    const uint64_t now = clockMs(nowMs);
+    std::lock_guard lock(mutex_);
+    const auto found = policies_.find(transparent::PeerKey{target, sourcePort, 0});
+    if (found == policies_.end()) return;
+    found->second.applied = true;
+    // Outlive the probe: the prober asks only after it saw the server answer.
+    found->second.expiresAtMs =
+        std::max(found->second.expiresAtMs, now + kAppliedTtlMs);
+}
+
+bool PolicyRegistry::consumeApplied(const std::string& targetAddress,
+                                    uint16_t sourcePort, uint64_t nowMs) {
+    Address address;
+    if (!transparent::parseAddress(targetAddress, address)) return false;
+    const uint64_t now = clockMs(nowMs);
+    std::lock_guard lock(mutex_);
+    const auto found = policies_.find(transparent::PeerKey{address, sourcePort, 0});
+    if (found == policies_.end()) return false;
+    const bool applied = found->second.applied && found->second.expiresAtMs > now;
+    policies_.erase(found);
+    return applied;
 }
 
 void PolicyRegistry::clear() {
     std::lock_guard lock(mutex_);
     policies_.clear();
     hops_.clear();
-}
-
-void PolicyRegistry::pruneLocked(uint64_t nowMs) {
-    const auto prune = [nowMs](auto& entries) {
-        for (auto it = entries.begin(); it != entries.end();) {
-            if (it->second.expiresAtMs <= nowMs) it = entries.erase(it);
-            else ++it;
-        }
-    };
-    prune(policies_);
-    prune(hops_);
+    nextPruneMs_ = 0;
 }
 
 } // namespace packet_strategy

@@ -46,28 +46,44 @@ unsigned automaticRestartDelayMs(unsigned attemptNumber) {
     return std::min(kInitialDelayMs << shift, kMaximumDelayMs);
 }
 
-bool WorkerHealth::observe(int httpStatus, uint64_t nowMs) {
-    constexpr uint64_t kFailureWindowMs = 30'000;
-    constexpr unsigned kFailureThreshold = 3;
-    const bool failed = httpStatus < 0 || httpStatus == 401 ||
-        httpStatus == 403 || httpStatus == 429 || httpStatus >= 500;
+bool WorkerHealth::observe(int httpStatus, uint64_t nowMs, unsigned retryAfterSeconds) {
     std::lock_guard lock(mutex_);
     if (unavailable_) return true;
+
+    if (httpStatus == 429) {
+        // Alive but rate limiting us: neither a failure nor proof of recovery.
+        const uint64_t requested = retryAfterSeconds != 0
+            ? (uint64_t)retryAfterSeconds * 1000 : kRateLimitDefaultBackoffMs;
+        backoffUntilMs_ = std::max(backoffUntilMs_,
+                                   nowMs + std::min(requested, kRateLimitMaxBackoffMs));
+        return false;
+    }
+
+    const bool failed = httpStatus < 0 || httpStatus == 401 ||
+        httpStatus == 403 || httpStatus >= 500;
     if (!failed) {
         failures_ = 0;
         return false;
     }
-    if (failures_ == 0 || nowMs - lastFailureMs_ > kFailureWindowMs) {
+    if (failures_ == 0 || nowMs - lastFailureMs_ > kWorkerFailureGapMs) {
         failures_ = 0;
+        streakStartMs_ = nowMs;
     }
     lastFailureMs_ = nowMs;
-    unavailable_ = ++failures_ >= kFailureThreshold;
+    ++failures_;
+    unavailable_ = failures_ >= kWorkerFailureThreshold &&
+                   nowMs - streakStartMs_ >= kWorkerMinStreakMs;
     return unavailable_;
 }
 
 bool WorkerHealth::unavailable() const {
     std::lock_guard lock(mutex_);
     return unavailable_;
+}
+
+bool WorkerHealth::backingOff(uint64_t nowMs) const {
+    std::lock_guard lock(mutex_);
+    return nowMs < backoffUntilMs_;
 }
 
 RestartBudget::RestartBudget(unsigned maxAttempts, uint64_t windowMs)

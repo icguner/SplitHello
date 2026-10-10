@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -26,6 +27,11 @@ struct RelayContext {
     std::string workerUrl;
     std::string sharedSecret;
     std::string networkId = "network-default";
+
+    // When set, asked once per connection so a laptop that roams between
+    // networks learns and records under the network it is on now. Falls back
+    // to networkId when unset or when it returns an empty string.
+    std::function<std::string()> networkIdProvider;
     dns::Resolver* resolver = nullptr;
     strategy::Store* strategies = nullptr;
     packet_strategy::PolicyRegistry* packetPolicies = nullptr;
@@ -40,6 +46,10 @@ struct RelayContext {
     // this long is closed. Abandoned flows would otherwise hold a thread, two
     // sockets and their buffers for as long as the process lives.
     unsigned idleTimeoutMs = 10 * 60 * 1000;
+
+    // Manual SOCKS5/CONNECT only: the client must finish its handshake within
+    // this long, so a silent local process cannot pin a connection slot.
+    unsigned handshakeTimeoutMs = 10 * 1000;
 
     // When set, this profile is used for every connection and nothing is
     // probed or learned. Debugging aid for comparing profiles on one network.
@@ -64,6 +74,12 @@ struct RelayContext {
 // stop() and know exactly when it has finished.
 class DirectRelay {
 public:
+    // Healthy single-attempt flows (baseline 'none' succeeded, nothing learned
+    // or remembered) are persisted to telemetry 1 in N only; the live counters
+    // still see every one. A dashboard that wants the true count of such
+    // events multiplies the persisted ones by this.
+    static constexpr unsigned kHealthySampleRate = 20;
+
     // Takes ownership of clientSock.
     DirectRelay(SOCKET clientSock, const RelayContext& context,
                 std::string targetHost, uint16_t targetPort,
@@ -92,6 +108,9 @@ private:
     uint16_t targetPort_;
     std::string originalTargetAddress_;
     uint16_t connectPort_;
+    std::string networkId_;                 // resolved once at the start of run()
+    uint16_t armedLocalPort_ = 0;           // local port of the last armed packet policy
+    bool abortive_ = false;                 // pump ended on an error: reset the client
 
     std::vector<std::string> candidates_;   // resolved addresses, in connect order
     std::string connectedAddress_;
@@ -131,14 +150,19 @@ private:
     diagnosis::ProbeSignal awaitResponse(std::vector<uint8_t>& out);
     bool flushTrailingClientData();
 
+    // Whether the packet policy armed for the current attempt actually changed
+    // the traffic. A packet-* profile can draw a ServerHello without the driver
+    // having touched a single packet, which is not evidence the profile works;
+    // this is the one gate that decides if such a winner may be credited.
+    bool packetPolicyApplied() const;
+
     // Last resort: hand the connection to the Worker's WebSocket relay. Runs
     // the tunnel on this thread and takes ownership of clientSock_ on success.
     bool handOffToTunnel();
 
-    void setNoDelay(bool enabled);
-
     // Moves bytes in both directions on this thread until either side has
     // finished, an error occurs, the idle timeout expires or stop() is called.
+    // An error (reset, failed send) sets abortive_ so the client is reset too.
     void pump();
 
     // The handshake buffers are only needed until the first bytes are
