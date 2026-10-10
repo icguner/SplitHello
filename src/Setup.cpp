@@ -77,7 +77,10 @@ std::optional<std::string> selectAccount(const wrangler::Identity& identity,
 }
 
 // End-to-end check that the deployment works *and* that our secret matches.
-bool verifyDeployment(const std::string& workerUrl, const std::string& sharedSecret) {
+// A freshly written secret takes a few seconds to reach every edge, so a 401 is
+// expected at first; the caller decides when it has become a real failure.
+bool verifyDeployment(const std::string& workerUrl, const std::string& sharedSecret,
+                      int& status) {
     const std::string host = http::hostFromUrl(workerUrl);
     if (host.empty()) return false;
 
@@ -89,11 +92,7 @@ bool verifyDeployment(const std::string& workerUrl, const std::string& sharedSec
 
     const http::Response response = http::perform(request);
     secure::wipe(request.headers.back().second);   // the "Bearer <secret>" copy
-    if (response.status == 401 || response.status == 403) {
-        std::cerr << "\n" << console::red("Worker gizli anahtari kabul etmedi (HTTP " +
-                                          std::to_string(response.status) + ").") << "\n";
-        return false;
-    }
+    status = response.status;
     if (!response.ok()) return false;
     return !json::getStringArray(response.body, "a").empty();
 }
@@ -131,8 +130,9 @@ bool deployAndVerify(Config& config, const wrangler::Client& client) {
     }
 
     step(6, "Uctan uca dogrulaniyor...");
-    for (int attempt = 0; attempt < 5; ++attempt) {
-        if (verifyDeployment(config.workerUrl, config.sharedSecret)) {
+    int status = 0;
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        if (verifyDeployment(config.workerUrl, config.sharedSecret, status)) {
             stepOk();
             return true;
         }
@@ -140,6 +140,10 @@ bool deployAndVerify(Config& config, const wrangler::Client& client) {
     }
 
     stepFailed();
+    if (status == 401 || status == 403) {
+        std::cerr << console::red("Worker gizli anahtari kabul etmedi (HTTP " +
+                                  std::to_string(status) + ").") << "\n";
+    }
     std::cerr << console::yellow("Worker yuklendi ama henuz yanit vermiyor.") << "\n"
               << console::dim("Yeni anahtar kaydedildi; biraz sonra tekrar deneyin veya --redeploy "
                               "calistirin.") << "\n";
