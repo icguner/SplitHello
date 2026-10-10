@@ -1,5 +1,6 @@
 #include "Test.hpp"
 
+#include "Console.hpp"
 #include "Wrangler.hpp"
 
 #include <string>
@@ -59,4 +60,13 @@ TEST(ValidatesCloudflareWorkerNames) {
     CHECK(!wrangler::isValidWorkerName("relay-"));
     CHECK(!wrangler::isValidWorkerName("relay;whoami"));
     CHECK(!wrangler::isValidWorkerName(std::string(64, 'a')));
+}
+
+TEST(ExtractsLastWranglerErrorLineWithoutAnsi) {
+    const std::string output =
+        "banner\r\n"
+        "\x1b[31mX \x1b[41;31m[\x1b[41;97mERROR\x1b[41;31m]\x1b[0m \x1b[1mError: Consent denied.\x1b[0m\r\n"
+        "  more text\r\n";
+    CHECK_EQ(console::lastErrorLine(output), std::string("Consent denied."));
+    CHECK(console::lastErrorLine("all good\n").empty());
 }

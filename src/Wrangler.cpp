@@ -1,5 +1,6 @@
 #include "Wrangler.hpp"
 
+#include "Console.hpp"
 #include "FileUtil.hpp"
 #include "Json.hpp"
 
@@ -421,13 +422,19 @@ bool ensureKeyringBinding(const std::wstring& node, const std::wstring& npxCli) 
         }
     }
 
-    std::cout << "Windows anahtar zinciri modulu (@napi-rs/keyring) kuruluyor...\n";
+    std::cout << console::dim("  Windows anahtar zinciri modulu kuruluyor (bir kerelik)...") << "\n";
     const ProcessResult install = runProcess(
         node,
         {npmCli.wstring(), L"install", L"-g", L"@napi-rs/keyring@" + std::wstring(kKeyringVersion),
          L"--no-audit", L"--no-fund", L"--loglevel=error"},
-        {}, {}, true, kProbeTimeoutMs);
-    if (!install.ok()) std::cerr << "@napi-rs/keyring kurulamadi.\n";
+        {}, {}, false, kProbeTimeoutMs);
+    spdlog::debug("npm install keyring (exit={}): {}", install.exitCode, install.output);
+    if (!install.ok()) {
+        std::cerr << console::red("Anahtar zinciri modulu kurulamadi.") << " "
+                  << console::dim("Elle: npm install -g @napi-rs/keyring@" +
+                                  std::string(kKeyringVersion.begin(), kKeyringVersion.end()))
+                  << "\n";
+    }
     return install.ok();
 }
 
@@ -539,11 +546,22 @@ bool Client::available(std::string& error) const {
 
 bool Client::loginWithKeyring() const {
     if (!ensureKeyringBinding(nodePath_, npxCliPath_)) return false;
+    // Wrangler's own output (banner, long OAuth URL, stack-ish errors) is noise
+    // here: keep it for --verbose and surface only the reason on failure.
     const ProcessResult result = runProcess(
-        nodePath_, npxArguments(npxCliPath_, {L"login", L"--use-keyring"}), {}, {}, true,
+        nodePath_, npxArguments(npxCliPath_, {L"login", L"--use-keyring"}), {}, {}, false,
         kLoginTimeoutMs);
-    if (result.timedOut) std::cerr << "Wrangler OAuth girisi zaman asimina ugradi.\n";
-    return result.ok();
+    spdlog::debug("wrangler login (exit={}): {}", result.exitCode, result.output);
+    if (result.ok()) return true;
+    if (result.timedOut) {
+        std::cerr << console::red("Cloudflare girisi zaman asimina ugradi.") << "\n";
+    } else {
+        std::string reason = console::lastErrorLine(result.output);
+        if (reason.rfind("Consent denied", 0) == 0) reason = "Cloudflare'de izin verilmedi.";
+        std::cerr << console::red(reason.empty() ? "Cloudflare girisi tamamlanamadi." : reason)
+                  << "\n";
+    }
+    return false;
 }
 
 std::optional<Identity> Client::whoami() const {
@@ -597,7 +615,7 @@ DeployResult Client::deploy(const std::string& accountId,
                           npxArguments(npxCliPath_,
                                        {L"deploy", L"--config", configPath.wstring(),
                                         L"--no-autoconfig"}),
-                          directory.path().wstring(), {}, true, kDeployTimeoutMs);
+                          directory.path().wstring(), {}, false, kDeployTimeoutMs);
     };
 
     ProcessResult codeResult = deployCode();
@@ -605,10 +623,10 @@ DeployResult Client::deploy(const std::string& accountId,
     if (!codeResult.ok()) {
         // Any failure lands here, not only a rejected binding, so say plainly
         // what the retry gives up instead of burying it in the debug log.
-        std::cerr << "UYARI: Worker deploy edilemedi; hesap duzeyindeki rate limit binding'i "
-                     "olmadan bir kez daha deneniyor.\n"
-                     "Basarili olursa Worker'in yalnizca isolate basina yedek sayaci olur "
-                     "(hesap capinda hiz siniri yok).\n";
+        spdlog::debug("wrangler deploy (exit={}): {}", codeResult.exitCode, codeResult.output);
+        std::cerr << console::yellow("Deploy basarisiz; hesap duzeyindeki hiz siniri olmadan "
+                                     "bir kez daha deneniyor.")
+                  << "\n";
         if (!fileutil::writeAtomic(configFile,
                                    makeWranglerConfig(accountId, workerName, false))) {
             return deployment;
@@ -617,7 +635,11 @@ DeployResult Client::deploy(const std::string& accountId,
         deployedWithoutRateLimiter = codeResult.ok();
     }
     if (!codeResult.ok()) {
-        if (codeResult.timedOut) std::cerr << "Wrangler deploy zaman asimina ugradi.\n";
+        spdlog::debug("wrangler deploy (exit={}): {}", codeResult.exitCode, codeResult.output);
+        const std::string reason = console::lastErrorLine(codeResult.output);
+        std::cerr << console::red(codeResult.timedOut ? "Deploy zaman asimina ugradi."
+                                  : reason.empty() ? "Deploy basarisiz." : reason)
+                  << "\n";
         return deployment;
     }
 
@@ -627,16 +649,22 @@ DeployResult Client::deploy(const std::string& accountId,
         npxArguments(npxCliPath_,
                      {L"secret", L"put", L"SHARED_SECRET", L"--config",
                       configPath.wstring()}),
-        directory.path().wstring(), secretInput, true, kDeployTimeoutMs);
+        directory.path().wstring(), secretInput, false, kDeployTimeoutMs);
     if (!secretResult.ok()) {
-        if (secretResult.timedOut) std::cerr << "Wrangler secret yukleme zaman asimina ugradi.\n";
+        spdlog::debug("wrangler secret put (exit={}): {}", secretResult.exitCode,
+                      secretResult.output);
+        const std::string reason = console::lastErrorLine(secretResult.output);
+        std::cerr << console::red(secretResult.timedOut ? "Gizli anahtar yukleme zaman asimina ugradi."
+                                  : reason.empty() ? "Gizli anahtar yuklenemedi." : reason)
+                  << "\n";
         return deployment;
     }
 
     if (deployedWithoutRateLimiter) {
-        std::cerr << "UYARI: Worker rate limit binding'i OLMADAN deploy edildi; yalnizca "
-                     "isolate basina yedek sayac aktif. Hesabiniz destekliyorsa --redeploy "
-                     "ile tekrar deneyin.\n";
+        std::cerr << console::yellow("Hesap duzeyinde hiz siniri olmadan deploy edildi; yalnizca "
+                                     "yedek sayac aktif. Hesabiniz destekliyorsa --redeploy ile "
+                                     "tekrar deneyin.")
+                  << "\n";
         spdlog::warn("Worker rate limit binding'i olmadan deploy edildi");
     }
 
