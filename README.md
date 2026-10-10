@@ -73,7 +73,7 @@ splithello.exe --setup    # Cloudflare login and Worker deploy
 splithello.exe            # normal run
 ```
 
-`--setup` opens a Cloudflare login in the browser, generates a random shared secret, deploys the Worker and stores the secret encrypted with DPAPI. To run without a Worker, set `"dns_mode": "system"` in `config.json`. A normal run asks for UAC once and then sits in the system tray; double-click the icon to open the dashboard.
+`--setup` opens a Cloudflare login in the browser, generates a random shared secret, deploys the Worker and stores the secret encrypted with DPAPI. To run without a Worker, set `"dns_mode": "system"` in `config.json`. A normal run asks for UAC once and then sits in the system tray; double-click the icon to open the dashboard. If no Worker is configured yet, the tray opens the same setup in its own console on first start, and again when you pick **DNS: Worker** without one. When it finishes, the engine starts on its own. The tray menu also has **Cloudflare Worker kurulumunu çalıştır** to run it by hand.
 
 Prebuilt zips are on the [releases page](https://github.com/icguner/SplitHello/releases). Keep `splithello.exe`, `WinDivert.dll` and `WinDivert64.sys` in the same folder.
 

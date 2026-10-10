@@ -67,6 +67,10 @@ private:
     void openLogDirectory() const;
     void openDashboard();
     void restartEngineForConfiguration();
+    // Runs "splithello.exe --setup-only" in its own console (Cloudflare login +
+    // Worker deploy). pollSetup() picks up the result and starts the engine.
+    void launchSetup(bool wantWorkerMode);
+    void pollSetup();
 
     std::vector<std::wstring> engineArguments_;
     std::wstring logDirectory_;
@@ -90,6 +94,8 @@ private:
     HANDLE engineProcess_ = nullptr;
     HANDLE shutdownEvent_ = nullptr;
     HANDLE readyEvent_ = nullptr;
+    HANDLE setupProcess_ = nullptr;
+    bool setupWantsWorker_ = false;
 
     // Declared last so it is joined before any member it could touch.
     std::atomic<bool> startupBusy_{false};
