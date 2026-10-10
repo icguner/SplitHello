@@ -34,6 +34,7 @@ constexpr UINT kCommandExit = 1005;
 constexpr UINT kCommandDashboard = 1006;
 constexpr UINT kCommandDnsWorker = 1007;
 constexpr UINT kCommandDnsSystem = 1008;
+constexpr UINT kCommandSetup = 1009;
 
 // An engine that stays in Starting/Stopping this long is hung. Terminating it
 // closes its WinDivert handle in the kernel, which removes the filter (fail-open).
@@ -409,6 +410,7 @@ TrayApp::TrayApp(std::vector<std::wstring> engineArguments,
 TrayApp::~TrayApp() {
     removeIcon();
     closeEngineHandles();
+    if (setupProcess_) CloseHandle(setupProcess_);
     if (window_) DestroyWindow(window_);
 }
 
@@ -422,8 +424,9 @@ int TrayApp::run() {
         startEngine();
     } else {
         showBalloon(L"SplitHello kurulumu gerekli",
-                    L"Önce bir terminalde splithello.exe --setup çalıştırın.",
+                    L"Cloudflare kurulumu açılıyor; tarayıcıda izin verin.",
                     NIIF_WARNING);
+        launchSetup(true);
     }
 
     MSG message{};
@@ -533,6 +536,8 @@ void TrayApp::showMenu() {
     AppendMenuW(menu, MF_STRING |
                     (config.dnsMode == DnsMode::System ? MF_CHECKED : 0),
                 kCommandDnsSystem, L"DNS: Sistem (Worker'sız)");
+    AppendMenuW(menu, MF_STRING | (setupProcess_ ? MF_DISABLED : 0),
+                kCommandSetup, L"Cloudflare Worker kurulumunu çalıştır");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (startupEnabled_ ? MF_CHECKED : 0),
                 kCommandStartup, L"Windows ile başlat");
@@ -639,7 +644,70 @@ void TrayApp::requestExit() {
     }
 }
 
+void TrayApp::launchSetup(bool wantWorkerMode) {
+    if (setupProcess_) {
+        showBalloon(L"SplitHello", L"Kurulum zaten çalışıyor.");
+        return;
+    }
+    const std::wstring executable = executablePath();
+    if (executable.empty()) {
+        showBalloon(L"Kurulum başlatılamadı", L"Uygulama yolu bulunamadı.", NIIF_ERROR);
+        return;
+    }
+
+    std::wstring commandLine = cmdline::quoteArgument(executable) + L" --setup-only";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    // The tray is already elevated, so the child is too and shows no UAC prompt.
+    if (!CreateProcessW(executable.c_str(), commandLine.data(), nullptr, nullptr,
+                        FALSE, CREATE_NEW_CONSOLE, nullptr, nullptr,
+                        &startup, &process)) {
+        spdlog::error("Kurulum baslatilamadi: {}", GetLastError());
+        showBalloon(L"Kurulum başlatılamadı", L"Kurulum penceresi açılamadı.", NIIF_ERROR);
+        return;
+    }
+    CloseHandle(process.hThread);
+    setupProcess_ = process.hProcess;
+    setupWantsWorker_ = wantWorkerMode;
+}
+
+void TrayApp::pollSetup() {
+    if (!setupProcess_ || WaitForSingleObject(setupProcess_, 0) != WAIT_OBJECT_0) return;
+
+    DWORD exitCode = 1;
+    GetExitCodeProcess(setupProcess_, &exitCode);
+    CloseHandle(setupProcess_);
+    setupProcess_ = nullptr;
+    if (exiting_) return;
+
+    Config config;
+    config.load();
+    if (exitCode != 0 || config.loadFailed || config.workerUrl.empty()) {
+        showBalloon(L"Kurulum tamamlanamadı",
+                    L"Ayrıntı için log klasörüne bakın; menüden kurulumu yeniden çalıştırabilirsiniz.",
+                    NIIF_WARNING);
+        return;
+    }
+    if (setupWantsWorker_ && config.dnsMode != DnsMode::Worker) {
+        config.dnsMode = DnsMode::Worker;
+        if (!config.save()) {
+            showBalloon(L"DNS modu değişmedi", L"Yapılandırma kaydedilemedi.", NIIF_ERROR);
+            return;
+        }
+    }
+    canStart_ = config.isValid();
+    showBalloon(L"SplitHello", L"Worker kurulumu tamamlandı.");
+    if (!canStart_) return;
+    if (!engineProcess_ && (state_ == EngineState::Stopped || state_ == EngineState::Failed)) {
+        startEngine();
+    } else {
+        restartEngineForConfiguration();
+    }
+}
+
 void TrayApp::pollEngine() {
+    pollSetup();
     const uint64_t nowMs = GetTickCount64();
     if (!engineProcess_) {
         if (restartPending_ && nowMs >= restartAtMs_) {
@@ -855,8 +923,9 @@ void TrayApp::setDnsMode(DnsMode mode) {
     if (config.dnsMode == mode) return;
     if (mode == DnsMode::Worker && config.workerUrl.empty()) {
         showBalloon(L"Worker kurulumu gerekli",
-                    L"Worker DNS için önce splithello.exe --setup çalıştırın.",
+                    L"Cloudflare kurulumu açılıyor; tarayıcıda izin verin.",
                     NIIF_WARNING);
+        launchSetup(true);
         return;
     }
     config.dnsMode = mode;
@@ -938,6 +1007,7 @@ LRESULT TrayApp::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case kCommandStartup: toggleStartup(); break;
         case kCommandDnsWorker: setDnsMode(DnsMode::Worker); break;
         case kCommandDnsSystem: setDnsMode(DnsMode::System); break;
+        case kCommandSetup: launchSetup(true); break;
         case kCommandOpenLogs: openLogDirectory(); break;
         case kCommandDashboard: openDashboard(); break;
         case kCommandExit: requestExit(); break;

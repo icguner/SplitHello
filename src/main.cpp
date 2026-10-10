@@ -325,6 +325,7 @@ struct Options {
     unsigned splitDelayMs = 0;
     bool splitDelaySet = false;
     bool setup = false;
+    bool setupOnly = false; // tray-launched: run setup, wait for a key, exit
     bool redeploy = false;
     bool manualProxy = false;
     quic_strategy::Mode quicMode = quic_strategy::Mode::Allow;
@@ -442,6 +443,9 @@ bool parseArgs(int argc, char* argv[], Options& options, int& exitCode) {
             options.parentPid = (DWORD)parentPid;
         } else if (arg == "--setup") {
             options.setup = true;
+        } else if (arg == "--setup-only") {
+            options.setup = true;
+            options.setupOnly = true;
         } else if (arg == "--redeploy") {
             options.redeploy = true;
         } else if (arg == "--help") {
@@ -652,7 +656,16 @@ int main(int argc, char* argv[]) {
         return redeployWorker(config) ? 0 : 1;
     }
 
-    if (options.setup && !runSetup(config)) return 1;
+    if (options.setup) {
+        const bool done = runSetup(config);
+        if (options.setupOnly) {
+            // The console belongs to the tray-launched child and closes on exit.
+            std::cout << "\nKapatmak icin Enter'a basin...";
+            std::cin.get();
+            return done ? 0 : 1;
+        }
+        if (!done) return 1;
+    }
 
     std::string workerUrl = options.workerUrl.empty() ? config.workerUrl : options.workerUrl;
 
