@@ -47,6 +47,7 @@ struct DashboardData {
         int64_t bypassed = 0;   // verified differential: baseline failed, profile worked
         int64_t learned = 0;    // a remembered profile was applied without new evidence
         int64_t unresolved = 0;
+        int64_t suspected = 0;  // first differential, not yet reproduced (not learned)
     };
     struct Attempt {
         std::string profile;
@@ -99,6 +100,7 @@ struct DashboardData {
         int64_t normal = 0;
         int64_t unresolved = 0;
         double averageLatencyMs = 0;
+        int64_t suspected = 0;
     };
 
     bool ready = false;
@@ -109,12 +111,15 @@ struct DashboardData {
     // `bypassed` counts only verified interference: the untouched baseline
     // failed and a transformed hello worked in the same connection. Reusing
     // a remembered winner is `learned`; it applies a fix but proves nothing.
+    // `suspected` is a single, not yet reproduced differential: neither proof
+    // nor a learned profile, so it is reported separately from both.
     int64_t total = 0;
     int64_t bypassed = 0;
     int64_t learned = 0;
     int64_t normal = 0;
     int64_t unresolved = 0;
     int64_t cacheHits = 0;
+    int64_t suspected = 0;
     double averageLatencyMs = 0;
 
     Percentiles latency;
@@ -132,7 +137,7 @@ struct DashboardData {
 class Store {
 public:
     explicit Store(std::string path, unsigned retentionDays = 30,
-                   size_t maxEvents = 50000, size_t maxQueued = 4096);
+                   size_t maxEvents = 20000, size_t maxQueued = 4096);
     ~Store();
 
     Store(const Store&) = delete;
@@ -163,7 +168,8 @@ private:
     std::atomic<bool> accepting_{false};
     std::atomic<bool> stopping_{false};
     std::atomic<size_t> dropped_{0};
-    std::mutex mutex_;
+    std::mutex lifecycle_;   // serialises start()/stop(); never held by the writer
+    std::mutex mutex_;       // guards queue_ and the stopping_ hand-off
     std::condition_variable ready_;
     std::deque<ProbeRecord> queue_;
     std::thread writer_;

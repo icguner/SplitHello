@@ -62,6 +62,7 @@ void AdaptiveRegistry::purgeIfDue(uint64_t nowMs) {
 
     for (auto it = flows_.begin(); it != flows_.end();) {
         if (nowMs - it->second.touchedMs > fallbackMs_) {
+            if (!it->second.answered) unansweredFlows_.fetch_sub(1, std::memory_order_relaxed);
             it = flows_.erase(it);
         } else {
             ++it;
@@ -74,6 +75,7 @@ void AdaptiveRegistry::purgeIfDue(uint64_t nowMs) {
             ++it;
         }
     }
+    publishBlockedLocked();
 }
 
 Decision AdaptiveRegistry::outbound(const std::string& server,
@@ -86,11 +88,13 @@ Decision AdaptiveRegistry::outbound(const std::string& server,
     if (blocked != blockedUntil_.end()) {
         if (blocked->second > nowMs) return Decision::Drop;
         blockedUntil_.erase(blocked);
+        publishBlockedLocked();
     }
 
-    // Only Initial packets participate in learning. Tracking every UDP/443
-    // datagram put a global lock, string allocation and map scan on QUIC's hot
-    // data path, and a pre-Initial datagram could suppress the real probe.
+    // Only Initial packets create learning state; any other datagram only
+    // consults the blocked-server list above. Callers skip even that call via
+    // needsOutbound() while nothing is blocked, so steady QUIC data traffic
+    // costs neither the lock nor the server text.
     if (!initial) return Decision::Pass;
 
     const std::string key = flowKey(server, localPort);
@@ -98,10 +102,14 @@ Decision AdaptiveRegistry::outbound(const std::string& server,
     Flow& flow = it->second;
     flow.touchedMs = nowMs;
 
-    if (inserted) return initial ? Decision::PrimeAndPass : Decision::Pass;
+    if (inserted) {
+        unansweredFlows_.fetch_add(1, std::memory_order_relaxed);
+        return Decision::PrimeAndPass;
+    }
     if (flow.answered) return Decision::Pass;
     if (nowMs - flow.startedMs >= responseTimeoutMs_) {
         blockedUntil_[server] = nowMs + fallbackMs_;
+        publishBlockedLocked();
         return Decision::Drop;
     }
     return Decision::Pass;
@@ -113,15 +121,19 @@ void AdaptiveRegistry::inbound(const std::string& server, uint16_t localPort,
     purgeIfDue(nowMs);
     const auto it = flows_.find(flowKey(server, localPort));
     if (it == flows_.end()) return;
+    if (!it->second.answered) unansweredFlows_.fetch_sub(1, std::memory_order_relaxed);
     it->second.answered = true;
     it->second.touchedMs = nowMs;
     blockedUntil_.erase(server);
+    publishBlockedLocked();
 }
 
 void AdaptiveRegistry::clear() {
     std::lock_guard lock(mutex_);
     flows_.clear();
     blockedUntil_.clear();
+    unansweredFlows_.store(0, std::memory_order_relaxed);
+    publishBlockedLocked();
     nextPurgeAtMs_ = 0;
 }
 

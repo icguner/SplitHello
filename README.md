@@ -132,14 +132,21 @@ build\Release\splithello.exe           # normal çalıştırma / normal run
 --tunnel-fallback    Tüm profiller başarısızsa Worker tünelini kullan
 --manual-proxy       WinDivert'sız, SOCKS5/CONNECT dinle
 --quic-mode <mod>    allow (varsayılan), adaptive veya block
+--allow-quic         Eski ad; --quic-mode allow ile aynı
 --include-process <desen>  Yalnız eşleşen exe'leri işle (tekrarlanabilir)
 --exclude-process <desen>  Eşleşen exe'leri atla (tekrarlanabilir)
---restore-proxy      Çökme sonrası kalan proxy yedeğini geri yükle
---forget-strategies  Öğrenilen alan adı profillerini sıfırla
---list-strategies    Profilleri listele
+--restore-proxy      Çökme sonrası kalan proxy yedeğini geri yükle ve çık
+--forget-token       Eski sürümden kalan API token alanını sil ve çık
+--forget-strategies  Öğrenilen alan adı profillerini sıfırla ve çık
+--list-strategies    Profilleri listele ve çık
 --console            Tepsi yerine konsolda çalıştır
---verbose            Konsolda ayrıntılı log
+--verbose            Konsolda ayrıntılı log (konsol modunu açar)
+--help               Yardımı göster
 ```
+
+**TR** — `--manual-proxy` WinDivert'i hiç açmaz; bu yüzden `--quic-mode`, `--allow-quic` ve süreç filtreleri (`--include-process`, `--exclude-process`) bu modda etkisizdir. `--tunnel-fallback`, DNS modu **Sistem (Worker'sız)** iken yok sayılır (Worker kullanılmadığı için tünel de yoktur). `--include-process`/`--exclude-process` boş ya da 1.024 bayttan uzun desenleri reddeder.
+
+**EN** — `--manual-proxy` never opens WinDivert, so `--quic-mode`, `--allow-quic` and the process filters are inert in that mode. `--tunnel-fallback` is ignored in **System (no Worker)** DNS mode because no Worker tunnel exists there. `--include-process`/`--exclude-process` reject empty or over-1,024-byte patterns.
 </details>
 
 <details>
@@ -153,6 +160,22 @@ build\Release\splithello.exe           # normal çalıştırma / normal run
   "process_exclude": ["steam*.exe", "C:\\Games\\Legacy\\*"]
 }
 ```
+
+**TR** — `process_include` dolu ama hiçbir girdisi geçerli değilse (ör. yalnızca boş dizeler) kapsam "tüm süreçler"e **genişletilmez**: ağ motoru başlamaz, trafik normal Windows yolunda kalır ve tepsi nedenini bildirir. Listeyi düzeltin ya da boşaltın. Komut satırından verilen `--include-process`/`--exclude-process` kuralları yalnızca o çalıştırma için motora eklenir; panelde düzenlenemez, panel yalnızca sayısını gösterir.
+
+**EN** — If `process_include` is non-empty but none of its entries is usable (for example only empty strings), the scope is **not** widened to all processes: the engine refuses to start, traffic stays on the normal Windows path and the tray says why. Fix or clear the list. Rules passed on the command line are merged into the engine for that run only; the dashboard cannot edit them and only shows how many there are.
+</details>
+
+<details>
+<summary><b>Windows ile başlat ve hatalar / Start with Windows and failures</b></summary>
+
+**TR** — Tepsi menüsündeki **Windows ile başlat**, oturum açılışında yönetici yetkisiyle çalışan bir zamanlanmış görev kaydeder (süre sınırı yok, pilde de çalışır). Bu görev exe'yi her oturumda yükseltilmiş çalıştıracağı için yalnızca standart kullanıcıların değiştiremeyeceği bir konumdan (ör. `C:\Program Files\SplitHello`) etkinleştirilir; kullanıcı klasörü ya da masaüstü gibi yazılabilir konumlarda reddedilir ve nedeni gösterilir. Kapatmak her konumdan çalışır.
+
+Ağ motoru başlayamazsa tepsi nedenini gösterir (port kullanımda, WinDivert açılamadı/`WinDivert.dll` yok, geçersiz süreç kuralları, Worker kurulumu yok, yapılandırma okunamadı). 10 saniyede başlamayan ya da durmayan motor sonlandırılır; sürücü kapanınca filtre kalkar ve internet normale döner. Çözülemeyen şifreli Worker sırrı (başka Windows kullanıcısı gibi) config'ten silinmez, uyarı loglanır.
+
+**EN** — **Windows ile başlat** in the tray menu registers a logon scheduled task that runs elevated (no execution time limit, also on battery). Because it launches the exe elevated every session, it only enables from a location standard users cannot modify (e.g. `C:\Program Files\SplitHello`); user-writable places such as a profile folder or the desktop are refused with an explanation. Disabling works from anywhere.
+
+If the engine cannot start the tray shows why (port in use, WinDivert could not open / `WinDivert.dll` missing, invalid process rules, Worker setup missing, config unreadable). An engine that does not start or stop within 10 seconds is terminated; closing the driver handle removes the filter and traffic returns to normal. A Worker secret that cannot be decrypted (for example one written by another Windows user) is kept in config.json untouched and a warning is logged.
 </details>
 
 ---

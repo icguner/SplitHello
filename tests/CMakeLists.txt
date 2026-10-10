@@ -1,12 +1,15 @@
 add_executable(splithello_tests
     TestMain.cpp
     TestWsLifecycle.cpp
+    TestCommandLine.cpp
+    TestConfig.cpp
     TestWinDivertPacket.cpp
     TestWinDivertLifecycle.cpp
     TestDnsLifecycle.cpp
     ../src/TransparentDnsProxy.cpp
     TestDiagnosis.cpp
     TestDnsMessage.cpp
+    TestDnsResolver.cpp
     TestJson.cpp
     TestLiveStats.cpp
     TestNetworkIdentity.cpp
@@ -22,7 +25,7 @@ add_executable(splithello_tests
     TestWrangler.cpp
 )
 
-target_link_libraries(splithello_tests PRIVATE splithello_core splithello_packet)
+target_link_libraries(splithello_tests PRIVATE splithello_core splithello_packet shell32)
 target_include_directories(splithello_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_test(NAME splithello_tests COMMAND splithello_tests)

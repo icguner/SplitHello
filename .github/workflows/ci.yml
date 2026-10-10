@@ -42,8 +42,23 @@ jobs:
             build/Release/WinDivert64.sys
             build/Release/WinDivert-LICENSE.txt
 
+  worker-syntax:
+    name: Worker JavaScript syntax check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: node --check worker/src/index.js
+        run: |
+          # The Worker is an ES module (`import ...`) with no package.json beside it,
+          # so Node would parse it as CommonJS; check an .mjs copy instead.
+          cp worker/src/index.js "$RUNNER_TEMP/worker.mjs"
+          node --check "$RUNNER_TEMP/worker.mjs"
+
   parser-fuzz-smoke:
-    name: Parser fuzz smoke (Clang ASan)
+    name: Parser fuzz smoke (Clang ASan + UBSan)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -66,13 +81,19 @@ jobs:
 
       - name: Run DNS parser fuzz smoke
         run: |
-          mkdir -p dns-corpus
-          ./build-fuzz/fuzz_dns dns-corpus -dict=fuzz/dns.dict -max_total_time=20 -timeout=2 -max_len=65536 -artifact_prefix=fuzz-artifacts/dns-
+          # Binary seeds are generated here (a query, an EDNS/DO query, a response)
+          # so the repo carries no opaque blobs. The first corpus directory is the
+          # writable one; the second is read-only seed input.
+          mkdir -p dns-corpus dns-seed
+          printf '\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01' > dns-seed/a-query.bin
+          printf '\x56\x78\x01\x00\x00\x01\x00\x00\x00\x00\x00\x01\x07example\x03com\x00\x00\x1c\x00\x01\x00\x00\x29\x10\x00\x00\x00\x80\x00\x00\x00' > dns-seed/aaaa-edns.bin
+          printf '\x12\x34\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\xcb\x00\x71\x07' > dns-seed/a-response.bin
+          ./build-fuzz/fuzz_dns dns-corpus dns-seed -dict=fuzz/dns.dict -max_total_time=20 -timeout=2 -max_len=65536 -artifact_prefix=fuzz-artifacts/dns-
 
       - name: Run JSON parser fuzz smoke
         run: |
           mkdir -p json-corpus
-          ./build-fuzz/fuzz_json json-corpus -dict=fuzz/json.dict -max_total_time=20 -timeout=2 -max_len=65536 -artifact_prefix=fuzz-artifacts/json-
+          ./build-fuzz/fuzz_json json-corpus fuzz/corpus/json -dict=fuzz/json.dict -max_total_time=20 -timeout=2 -max_len=65536 -artifact_prefix=fuzz-artifacts/json-
 
       - name: Upload crashing inputs
         if: failure()

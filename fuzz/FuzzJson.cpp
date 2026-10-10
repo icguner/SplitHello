@@ -13,7 +13,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     const size_t keyLength = std::min<size_t>(size, 64);
     const std::string dynamicKey(bytes, keyLength);
     for (const std::string& key : {std::string("result"), std::string("host"),
-                                   dynamicKey}) {
+                                   std::string("a"), std::string("aaaa"),
+                                   std::string("ttl"), std::string("data"), dynamicKey}) {
         (void)json::getString(input, key);
         (void)json::getBool(input, key);
         (void)json::getInt(input, key);

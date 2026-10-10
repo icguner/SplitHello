@@ -2,6 +2,8 @@
 #include <spdlog/spdlog.h>
 #include <stdexcept>
 #include <algorithm>
+#include <charconv>
+#include <system_error>
 
 #pragma comment(lib, "winhttp.lib")
 
@@ -23,9 +25,14 @@ void WsClient::cleanup() {
 bool WsClient::connect(std::string_view url,
                        const std::vector<std::pair<std::string, std::string>>& headers,
                        uint16_t connectPortOverride) {
-    const std::lock_guard sendLock(sendMutex_);
-    if (stopping_ || connectAttempted_) return false;
-    connectAttempted_ = true;
+    // The mutex only guards the latch and the final publication of the socket
+    // handle: the handshake below blocks on the network for tens of seconds,
+    // and close() must never queue behind it.
+    {
+        const std::lock_guard sendLock(sendMutex_);
+        if (stopping_ || connectAttempted_) return false;
+        connectAttempted_ = true;
+    }
     cleanup();
 
     // Parse URL: wss://host[:port]/path
@@ -56,7 +63,15 @@ bool WsClient::connect(std::string_view url,
     auto colonPos = hostPort.find(':');
     if (colonPos != std::string::npos) {
         host = hostPort.substr(0, colonPos);
-        port = static_cast<INTERNET_PORT>(std::stoi(hostPort.substr(colonPos + 1)));
+        const char* first = hostPort.data() + colonPos + 1;
+        const char* last = hostPort.data() + hostPort.size();
+        unsigned value = 0;
+        const auto parsed = std::from_chars(first, last, value);
+        if (parsed.ec != std::errc{} || parsed.ptr != last || value == 0 || value > 65535) {
+            spdlog::error("Invalid WebSocket port: {}", urlStr);
+            return false;
+        }
+        port = static_cast<INTERNET_PORT>(value);
     } else {
         host = hostPort;
     }
@@ -167,8 +182,8 @@ bool WsClient::connect(std::string_view url,
     }
 
     // Complete the WebSocket upgrade
-    websocket_ = WinHttpWebSocketCompleteUpgrade(request_, 0);
-    if (!websocket_) {
+    HINTERNET websocket = WinHttpWebSocketCompleteUpgrade(request_, 0);
+    if (!websocket) {
         spdlog::error("WinHttpWebSocketCompleteUpgrade failed: {}", GetLastError());
         cleanup();
         return false;
@@ -178,11 +193,22 @@ bool WsClient::connect(std::string_view url,
     WinHttpCloseHandle(request_);
     request_ = nullptr;
 
-    if (stopping_) {
+    // Publish under the mutex so close() either sees the handle and shuts it
+    // down, or has already latched stopping_ and we discard it here.
+    bool published = false;
+    {
+        const std::lock_guard sendLock(sendMutex_);
+        if (!stopping_) {
+            websocket_ = websocket;
+            connected_ = true;
+            published = true;
+        }
+    }
+    if (!published) {
+        WinHttpCloseHandle(websocket);
         cleanup();
         return false;
     }
-    connected_ = true;
     spdlog::info("WebSocket connected to {}", urlStr);
     return true;
 }
@@ -220,8 +246,6 @@ bool WsClient::sendBinary(const uint8_t* data, size_t len) {
 int WsClient::receive(std::vector<uint8_t>& out, bool& isText) {
     if (!connected_ || stopping_) return -1;
 
-    out.clear();
-
     // Read in chunks until we get a complete message
     constexpr DWORD CHUNK_SIZE = 8192;
     uint8_t chunk[CHUNK_SIZE];
@@ -229,30 +253,35 @@ int WsClient::receive(std::vector<uint8_t>& out, bool& isText) {
     DWORD bytesRead = 0;
     WINHTTP_WEB_SOCKET_BUFFER_TYPE bufType;
 
+    // An empty data message carries no bytes, but 0 is the close code: skip it
+    // and wait for the next message so a stray empty frame cannot end the tunnel.
     do {
-        DWORD err = WinHttpWebSocketReceive(websocket_, chunk, CHUNK_SIZE, &bytesRead, &bufType);
-        if (err != NO_ERROR) {
-            spdlog::error("WebSocket receive failed: {}", err);
-            connected_ = false;
-            return -1;
-        }
+        out.clear();
+        do {
+            DWORD err = WinHttpWebSocketReceive(websocket_, chunk, CHUNK_SIZE, &bytesRead, &bufType);
+            if (err != NO_ERROR) {
+                spdlog::error("WebSocket receive failed: {}", err);
+                connected_ = false;
+                return -1;
+            }
 
-        // Check for close frame
-        if (bufType == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) {
-            spdlog::info("WebSocket received close frame");
-            connected_ = false;
-            return 0;
-        }
+            // Check for close frame
+            if (bufType == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) {
+                spdlog::info("WebSocket received close frame");
+                connected_ = false;
+                return 0;
+            }
 
-        constexpr size_t kMaxMessageBytes = 1024 * 1024;
-        if (bytesRead > kMaxMessageBytes - out.size()) {
-            connected_ = false;
-            return -1;
-        }
-        out.insert(out.end(), chunk, chunk + bytesRead);
+            constexpr size_t kMaxMessageBytes = 1024 * 1024;
+            if (bytesRead > kMaxMessageBytes - out.size()) {
+                connected_ = false;
+                return -1;
+            }
+            out.insert(out.end(), chunk, chunk + bytesRead);
 
-    } while (bufType == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE ||
-             bufType == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE);
+        } while (bufType == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE ||
+                 bufType == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE);
+    } while (out.empty());
 
     isText = (bufType == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE);
     return (int)out.size();

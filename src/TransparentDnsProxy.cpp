@@ -9,11 +9,21 @@
 #include <array>
 #include <string>
 
+#include <windows.h>   // GetTickCount64
+
 namespace {
 
-constexpr size_t kWorkerCount = 4;
+// Each worker can sit in a blocking DoH call, so a handful of slow queries must
+// not starve the rest. Still bounded: the owned, joined threads are the
+// lifecycle contract (see stopLocked).
+constexpr size_t kWorkerCount = 8;
 constexpr size_t kMaxQueuedQueries = 1024;
 constexpr size_t kMaxDnsDatagram = 4096;
+// The OS resolver retries within ~1-2 s and gives up in a few more; an answer
+// produced after that is wasted work and a spurious Worker request.
+constexpr unsigned long long kMaxQueueAgeMs = 3000;
+// Overall budget per query, on top of the per-phase WinHTTP timeouts.
+constexpr unsigned long long kJobDeadlineMs = 8000;
 
 bool endpoint(const sockaddr_storage& peer, std::string& address,
               uint16_t& port) {
@@ -172,6 +182,7 @@ void TransparentDnsProxy::receiveLoop() {
         }
 
         job.data.assign(buffer.begin(), buffer.begin() + received);
+        job.enqueuedMs = GetTickCount64();
         dns_message::Query query;
         if (dns_message::parseQuery(job.data.data(), job.data.size(), query) &&
             resolver_.isBootstrapHost(query.name)) {
@@ -202,46 +213,66 @@ void TransparentDnsProxy::workerLoop() {
             job = std::move(jobs_.front());
             jobs_.pop_front();
         }
+        if (GetTickCount64() - job.enqueuedMs > kMaxQueueAgeMs) {
+            spdlog::debug("DNS relay: bayat sorgu atlandi (istemci vazgecmis olmali)");
+            continue;
+        }
         process(job);
     }
 }
 
-void TransparentDnsProxy::process(const Job& job) {
+std::vector<uint8_t> TransparentDnsProxy::buildReply(const uint8_t* data, size_t length,
+                                                     unsigned long long deadlineMs) {
     dns_message::Query query;
-    if (!dns_message::parseQuery(job.data.data(), job.data.size(), query)) {
-        spdlog::debug("Desteklenmeyen veya bozuk DNS sorgusu reddedildi");
-        return;
+    if (!dns_message::parseQuery(data, length, query)) {
+        // Answer FORMERR/NOTIMP when the header is readable so the client does
+        // not wait out its timeout; garbage without a usable header is dropped.
+        spdlog::debug("Desteklenmeyen veya bozuk DNS sorgusu (rcode {})", query.error);
+        return query.error != 0 ? dns_message::buildError(query, query.error)
+                                : std::vector<uint8_t>{};
     }
 
     std::vector<uint8_t> response;
-    bool allowWireFallback = false;
     if (query.type == dns_message::kTypeA ||
         query.type == dns_message::kTypeAaaa) {
         // /resolve returns both address families at once and warms the same
         // cache used by DirectRelay. That lets the relay restore Happy
         // Eyeballs without a second network lookup for every TLS connection.
-        const dns::Result resolved = resolver_.resolve(query.name);
-        allowWireFallback = resolved.allowWireFallback;
+        const dns::Result resolved = resolver_.resolve(query.name, deadlineMs);
         const std::vector<std::string>& addresses =
             query.type == dns_message::kTypeA ? resolved.v4 : resolved.v6;
+        const uint32_t ttl = resolved.ttlSeconds == 0 ? 60 : resolved.ttlSeconds;
         if (!resolved.empty()) {
-            response = dns_message::buildResponse(
-                query, addresses, resolved.ttlSeconds == 0 ? 60 : resolved.ttlSeconds);
+            // One family's lookup errored: NODATA for it would be a lie.
+            if (!addresses.empty() || !resolved.transient) {
+                response = dns_message::buildResponse(query, addresses, ttl);
+            }
+        } else if (resolved.allowWireFallback) {
+            // An older Worker (404 for every negative), or a name /resolve
+            // cannot carry: the raw DoH path yields the real RCODE.
+            response = resolver_.queryWire(data, length, deadlineMs);
+        } else if (!resolved.transient) {
+            // The Worker's verdict (NXDOMAIN / NODATA) reaches the app unchanged.
+            response = dns_message::buildResponse(query, {}, ttl, false, resolved.rcode);
         }
     } else {
-        response = resolver_.queryWire(job.data.data(), job.data.size());
-    }
-    if (response.empty() &&
-        (query.type == dns_message::kTypeA ||
-         query.type == dns_message::kTypeAaaa) &&
-        allowWireFallback) {
-        // Preserve the raw DoH path as a fallback for an older Worker whose
-        // /resolve response does not contain the modern multi-address shape.
-        response = resolver_.queryWire(job.data.data(), job.data.size());
+        response = resolver_.queryWire(data, length, deadlineMs);
     }
     if (response.empty()) {
         response = dns_message::buildResponse(query, {}, 60, true);
     }
+
+    dns_message::truncateForUdp(
+        response, std::max(dns_message::kClassicUdpPayload, (size_t)query.ednsPayload));
+    spdlog::trace("DNS relay: {} tip {} -> {} bayt", query.name, query.type,
+                  response.size());
+    return response;
+}
+
+void TransparentDnsProxy::process(const Job& job) {
+    const std::vector<uint8_t> response = buildReply(
+        job.data.data(), job.data.size(), job.enqueuedMs + kJobDeadlineMs);
+    if (response.empty()) return;
 
     const SOCKET socket = socket_.load();
     if (socket == INVALID_SOCKET || !running_) return;
@@ -251,8 +282,5 @@ void TransparentDnsProxy::process(const Job& job) {
         job.peerLength);
     if (sent == SOCKET_ERROR && running_) {
         spdlog::warn("DNS relay cevap gonderme hatasi: {}", WSAGetLastError());
-    } else {
-        spdlog::trace("DNS wire relay: {} tip {} -> {} bayt", query.name,
-                      query.type, response.size());
     }
 }

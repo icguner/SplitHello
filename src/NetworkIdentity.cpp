@@ -40,14 +40,14 @@ uint64_t fnv1a(const std::string& text) {
 std::string current() {
     const HRESULT init = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const bool uninitialize = SUCCEEDED(init);
-    if (FAILED(init) && init != RPC_E_CHANGED_MODE) return "network-default";
+    if (FAILED(init) && init != RPC_E_CHANGED_MODE) return kDefaultId;
 
     INetworkListManager* manager = nullptr;
     HRESULT result = CoCreateInstance(CLSID_NetworkListManager, nullptr,
                                       CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&manager));
     if (FAILED(result) || !manager) {
         if (uninitialize) CoUninitialize();
-        return "network-default";
+        return kDefaultId;
     }
 
     IEnumNetworks* networks = nullptr;
@@ -76,7 +76,7 @@ std::string current() {
     manager->Release();
     if (uninitialize) CoUninitialize();
 
-    if (ids.empty()) return "network-default";
+    if (ids.empty()) return kDefaultId;
 
     std::sort(ids.begin(), ids.end());
     std::string joined;
@@ -88,6 +88,32 @@ std::string current() {
     std::ostringstream out;
     out << "nla-" << std::hex << std::setw(16) << std::setfill('0') << fnv1a(joined);
     return out.str();
+}
+
+std::string CachedIdentity::get(Clock::time_point now) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const bool fresh = !value_.empty() && now - fetchedAt_ < ttl_;
+        if (fresh) return value_;
+        // Someone else is already asking the OS; a slightly stale answer
+        // beats stalling this connection behind their COM call.
+        if (refreshing_ && !value_.empty()) return value_;
+        refreshing_ = true;
+    }
+
+    std::string fetched = fetch_();
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    refreshing_ = false;
+    fetchedAt_ = now;
+    // The fallback id means "could not tell"; keep a real identity we knew.
+    if (value_.empty() || fetched != kDefaultId) value_ = std::move(fetched);
+    return value_;
+}
+
+std::string currentCached() {
+    static CachedIdentity cache(&current, std::chrono::seconds(30));
+    return cache.get();
 }
 
 } // namespace network_identity

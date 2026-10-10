@@ -19,14 +19,17 @@ inline size_t skipWs(const std::string& s, size_t pos) {
     return pos;
 }
 
-// Position just after the colon following "key", or npos.
+// Position just after the colon following "key", or npos. An occurrence of
+// "key" that is a *value* (e.g. {"host":"a","a":[...]}) has no colon after it
+// and is skipped, so the real key further on is still found.
 inline size_t findValue(const std::string& s, const std::string& key, size_t from = 0) {
     const std::string needle = "\"" + key + "\"";
-    size_t pos = s.find(needle, from);
-    if (pos == std::string::npos) return std::string::npos;
-    pos = skipWs(s, pos + needle.size());
-    if (pos >= s.size() || s[pos] != ':') return std::string::npos;
-    return skipWs(s, pos + 1);
+    for (size_t pos = s.find(needle, from); pos != std::string::npos;
+         pos = s.find(needle, pos + 1)) {
+        const size_t colon = skipWs(s, pos + needle.size());
+        if (colon < s.size() && s[colon] == ':') return skipWs(s, colon + 1);
+    }
+    return std::string::npos;
 }
 
 // Parse a JSON string literal starting at pos (which must point at '"').

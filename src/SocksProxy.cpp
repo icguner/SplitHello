@@ -5,6 +5,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <format>
@@ -37,6 +38,38 @@ constexpr unsigned kStopDrainWarnSeconds = 15;
 
 // Rejections come in bursts; one line every few seconds is enough.
 constexpr ULONGLONG kRejectLogIntervalMs = 5000;
+
+// A manual-mode client is a local process we do not trust to be well behaved:
+// the whole handshake (protocol sniff through CONNECT reply) must finish within
+// RelayContext::handshakeTimeoutMs, or the connection is dropped and its thread
+// freed. Header lines are bounded too.
+constexpr int kMaxHeaderLines = 100;
+
+// Accept failures that cannot be cured by trying again. Everything else
+// (WSAENOBUFS, WSAEMFILE, WSAECONNABORTED, WSAENETDOWN, ...) is treated as
+// transient: the listener is fine and resources or the network come back.
+bool isFatalAcceptError(int error) {
+    return error == WSAENOTSOCK || error == WSAEINVAL || error == WSAEBADF ||
+           error == WSAEOPNOTSUPP || error == WSANOTINITIALISED;
+}
+constexpr unsigned kAcceptBackoffMinMs = 10;
+constexpr unsigned kAcceptBackoffMaxMs = 1000;
+constexpr unsigned kAcceptMaxConsecutiveErrors = 100; // ~100 s at the maximum backoff
+
+// True once the socket is readable (data, FIN or error) before the deadline.
+bool waitReadable(SOCKET sock, ULONGLONG deadline) {
+    const ULONGLONG now = GetTickCount64();
+    if (now >= deadline) return false;
+    const ULONGLONG waitMs = deadline - now;
+
+    fd_set readable;
+    FD_ZERO(&readable);
+    FD_SET(sock, &readable);
+    timeval tv{};
+    tv.tv_sec = (long)(waitMs / 1000);
+    tv.tv_usec = (long)((waitMs % 1000) * 1000);
+    return ::select(0, &readable, nullptr, nullptr, &tv) > 0;
+}
 
 // Parse a decimal port without throwing on junk input from the client.
 bool parsePort(std::string_view text, uint16_t& out) {
@@ -108,9 +141,10 @@ SocksProxy::~SocksProxy() {
     stop();
 }
 
-bool SocksProxy::recvExact(SOCKET sock, uint8_t* buf, int n) {
+bool SocksProxy::recvExact(SOCKET sock, uint8_t* buf, int n, ULONGLONG deadline) {
     int total = 0;
     while (total < n) {
+        if (!waitReadable(sock, deadline)) return false;
         int r = recv(sock, reinterpret_cast<char*>(buf + total), n - total, 0);
         if (r <= 0) return false;
         total += r;
@@ -118,18 +152,19 @@ bool SocksProxy::recvExact(SOCKET sock, uint8_t* buf, int n) {
     return true;
 }
 
-std::string SocksProxy::recvLine(SOCKET sock) {
-    std::string line;
+bool SocksProxy::recvLine(SOCKET sock, std::string& line, ULONGLONG deadline) {
+    line.clear();
     char c;
     while (true) {
+        if (!waitReadable(sock, deadline)) return false;
         int r = recv(sock, &c, 1, 0);
-        if (r <= 0) return {};
+        if (r <= 0) return false;
         line += c;
         if (line.size() >= 2 && line.ends_with("\r\n")) {
             line.resize(line.size() - 2); // strip \r\n
-            return line;
+            return true;
         }
-        if (line.size() > 8192) return {}; // safety limit
+        if (line.size() > 8192) return false; // safety limit
     }
 }
 
@@ -195,6 +230,8 @@ bool SocksProxy::run() {
     }
     spdlog::debug("Es zamanli baglanti siniri: {}", maxConnections_);
 
+    unsigned consecutiveErrors = 0;
+    unsigned backoffMs = kAcceptBackoffMinMs;
     while (running_) {
         sockaddr_storage clientAddr{};
         int addrLen = sizeof(clientAddr);
@@ -203,15 +240,25 @@ bool SocksProxy::run() {
         if (clientSock == INVALID_SOCKET) {
             if (!running_) break;
             const int error = WSAGetLastError();
-            if (error == WSAECONNRESET || error == WSAEINTR) {
-                Sleep(10);
-                continue;
+            consecutiveErrors++;
+            if (isFatalAcceptError(error) || consecutiveErrors > kAcceptMaxConsecutiveErrors) {
+                spdlog::error("Accept durdu: {} ({} ardisik hata)", error, consecutiveErrors);
+                running_ = false;
+                return false;
             }
-            spdlog::error("Accept durdu: {}", error);
-            running_ = false;
-            return false;
+            // A burst of aborted handshakes or a momentary lack of buffers or
+            // handles must not take the whole engine down.
+            if (consecutiveErrors == 1 || consecutiveErrors % 20 == 0) {
+                spdlog::warn("Accept hatasi: {}; yeniden deneniyor ({}. ardisik)",
+                             error, consecutiveErrors);
+            }
+            Sleep(backoffMs);
+            backoffMs = std::min(backoffMs * 2, kAcceptBackoffMaxMs);
+            continue;
         }
 
+        consecutiveErrors = 0;
+        backoffMs = kAcceptBackoffMinMs;
         spawnSession(clientSock);
     }
 
@@ -270,7 +317,9 @@ void SocksProxy::spawnSession(SOCKET clientSock) {
             spdlog::warn("Baglanti siniri doldu ({} acik); yeni baglanti reddedildi (toplam {})",
                          sessions_.size(), rejected_.load());
         }
-        closesocket(clientSock);
+        // Reset, not FIN: the client learns at once that it was refused instead
+        // of reading a clean EOF, and no TIME_WAIT is left on our side.
+        tcp::closeAbortive(clientSock);
         return;
     }
 
@@ -410,18 +459,23 @@ bool SocksProxy::negotiate(SOCKET clientSock, std::string& targetHost, uint16_t&
         return false;
     }
 
+    // One budget for the whole handshake; a silent or dribbling local client
+    // would otherwise pin this thread (and a slot of the cap) forever.
+    const ULONGLONG deadline = GetTickCount64() + context_.handshakeTimeoutMs;
+
     // Peek first byte to detect protocol
     uint8_t firstByte;
+    if (!waitReadable(clientSock, deadline)) return false;
     int peeked = recv(clientSock, reinterpret_cast<char*>(&firstByte), 1, MSG_PEEK);
     if (peeked <= 0) return false;
 
     bool ok = false;
     if (firstByte == socks5::VERSION) {
         // SOCKS5 protocol
-        ok = socks5Handshake(clientSock, targetHost, targetPort);
+        ok = socks5Handshake(clientSock, targetHost, targetPort, deadline);
     } else if (firstByte >= 'A' && firstByte <= 'Z') {
         // HTTP method (CONNECT, GET, etc.)
-        ok = httpConnectHandshake(clientSock, targetHost, targetPort);
+        ok = httpConnectHandshake(clientSock, targetHost, targetPort, deadline);
     } else {
         spdlog::warn("Bilinmeyen protokol: ilk byte=0x{:02x}", firstByte);
     }
@@ -433,10 +487,11 @@ bool SocksProxy::negotiate(SOCKET clientSock, std::string& targetHost, uint16_t&
 
 // ---- HTTP CONNECT ----
 
-bool SocksProxy::httpConnectHandshake(SOCKET sock, std::string& targetHost, uint16_t& targetPort) {
+bool SocksProxy::httpConnectHandshake(SOCKET sock, std::string& targetHost, uint16_t& targetPort,
+                                      ULONGLONG deadline) {
     // Read request line: "CONNECT host:port HTTP/1.1"
-    std::string requestLine = recvLine(sock);
-    if (requestLine.empty()) return false;
+    std::string requestLine;
+    if (!recvLine(sock, requestLine, deadline) || requestLine.empty()) return false;
 
     // Parse method
     auto spacePos = requestLine.find(' ');
@@ -454,7 +509,9 @@ bool SocksProxy::httpConnectHandshake(SOCKET sock, std::string& targetHost, uint
         // Drain the rest of the request before replying. Closing a socket that
         // still has unread data triggers an abortive reset, and the client then
         // sees a dropped connection instead of the status we just sent.
-        while (!recvLine(sock).empty()) {}
+        // Bounded: a client that never ends its headers gets the reply anyway.
+        std::string header;
+        for (int i = 0; i < kMaxHeaderLines && recvLine(sock, header, deadline) && !header.empty(); i++) {}
 
         static constexpr std::string_view resp =
             "HTTP/1.1 405 Method Not Allowed\r\n"
@@ -479,11 +536,14 @@ bool SocksProxy::httpConnectHandshake(SOCKET sock, std::string& targetHost, uint
         return false;
     }
 
-    // Read remaining headers until empty line
-    while (true) {
-        std::string line = recvLine(sock);
-        if (line.empty()) break; // empty line = end of headers
+    // Read remaining headers until empty line. A timeout, a closed socket or a
+    // header flood is a broken client, not an end of headers.
+    std::string line;
+    bool endOfHeaders = false;
+    for (int i = 0; i < kMaxHeaderLines && recvLine(sock, line, deadline); i++) {
+        if (line.empty()) { endOfHeaders = true; break; }
     }
+    if (!endOfHeaders) return false;
 
     // Send 200 Connection Established
     static constexpr std::string_view response = "HTTP/1.1 200 Connection Established\r\n\r\n";
@@ -492,17 +552,18 @@ bool SocksProxy::httpConnectHandshake(SOCKET sock, std::string& targetHost, uint
 
 // ---- SOCKS5 ----
 
-bool SocksProxy::socks5Handshake(SOCKET sock, std::string& targetHost, uint16_t& targetPort) {
+bool SocksProxy::socks5Handshake(SOCKET sock, std::string& targetHost, uint16_t& targetPort,
+                                 ULONGLONG deadline) {
     // Phase 1: Auth negotiation
     uint8_t header[2];
-    if (!recvExact(sock, header, 2)) return false;
+    if (!recvExact(sock, header, 2, deadline)) return false;
     if (header[0] != socks5::VERSION) return false;
 
     uint8_t nMethods = header[1];
     if (nMethods == 0) return false;
 
     std::vector<uint8_t> methods(nMethods);
-    if (!recvExact(sock, methods.data(), nMethods)) return false;
+    if (!recvExact(sock, methods.data(), nMethods, deadline)) return false;
 
     bool hasNoAuth = false;
     for (uint8_t m : methods) {
@@ -515,7 +576,7 @@ bool SocksProxy::socks5Handshake(SOCKET sock, std::string& targetHost, uint16_t&
 
     // Phase 2: Connect request
     uint8_t req[4];
-    if (!recvExact(sock, req, 4)) return false;
+    if (!recvExact(sock, req, 4, deadline)) return false;
     if (req[0] != socks5::VERSION) return false;
 
     if (req[1] != socks5::CMD_CONNECT) {
@@ -529,21 +590,21 @@ bool SocksProxy::socks5Handshake(SOCKET sock, std::string& targetHost, uint16_t&
     switch (atyp) {
     case socks5::ATYP_IPV4: {
         uint8_t ipBytes[4];
-        if (!recvExact(sock, ipBytes, 4)) return false;
+        if (!recvExact(sock, ipBytes, 4, deadline)) return false;
         targetHost = std::format("{}.{}.{}.{}", ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3]);
         break;
     }
     case socks5::ATYP_DOMAIN: {
         uint8_t domainLen;
-        if (!recvExact(sock, &domainLen, 1)) return false;
+        if (!recvExact(sock, &domainLen, 1, deadline) || domainLen == 0) return false;
         std::string domain(domainLen, '\0');
-        if (!recvExact(sock, reinterpret_cast<uint8_t*>(domain.data()), domainLen)) return false;
+        if (!recvExact(sock, reinterpret_cast<uint8_t*>(domain.data()), domainLen, deadline)) return false;
         targetHost = std::move(domain);
         break;
     }
     case socks5::ATYP_IPV6: {
         uint8_t ipv6Bytes[16];
-        if (!recvExact(sock, ipv6Bytes, 16)) return false;
+        if (!recvExact(sock, ipv6Bytes, 16, deadline)) return false;
         char buf[INET6_ADDRSTRLEN];
         inet_ntop(AF_INET6, ipv6Bytes, buf, sizeof(buf));
         targetHost = buf;
@@ -554,7 +615,7 @@ bool SocksProxy::socks5Handshake(SOCKET sock, std::string& targetHost, uint16_t&
     }
 
     uint8_t portBytes[2];
-    if (!recvExact(sock, portBytes, 2)) return false;
+    if (!recvExact(sock, portBytes, 2, deadline)) return false;
     targetPort = (static_cast<uint16_t>(portBytes[0]) << 8) | portBytes[1];
 
     // Success reply

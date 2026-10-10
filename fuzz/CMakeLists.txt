@@ -16,6 +16,16 @@ if(WIN32)
     add_compile_definitions(_DISABLE_STRING_ANNOTATION _DISABLE_VECTOR_ANNOTATION)
 endif()
 
+# ASan everywhere; UBSan too where the toolchain ships its runtime (Linux CI).
+# The Windows LLVM libFuzzer package does not, so it stays ASan-only there.
+# -fno-sanitize-recover makes a UB report fail the run instead of just printing.
+set(SPLITHELLO_FUZZ_SANITIZERS address)
+set(SPLITHELLO_FUZZ_UBSAN_OPTIONS)
+if(NOT WIN32)
+    string(APPEND SPLITHELLO_FUZZ_SANITIZERS ",undefined")
+    set(SPLITHELLO_FUZZ_UBSAN_OPTIONS -fno-sanitize-recover=undefined)
+endif()
+
 add_library(splithello_fuzz_parsers STATIC
     ../src/DnsMessage.cpp
     ../src/TlsHello.cpp
@@ -28,7 +38,8 @@ target_compile_options(splithello_fuzz_parsers PRIVATE
     -O1
     -g
     -fno-omit-frame-pointer
-    -fsanitize=address,fuzzer-no-link
+    -fsanitize=${SPLITHELLO_FUZZ_SANITIZERS},fuzzer-no-link
+    ${SPLITHELLO_FUZZ_UBSAN_OPTIONS}
     -Wall
     -Wextra
     -Wpedantic
@@ -42,12 +53,13 @@ function(add_splithello_fuzzer target source)
         -O1
         -g
         -fno-omit-frame-pointer
-        -fsanitize=address,fuzzer
+        -fsanitize=${SPLITHELLO_FUZZ_SANITIZERS},fuzzer
+        ${SPLITHELLO_FUZZ_UBSAN_OPTIONS}
         -Wall
         -Wextra
         -Wpedantic
     )
-    target_link_options(${target} PRIVATE -fsanitize=address,fuzzer)
+    target_link_options(${target} PRIVATE -fsanitize=${SPLITHELLO_FUZZ_SANITIZERS},fuzzer)
 endfunction()
 
 add_splithello_fuzzer(fuzz_tls FuzzTls.cpp)

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -44,17 +45,26 @@ std::string normalize(std::string_view value) {
     return result;
 }
 
-std::vector<std::string> normalizeRules(std::vector<std::string> values) {
+// `rejected` counts non-blank patterns that could not be kept (too long, or
+// past the rule cap), so a silently emptied list can be told from a blank one.
+std::vector<std::string> normalizeRules(std::vector<std::string> values,
+                                        size_t& rejected) {
     std::vector<std::string> result;
     result.reserve(std::min(values.size(), kMaximumRules));
     for (const std::string& value : values) {
         std::string normalized = normalize(value);
-        if (normalized.empty()) continue;
+        if (normalized.empty()) {
+            if (value.find_first_not_of(" \t\r\n") != std::string::npos) ++rejected;
+            continue;
+        }
         if (std::find(result.begin(), result.end(), normalized) != result.end()) {
             continue;
         }
+        if (result.size() == kMaximumRules) {
+            ++rejected;
+            continue;
+        }
         result.push_back(std::move(normalized));
-        if (result.size() == kMaximumRules) break;
     }
     return result;
 }
@@ -141,19 +151,34 @@ bool zeroAddress(const uint8_t* address, size_t length) {
     return true;
 }
 
+// The connection table can grow between the size query and the fetch (a burst
+// of new connections is exactly when this runs), so the buffer is padded and
+// the fetch retried instead of treating the race as "owner unknown".
+template <typename Fetch>
+std::optional<std::vector<uint8_t>> fetchTable(Fetch fetch) {
+    constexpr int kAttempts = 4;
+    DWORD size = 0;
+    DWORD status = fetch(nullptr, &size);
+    for (int attempt = 0; attempt < kAttempts &&
+                          status == ERROR_INSUFFICIENT_BUFFER && size != 0;
+         ++attempt) {
+        size += size / 8 + 4096;
+        std::vector<uint8_t> bytes(size);
+        DWORD length = size;
+        status = fetch(bytes.data(), &length);
+        if (status == NO_ERROR) return bytes;
+        size = length;
+    }
+    return std::nullopt;
+}
+
 template <typename Table>
 std::optional<std::vector<uint8_t>> ownerTable(
     ULONG family, TCP_TABLE_CLASS tableClass) {
-    DWORD size = 0;
-    const DWORD first = GetExtendedTcpTable(nullptr, &size, FALSE, family,
-                                             tableClass, 0);
-    if (first != ERROR_INSUFFICIENT_BUFFER || size == 0) return std::nullopt;
-    std::vector<uint8_t> bytes(size);
-    if (GetExtendedTcpTable(bytes.data(), &size, FALSE, family, tableClass, 0) !=
-        NO_ERROR) {
-        return std::nullopt;
-    }
-    if (bytes.size() < sizeof(Table)) return std::nullopt;
+    auto bytes = fetchTable([&](void* buffer, DWORD* length) -> DWORD {
+        return GetExtendedTcpTable(buffer, length, FALSE, family, tableClass, 0);
+    });
+    if (!bytes || bytes->size() < sizeof(Table)) return std::nullopt;
     return bytes;
 }
 
@@ -197,16 +222,9 @@ std::optional<DWORD> tcpOwner(const Endpoint& endpoint) {
 
 std::optional<std::vector<uint8_t>> udpOwnerTable(ULONG family,
                                                   UDP_TABLE_CLASS tableClass) {
-    DWORD size = 0;
-    const DWORD first = GetExtendedUdpTable(nullptr, &size, FALSE, family,
-                                             tableClass, 0);
-    if (first != ERROR_INSUFFICIENT_BUFFER || size == 0) return std::nullopt;
-    std::vector<uint8_t> bytes(size);
-    if (GetExtendedUdpTable(bytes.data(), &size, FALSE, family, tableClass, 0) !=
-        NO_ERROR) {
-        return std::nullopt;
-    }
-    return bytes;
+    return fetchTable([&](void* buffer, DWORD* length) -> DWORD {
+        return GetExtendedUdpTable(buffer, length, FALSE, family, tableClass, 0);
+    });
 }
 
 template <typename Row>
@@ -298,14 +316,22 @@ bool operator==(const Endpoint& left, const Endpoint& right) noexcept {
 
 Rules::Rules(std::vector<std::string> includes,
              std::vector<std::string> excludes)
-    : includes_(normalizeRules(std::move(includes))),
-      excludes_(normalizeRules(std::move(excludes))) {}
+    : includes_(normalizeRules(std::move(includes), rejectedIncludes_)),
+      excludes_(normalizeRules(std::move(excludes), rejectedExcludes_)) {}
 
 bool Rules::enabled() const noexcept {
-    return !includes_.empty() || !excludes_.empty();
+    return !includes_.empty() || !excludes_.empty() || includeListInvalid();
 }
 
+bool Rules::includeListInvalid() const noexcept {
+    return includes_.empty() && rejectedIncludes_ != 0;
+}
+
+size_t Rules::rejectedIncludeCount() const noexcept { return rejectedIncludes_; }
+size_t Rules::rejectedExcludeCount() const noexcept { return rejectedExcludes_; }
+
 bool Rules::allowsImage(std::string_view imagePath) const {
+    if (includeListInvalid()) return false;
     const std::string fullPath = normalize(imagePath);
     if (fullPath.empty()) return false;
     const size_t separator = fullPath.find_last_of('\\');
@@ -325,15 +351,24 @@ public:
     explicit Impl(Rules rules) : rules_(std::move(rules)) {}
 
     bool shouldIntercept(const Endpoint& endpoint, bool outbound,
-                         bool newTcpFlow) {
+                         bool newTcpFlow, uint64_t nowMs) {
         if (!rules_.enabled()) return true;
         if (endpoint.localPort == 0 || endpoint.remotePort == 0) return false;
 
-        const uint64_t now = GetTickCount64();
+        const uint64_t now = nowMs == 0 ? GetTickCount64() : nowMs;
         {
             std::lock_guard lock(mutex_);
             const auto it = endpoints_.find(endpoint);
             if (it != endpoints_.end() && it->second.expiresAtMs > now) {
+                // A resolved decision follows its connection: traffic keeps it
+                // alive, so a long-lived intercepted flow is never turned into
+                // a bypassed (and therefore reset) one by a fixed deadline.
+                if (it->second.resolved) {
+                    it->second.expiresAtMs = std::max(
+                        it->second.expiresAtMs,
+                        now + (endpoint.protocol == Protocol::Tcp ? kTcpCacheTtlMs
+                                                                  : kUdpCacheTtlMs));
+                }
                 return it->second.intercept;
             }
         }
@@ -350,6 +385,9 @@ public:
             : udpOwner(endpoint);
         const std::string image = owner ? cachedProcessImage(*owner, now)
                                         : std::string{};
+        // shortcut: an unresolved owner is left alone even with exclude-only
+        // rules, because it might be the excluded process; the padded table
+        // fetch keeps unresolved owners rare. Revisit if users report misses.
         const bool intercept = !image.empty() && rules_.allowsImage(image);
         const uint64_t ttl = image.empty()
             ? kUnknownCacheTtlMs
@@ -357,9 +395,17 @@ public:
                                                   : kUdpCacheTtlMs);
 
         std::lock_guard lock(mutex_);
-        pruneLocked(now);
-        endpoints_[endpoint] = {intercept, now + ttl};
+        if (endpoints_.size() >= kMaximumCachedEndpoints &&
+            !endpoints_.contains(endpoint)) {
+            makeRoomLocked(now);
+        }
+        endpoints_[endpoint] = {intercept, now + ttl, !image.empty()};
         return intercept;
+    }
+
+    void forget(const Endpoint& endpoint) {
+        std::lock_guard lock(mutex_);
+        endpoints_.erase(endpoint);
     }
 
     void clear() {
@@ -374,6 +420,7 @@ private:
     struct Decision {
         bool intercept = false;
         uint64_t expiresAtMs = 0;
+        bool resolved = false;  // false: owner unknown, short negative cache
     };
 
     struct ProcessName {
@@ -404,28 +451,46 @@ private:
         return image;
     }
 
-    void pruneLocked(uint64_t now) {
-        if (endpoints_.size() < kMaximumCachedEndpoints) return;
-        for (auto it = endpoints_.begin(); it != endpoints_.end();) {
-            if (it->second.expiresAtMs <= now) {
-                it = endpoints_.erase(it);
-            } else {
-                ++it;
-            }
+    // Called with the cache full. Expired entries go first, scanned at most
+    // once per second; if the cache is genuinely full of live tuples, the
+    // least recently used 1/16 is evicted, bypassed tuples before intercepted
+    // ones, so inserts stay amortized O(1) under the global mutex.
+    void makeRoomLocked(uint64_t now) {
+        if (now >= nextSweepMs_) {
+            nextSweepMs_ = now + 1000;
+            std::erase_if(endpoints_, [now](const auto& item) {
+                return item.second.expiresAtMs <= now;
+            });
+            if (endpoints_.size() < kMaximumCachedEndpoints) return;
         }
-        while (endpoints_.size() >= kMaximumCachedEndpoints) {
-            const auto oldest = std::min_element(
-                endpoints_.begin(), endpoints_.end(),
-                [](const auto& left, const auto& right) {
-                    return left.second.expiresAtMs < right.second.expiresAtMs;
-                });
-            if (oldest == endpoints_.end()) break;
-            endpoints_.erase(oldest);
+
+        struct Candidate {
+            bool intercept;
+            uint64_t expiresAtMs;
+            Endpoint endpoint;
+        };
+        std::vector<Candidate> candidates;
+        candidates.reserve(endpoints_.size());
+        for (const auto& item : endpoints_) {
+            candidates.push_back({item.second.intercept, item.second.expiresAtMs,
+                                  item.first});
         }
+        const size_t evict = std::max<size_t>(1, candidates.size() / 16);
+        std::nth_element(candidates.begin(),
+                         candidates.begin() + (std::ptrdiff_t)(evict - 1),
+                         candidates.end(),
+                         [](const Candidate& left, const Candidate& right) {
+                             if (left.intercept != right.intercept) {
+                                 return !left.intercept;
+                             }
+                             return left.expiresAtMs < right.expiresAtMs;
+                         });
+        for (size_t i = 0; i < evict; ++i) endpoints_.erase(candidates[i].endpoint);
     }
 
     Rules rules_;
     std::mutex mutex_;
+    uint64_t nextSweepMs_ = 0;
     std::unordered_map<Endpoint, Decision, EndpointHash> endpoints_;
     std::unordered_map<DWORD, ProcessName> processNames_;
 };
@@ -439,9 +504,11 @@ bool Filter::enabled() const noexcept { return impl_->rules().enabled(); }
 const Rules& Filter::rules() const noexcept { return impl_->rules(); }
 
 bool Filter::shouldIntercept(const Endpoint& endpoint, bool outbound,
-                             bool newTcpFlow) {
-    return impl_->shouldIntercept(endpoint, outbound, newTcpFlow);
+                             bool newTcpFlow, uint64_t nowMs) {
+    return impl_->shouldIntercept(endpoint, outbound, newTcpFlow, nowMs);
 }
+
+void Filter::forget(const Endpoint& endpoint) { impl_->forget(endpoint); }
 
 void Filter::clear() { impl_->clear(); }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,22 @@ struct Config {
     bool migratedFromPlaintext = false;
     bool legacyApiTokenPresent = false;
 
+    // The stored DPAPI blob could not be decrypted (other Windows user, damaged
+    // file). It is kept verbatim and written back by save() unless sharedSecret
+    // is set explicitly, so a transient failure never destroys the secret.
+    std::string sharedSecretBlob;
+
+    // A config file exists but could not be read. Callers must not save() such a
+    // config: it holds defaults and would overwrite the real file.
+    bool loadFailed = false;
+
+    // process_include was non-empty on disk but every entry was unusable. The
+    // engine refuses to start (fail-open for traffic) rather than silently widen
+    // the scope to "all processes".
+    bool processIncludeInvalid = false;
+
+    // False when there is no readable file; check loadFailed to tell a fresh
+    // install (false) from a file that exists but could not be read (true).
     bool load();
     bool save() const;
 
@@ -38,6 +55,10 @@ struct Config {
     // Compatibility command for configs created before Wrangler OAuth.
     bool forgetToken();
 
+    // Paths are UTF-8 (the manifest sets the process code page to UTF-8, so the
+    // narrow Win32/SQLite/std::filesystem calls agree); the *Path variant keeps
+    // the original wide characters for callers that can use them directly.
+    static std::filesystem::path configDirPath();
     static std::string configDir();
     static std::string configPath();
     static std::string strategyPath();

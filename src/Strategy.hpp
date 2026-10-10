@@ -3,6 +3,7 @@
 #include "Diagnosis.hpp"
 #include "TlsHello.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -78,7 +79,10 @@ public:
     // without one it only nominates a candidate, and a second differential
     // at least a minute later with no healthy baseline in between promotes
     // it. A cache hit (LearnedProfile) keeps a winner alive, a transient
-    // failure changes nothing. `nowSeconds` of 0 means the wall clock.
+    // failure changes nothing. `nowSeconds` of 0 means the real clocks: wall
+    // time for persisted stamps (verification, expiry), a monotonic clock for
+    // the in-memory gaps (60 s confirm, 15 min healthy, reverify hold) so a
+    // wall-clock step cannot break them. An explicit value drives both.
     enum class Outcome {
         Ignored,      // nothing to record
         Forgotten,    // the untouched baseline retired a winner
@@ -110,6 +114,7 @@ public:
     void clear();
 
     size_t size() const;
+    size_t candidateCount() const;
 
     // Probe order for a host: the remembered profile first, then the rest.
     // A winner that has not been re-proven for a while is re-verified: the
@@ -133,15 +138,19 @@ private:
         uint64_t expiresAt = 0;
         unsigned failures = 0;
         uint64_t verifiedAt = 0;          // last differential that re-proved it
-        uint64_t reverifyStartedAt = 0;   // in-memory only
+        uint64_t reverifyStartedAt = 0;   // in-memory only, monotonic; 0: never
     };
 
-    // A differential seen once. Never persisted: a restart simply asks for a
-    // fresh pair of strikes.
+    // A differential seen once. A restart simply asks for a fresh pair of
+    // strikes. Times are monotonic seconds, except for a legacy entry loaded
+    // from disk: until its first strike it has no monotonic stamps and lives on
+    // `persistUntil` (wall clock). Only such entries are written back on save,
+    // until promoted, cancelled or expired, so an upgrade does not erase them.
     struct Candidate {
         std::string profile;
         uint64_t firstStrikeAt = 0;   // 0: legacy entry, no strike under the new rules yet
         uint64_t expiresAt = 0;
+        uint64_t persistUntil = 0;    // wall seconds; 0: not persisted
     };
 
     mutable std::mutex mutex_;
@@ -149,11 +158,29 @@ private:
     std::unordered_map<std::string, Entry> entries_;
     std::unordered_map<std::string, Candidate> candidates_;
 
-    // Most recent successful untouched baseline per scoped host. Never
-    // persisted: it only needs to outlive a network hiccup.
+    // Most recent successful untouched baseline per scoped host (monotonic
+    // seconds). Never persisted: it only needs to outlive a network hiccup.
     std::unordered_map<std::string, uint64_t> healthyAt_;
 
-    bool saveLocked() const;
+    // Serialised state captured under mutex_ and written after it is released,
+    // so slow disk I/O never stalls the connections that consult the store.
+    struct Snapshot {
+        uint64_t seq = 0;   // 0: nothing to write
+        std::string text;
+    };
+    uint64_t nextSeq_ = 0;          // guarded by mutex_
+
+    std::mutex writeMutex_;         // serialises file writes; never taken under mutex_
+    uint64_t writtenSeq_ = 0;       // guarded by writeMutex_
+    std::atomic<bool> saveFailing_{false};
+
+    Outcome rememberLocked(const std::string& networkId, const std::string& host,
+                           const std::string& profile, diagnosis::Kind kind,
+                           unsigned confidence, uint64_t explicitNow, bool& dirty);
+    void makeRoomForEntryLocked(uint64_t wallNow);
+    void makeRoomForCandidateLocked(uint64_t wallNow, uint64_t monoNow);
+    Snapshot snapshotLocked();
+    void commit(const Snapshot& snapshot);
 };
 
 // Lowercased, trailing-dot-stripped host used as the store key.

@@ -1,5 +1,6 @@
 #include "Telemetry.hpp"
 
+#include "FileUtil.hpp"
 #include "Json.hpp"
 
 #include <sqlite3.h>
@@ -15,7 +16,12 @@
 namespace telemetry {
 namespace {
 
-constexpr size_t kWriteBatchSize = 64;
+// One transaction commits many records: the writer lingers briefly after the
+// first one so a burst of connections shares a single fsync-bearing COMMIT.
+constexpr size_t kWriteBatchSize = 256;
+constexpr std::chrono::milliseconds kBatchLinger{200};
+constexpr size_t kPruneEveryRecords = 2000;
+constexpr std::chrono::minutes kPruneEveryInterval{60};
 
 int64_t unixSeconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -246,6 +252,7 @@ std::string serializeDashboard(const DashboardData& data) {
     output << ",\"summary\":{\"total\":" << data.total
            << ",\"bypassed\":" << data.bypassed
            << ",\"learned\":" << data.learned
+           << ",\"suspected\":" << data.suspected
            << ",\"normal\":" << data.normal
            << ",\"unresolved\":" << data.unresolved
            << ",\"averageLatencyMs\":" << std::fixed << std::setprecision(1)
@@ -274,7 +281,8 @@ std::string serializeDashboard(const DashboardData& data) {
                << "\",\"total\":" << day.total
                << ",\"bypassed\":" << day.bypassed
                << ",\"learned\":" << day.learned
-               << ",\"unresolved\":" << day.unresolved << '}';
+               << ",\"unresolved\":" << day.unresolved
+               << ",\"suspected\":" << day.suspected << '}';
     }
     output << "]";
 
@@ -328,25 +336,43 @@ Store::~Store() {
 }
 
 bool Store::start() {
-    if (path_.empty() || accepting_.exchange(true)) return !path_.empty();
+    std::lock_guard<std::mutex> lifecycle(lifecycle_);
+    if (path_.empty()) return false;
+    if (accepting_) return true;
 
-    stopping_ = false;
+    // A writer that gave up on its own (database would not open) has exited
+    // but is still joinable; assigning over it would terminate the process.
+    if (writer_.joinable()) writer_.join();
+
     std::error_code error;
-    const std::filesystem::path parent = std::filesystem::path(path_).parent_path();
+    const std::filesystem::path parent =
+        std::filesystem::path(fileutil::widen(path_)).parent_path();
     if (!parent.empty()) std::filesystem::create_directories(parent, error);
     if (error) {
-        accepting_ = false;
         spdlog::error("Telemetri dizini olusturulamadi: {}", error.message());
         return false;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = false;
+        queue_.clear();
+    }
+    accepting_ = true;
     writer_ = std::thread([this]() { writerLoop(); });
     return true;
 }
 
 void Store::stop() {
-    accepting_ = false;
-    stopping_ = true;
+    std::lock_guard<std::mutex> lifecycle(lifecycle_);
+    {
+        // Flip the flag under the mutex the writer waits on, otherwise the
+        // notify can land between its predicate check and the block (lost
+        // wakeup) and join() never returns.
+        std::lock_guard<std::mutex> lock(mutex_);
+        accepting_ = false;
+        stopping_ = true;
+    }
     ready_.notify_all();
     if (writer_.joinable()) writer_.join();
 }
@@ -371,11 +397,12 @@ void Store::writerLoop() {
     sqlite3* database = nullptr;
     const int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
                       SQLITE_OPEN_FULLMUTEX;
-    if (sqlite3_open_v2(path_.c_str(), &database, flags, nullptr) != SQLITE_OK ||
+    // SQLite wants UTF-8; the path may be ANSI or UTF-8 text.
+    if (sqlite3_open_v2(fileutil::toUtf8(path_).c_str(), &database, flags, nullptr) != SQLITE_OK ||
         !database || !initializeDatabase(database)) {
         spdlog::error("Telemetri veritabani acilamadi: {}",
                       database ? sqlite3_errmsg(database) : path_);
-        if (database) sqlite3_close(database);
+        if (database) sqlite3_close_v2(database);
         accepting_ = false;
         std::lock_guard<std::mutex> lock(mutex_);
         queue_.clear();
@@ -392,13 +419,14 @@ void Store::writerLoop() {
         " VALUES(?,?,?,?,?);");
     if (!eventInsert || !attemptInsert) {
         spdlog::error("Telemetri sorgulari hazirlanamadi: {}", sqlite3_errmsg(database));
-        sqlite3_close(database);
+        sqlite3_close_v2(database);
         accepting_ = false;
         return;
     }
 
     pruneDatabase(database, retentionDays_, maxEvents_);
-    size_t batchesSincePrune = 0;
+    size_t recordsSincePrune = 0;
+    auto lastPrune = std::chrono::steady_clock::now();
 
     while (true) {
         std::vector<ProbeRecord> batch;
@@ -406,6 +434,12 @@ void Store::writerLoop() {
         {
             std::unique_lock<std::mutex> lock(mutex_);
             ready_.wait(lock, [this]() { return stopping_ || !queue_.empty(); });
+            if (!stopping_ && queue_.size() < kWriteBatchSize) {
+                // Let a burst pile up so it commits as one transaction.
+                ready_.wait_for(lock, kBatchLinger, [this]() {
+                    return stopping_ || queue_.size() >= kWriteBatchSize;
+                });
+            }
             while (!queue_.empty() && batch.size() < kWriteBatchSize) {
                 batch.push_back(std::move(queue_.front()));
                 queue_.pop_front();
@@ -426,30 +460,37 @@ void Store::writerLoop() {
             spdlog::warn("{} telemetri kaydi yazilamadi", batch.size());
         }
 
-        if (++batchesSincePrune >= 64) {
+        recordsSincePrune += batch.size();
+        const auto now = std::chrono::steady_clock::now();
+        if (recordsSincePrune >= kPruneEveryRecords || now - lastPrune >= kPruneEveryInterval) {
             pruneDatabase(database, retentionDays_, maxEvents_);
-            batchesSincePrune = 0;
+            recordsSincePrune = 0;
+            lastPrune = now;
         }
     }
 
     pruneDatabase(database, retentionDays_, maxEvents_);
-    sqlite3_close(database);
+    // _v2: the prepared statements above are finalized only when they go out
+    // of scope, after this call; plain sqlite3_close would refuse and leak.
+    sqlite3_close_v2(database);
 }
 
 DashboardData Store::dashboardSnapshot(const std::string& path,
                                        unsigned windowDays) {
     windowDays = std::clamp(windowDays, 1U, 90U);
-    if (path.empty() || !std::filesystem::exists(path)) {
+    std::error_code existsError;
+    if (path.empty() ||
+        !std::filesystem::exists(std::filesystem::path(fileutil::widen(path)), existsError)) {
         return emptyDashboard("Henüz telemetri kaydı oluşmadı.", windowDays);
     }
 
     sqlite3* database = nullptr;
-    if (sqlite3_open_v2(path.c_str(), &database,
+    if (sqlite3_open_v2(fileutil::toUtf8(path).c_str(), &database,
                         SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX,
                         nullptr) != SQLITE_OK || !database) {
         const std::string error = database ? sqlite3_errmsg(database)
                                            : "Veritabanı açılamadı.";
-        if (database) sqlite3_close(database);
+        if (database) sqlite3_close_v2(database);
         return emptyDashboard(error, windowDays);
     }
     sqlite3_busy_timeout(database, 1000);
@@ -470,7 +511,8 @@ DashboardData Store::dashboardSnapshot(const std::string& path,
         " COALESCE(SUM(success=0),0),"
         " COALESCE(AVG(total_elapsed_ms),0),"
         " COALESCE(SUM(cache_hit),0),"
-        " COALESCE(SUM(diagnosis_kind IN ('learned-profile','transient-failure','interference-suspected')),0)"
+        " COALESCE(SUM(diagnosis_kind IN ('learned-profile','transient-failure')),0),"
+        " COALESCE(SUM(diagnosis_kind='interference-suspected'),0)"
         " FROM probe_events WHERE occurred_at>=?;");
     if (summary) {
         bindCutoff(summary, cutoff);
@@ -482,6 +524,7 @@ DashboardData Store::dashboardSnapshot(const std::string& path,
             data.averageLatencyMs = sqlite3_column_double(summary.get(), 4);
             data.cacheHits = sqlite3_column_int64(summary.get(), 5);
             data.learned = sqlite3_column_int64(summary.get(), 6);
+            data.suspected = sqlite3_column_int64(summary.get(), 7);
         }
     }
 
@@ -494,7 +537,8 @@ DashboardData Store::dashboardSnapshot(const std::string& path,
         " COALESCE(SUM(diagnosis_kind='no-interference'),0),"
         " COALESCE(SUM(success=0),0),"
         " COALESCE(AVG(total_elapsed_ms),0),"
-        " COALESCE(SUM(diagnosis_kind IN ('learned-profile','transient-failure','interference-suspected')),0)"
+        " COALESCE(SUM(diagnosis_kind IN ('learned-profile','transient-failure')),0),"
+        " COALESCE(SUM(diagnosis_kind='interference-suspected'),0)"
         " FROM probe_events WHERE occurred_at>=? AND occurred_at<?;");
     if (previous) {
         sqlite3_bind_int64(previous.get(), 1, previousCutoff);
@@ -506,6 +550,7 @@ DashboardData Store::dashboardSnapshot(const std::string& path,
             data.previous.unresolved = sqlite3_column_int64(previous.get(), 3);
             data.previous.averageLatencyMs = sqlite3_column_double(previous.get(), 4);
             data.previous.learned = sqlite3_column_int64(previous.get(), 5);
+            data.previous.suspected = sqlite3_column_int64(previous.get(), 6);
         }
     }
 
@@ -627,8 +672,9 @@ DashboardData Store::dashboardSnapshot(const std::string& path,
     Statement daily(database,
         "SELECT strftime('%Y-%m-%d',occurred_at,'unixepoch','localtime'),"
         " COUNT(*),COALESCE(SUM(diagnosis_kind='sni-interference-likely'),0),"
-        " COALESCE(SUM(diagnosis_kind IN ('learned-profile','transient-failure','interference-suspected')),0),"
-        " COALESCE(SUM(success=0),0) FROM probe_events"
+        " COALESCE(SUM(diagnosis_kind IN ('learned-profile','transient-failure')),0),"
+        " COALESCE(SUM(success=0),0),"
+        " COALESCE(SUM(diagnosis_kind='interference-suspected'),0) FROM probe_events"
         " WHERE occurred_at>=? GROUP BY 1 ORDER BY 1;");
     if (daily) {
         bindCutoff(daily, cutoff);
@@ -638,7 +684,8 @@ DashboardData Store::dashboardSnapshot(const std::string& path,
                 sqlite3_column_int64(daily.get(), 1),
                 sqlite3_column_int64(daily.get(), 2),
                 sqlite3_column_int64(daily.get(), 3),
-                sqlite3_column_int64(daily.get(), 4)});
+                sqlite3_column_int64(daily.get(), 4),
+                sqlite3_column_int64(daily.get(), 5)});
         }
     }
 
@@ -685,7 +732,7 @@ DashboardData Store::dashboardSnapshot(const std::string& path,
     }
 
     execute(database, "COMMIT;");
-    sqlite3_close(database);
+    sqlite3_close_v2(database);
     return data;
 }
 

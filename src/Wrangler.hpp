@@ -24,7 +24,9 @@ struct DeployResult {
 // Pure helpers are public so authentication/deployment output can be covered
 // without touching a real Cloudflare account in the unit tests.
 std::optional<Identity> parseIdentity(const std::string& output);
-std::string parseWorkersDevUrl(const std::string& output);
+// With a non-empty `workerName` only "<workerName>.<subdomain>.workers.dev" is
+// accepted, not any workers.dev link that happens to be in the output.
+std::string parseWorkersDevUrl(const std::string& output, const std::string& workerName = {});
 bool isValidWorkerName(const std::string& name);
 
 class Client {

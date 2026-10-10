@@ -67,6 +67,7 @@ bool verifyDeployment(const std::string& workerUrl, const std::string& sharedSec
     request.headers.push_back({"Authorization", "Bearer " + sharedSecret});
 
     const http::Response response = http::perform(request);
+    secure::wipe(request.headers.back().second);   // the "Bearer <secret>" copy
     if (response.status == 401 || response.status == 403) {
         std::cerr << "\nWorker gizli anahtari kabul etmedi (HTTP " << response.status << ").\n";
         return false;

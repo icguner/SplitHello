@@ -33,16 +33,22 @@ bool pointsAtUs(const std::string& value, uint16_t port) {
     return value == ourProxyValue(port) || value == bare;
 }
 
+// Reads a REG_SZ/REG_EXPAND_SZ value of any length. ProxyOverride lists easily
+// exceed 1 KiB, and a truncated backup would restore a damaged bypass list.
 std::string regGetString(HKEY key, const char* name) {
-    char buffer[1024] = {};
-    DWORD size = sizeof(buffer);
+    DWORD size = 0;
     DWORD type = 0;
-    if (RegQueryValueExA(key, name, nullptr, &type, (BYTE*)buffer, &size) != ERROR_SUCCESS ||
-        type != REG_SZ) {
+    if (RegQueryValueExA(key, name, nullptr, &type, nullptr, &size) != ERROR_SUCCESS ||
+        (type != REG_SZ && type != REG_EXPAND_SZ)) {
         return {};
     }
+    std::string value(size, '\0');
+    if (RegQueryValueExA(key, name, nullptr, &type, (BYTE*)value.data(), &size) !=
+        ERROR_SUCCESS) {
+        return {};
+    }
+    value.resize(size);
     // The stored size may or may not include the terminator.
-    std::string value(buffer, size);
     while (!value.empty() && value.back() == '\0') value.pop_back();
     return value;
 }
@@ -98,13 +104,16 @@ bool SystemProxy::applySnapshot(const Snapshot& snapshot) {
     }
 
     const DWORD enabled = snapshot.enabled;
-    RegSetValueExA(key, "ProxyEnable", 0, REG_DWORD, (const BYTE*)&enabled, sizeof(enabled));
+    const bool enableWritten =
+        RegSetValueExA(key, "ProxyEnable", 0, REG_DWORD, (const BYTE*)&enabled,
+                       sizeof(enabled)) == ERROR_SUCCESS;
     regSetOrDelete(key, "ProxyServer", snapshot.server);
     regSetOrDelete(key, "ProxyOverride", snapshot.bypass);
 
     RegCloseKey(key);
     notifySystem();
-    return true;
+    if (!enableWritten) spdlog::error("Sistem proxy: ProxyEnable yazilamadi");
+    return enableWritten;
 }
 
 bool SystemProxy::writeBackup(const std::string& path, const Snapshot& snapshot) {
@@ -174,14 +183,18 @@ bool SystemProxy::disable() {
     if (!saved_) return true;
 
     const bool restored = applySnapshot(snapshot_);
-    if (restored) {
-        spdlog::info("Sistem proxy ayarlari geri alindi");
+    if (!restored) {
+        // Keep the backup file and the in-memory snapshot: they are the only
+        // record of the user's original settings (--restore-proxy retries).
+        spdlog::error("Sistem proxy geri alinamadi; yedek korunuyor ({})", backupPath_);
+        return false;
     }
 
+    spdlog::info("Sistem proxy ayarlari geri alindi");
     fileutil::remove(backupPath_);
     saved_ = false;
     backupPath_.clear();
-    return restored;
+    return true;
 }
 
 bool SystemProxy::isOurs(uint16_t port) {

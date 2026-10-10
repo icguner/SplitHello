@@ -23,7 +23,12 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr std::wstring_view kWranglerPackage = L"wrangler@4";
+// The single place the Wrangler release is chosen. `npx --yes wrangler@<this>`
+// downloads and runs that package with the user's Cloudflare OAuth session, so
+// it should be an exact x.y.z (see `npm view wrangler@4 version`): a floating
+// "4" lets a broken or compromised new release run unreviewed. To bump, change
+// this value, then run --setup / --redeploy once against a scratch account.
+constexpr std::wstring_view kWranglerVersion = L"4.149.0";
 constexpr DWORD kProbeTimeoutMs = 120000;
 constexpr DWORD kLoginTimeoutMs = 10 * 60 * 1000;
 constexpr DWORD kDeployTimeoutMs = 5 * 60 * 1000;
@@ -60,6 +65,18 @@ struct ProcessResult {
 
     bool ok() const { return launched && !timedOut && exitCode == 0; }
 };
+
+std::string utf8Path(const fs::path& path) {
+    const std::wstring wide = path.wstring();
+    if (wide.empty()) return {};
+    const int length = WideCharToMultiByte(CP_UTF8, 0, wide.data(), (int)wide.size(),
+                                           nullptr, 0, nullptr, nullptr);
+    if (length <= 0) return {};
+    std::string utf8((size_t)length, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.data(), (int)wide.size(), utf8.data(), length,
+                        nullptr, nullptr);
+    return utf8;
+}
 
 std::wstring searchPath(const wchar_t* fileName) {
     const DWORD required = SearchPathW(nullptr, fileName, nullptr, 0, nullptr, nullptr);
@@ -191,26 +208,57 @@ ProcessResult runProcess(const std::wstring& application,
     mutableCommand.push_back(L'\0');
     std::vector<wchar_t> environment = sanitizedEnvironment();
 
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    startup.dwFlags = STARTF_USESTDHANDLES;
-    startup.hStdInput = inputRead.value;
-    startup.hStdOutput = outputWrite.value;
-    startup.hStdError = outputWrite.value;
-
-    PROCESS_INFORMATION process{};
-    if (!CreateProcessW(application.c_str(), mutableCommand.data(), nullptr, nullptr, TRUE,
-                        CREATE_UNICODE_ENVIRONMENT, environment.data(),
-                        workingDirectory.empty() ? nullptr : workingDirectory.c_str(),
-                        &startup, &process)) {
+    // Inherit exactly the two pipe ends the child needs. With bInheritHandles
+    // alone it would also receive every other inheritable handle in this
+    // process (sockets, log files, ...).
+    SIZE_T attributeSize = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeSize);
+    std::vector<char> attributeBuffer(attributeSize);
+    auto* attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributeBuffer.data());
+    if (attributeSize == 0 || !InitializeProcThreadAttributeList(attributes, 1, 0, &attributeSize)) {
         return result;
     }
+    HANDLE inheritedHandles[2] = {inputRead.value, outputWrite.value};
+    const bool attributesReady = UpdateProcThreadAttribute(
+        attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inheritedHandles,
+        sizeof(inheritedHandles), nullptr, nullptr) != 0;
+
+    STARTUPINFOEXW startup{};
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = inputRead.value;
+    startup.StartupInfo.hStdOutput = outputWrite.value;
+    startup.StartupInfo.hStdError = outputWrite.value;
+    startup.lpAttributeList = attributes;
+
+    // Started suspended so it is inside the job before it can spawn children;
+    // npx -> node -> wrangler is a chain, and killing only the head on timeout
+    // would leave the rest running.
+    PROCESS_INFORMATION process{};
+    const BOOL created = attributesReady && CreateProcessW(
+        application.c_str(), mutableCommand.data(), nullptr, nullptr, TRUE,
+        CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
+        environment.data(), workingDirectory.empty() ? nullptr : workingDirectory.c_str(),
+        &startup.StartupInfo, &process);
+    DeleteProcThreadAttributeList(attributes);
+    if (!created) return result;
 
     result.launched = true;
     Handle processHandle(process.hProcess);
     Handle threadHandle(process.hThread);
     inputRead = {};
     outputWrite = {};
+
+    Handle job(CreateJobObjectW(nullptr, nullptr));
+    if (job.value) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job.value, JobObjectExtendedLimitInformation, &limits,
+                                sizeof(limits));
+        if (!AssignProcessToJobObject(job.value, processHandle.value)) job = {};
+    }
+    if (!job.value) spdlog::debug("Wrangler job nesnesine atanamadi; yalnizca ana surec sonlandirilabilir");
+    ResumeThread(threadHandle.value);
 
     if (!input.empty()) {
         size_t offset = 0;
@@ -252,7 +300,8 @@ ProcessResult runProcess(const std::wstring& application,
         }
         if (GetTickCount64() >= deadline) {
             result.timedOut = true;
-            TerminateProcess(processHandle.value, ERROR_TIMEOUT);
+            if (job.value) TerminateJobObject(job.value, ERROR_TIMEOUT);
+            else TerminateProcess(processHandle.value, ERROR_TIMEOUT);
             WaitForSingleObject(processHandle.value, 5000);
             processEnded = true;
         }
@@ -343,7 +392,8 @@ std::pair<std::wstring, std::wstring> findNpxRuntime() {
 
 std::vector<std::wstring> npxArguments(const std::wstring& npxCli,
                                        std::initializer_list<std::wstring> arguments) {
-    std::vector<std::wstring> result{npxCli, L"--yes", std::wstring(kWranglerPackage)};
+    std::vector<std::wstring> result{npxCli, L"--yes",
+                                     L"wrangler@" + std::wstring(kWranglerVersion)};
     result.insert(result.end(), arguments.begin(), arguments.end());
     return result;
 }
@@ -395,8 +445,12 @@ std::optional<Identity> parseIdentity(const std::string& output) {
     return identity;
 }
 
-std::string parseWorkersDevUrl(const std::string& output) {
+std::string parseWorkersDevUrl(const std::string& output, const std::string& workerName) {
     constexpr std::string_view prefix = "https://";
+    // Wrangler prints "<worker>.<account-subdomain>.workers.dev". Requiring the
+    // worker name rules out other workers.dev links in its output (docs, a
+    // dashboard hint, someone else's template) being taken as ours.
+    const std::string namePrefix = workerName.empty() ? std::string{} : workerName + ".";
     size_t cursor = 0;
     while ((cursor = output.find(prefix, cursor)) != std::string::npos) {
         const size_t hostStart = cursor + prefix.size();
@@ -411,7 +465,8 @@ std::string parseWorkersDevUrl(const std::string& output) {
             return static_cast<char>(std::tolower(ch));
         });
         constexpr std::string_view suffix = ".workers.dev";
-        if (host.size() > suffix.size() && host.ends_with(suffix)) {
+        if (host.size() > suffix.size() && host.ends_with(suffix) &&
+            host.starts_with(namePrefix) && host.size() > namePrefix.size() + suffix.size()) {
             return "wss://" + host;
         }
         cursor = hostEnd;
@@ -491,8 +546,13 @@ DeployResult Client::deploy(const std::string& accountId,
 
     const fs::path scriptPath = directory.path() / L"index.js";
     const fs::path configPath = directory.path() / L"wrangler.toml";
-    if (!fileutil::writeAtomic(scriptPath.string(), workerSource) ||
-        !fileutil::writeAtomic(configPath.string(),
+    // fs::path::string() is lossy for a non-ANSI temp path (e.g. a profile name
+    // with Turkish characters); hand writeAtomic the UTF-8 form it prefers.
+    const std::string scriptFile = utf8Path(scriptPath);
+    const std::string configFile = utf8Path(configPath);
+    if (scriptFile.empty() || configFile.empty() ||
+        !fileutil::writeAtomic(scriptFile, workerSource) ||
+        !fileutil::writeAtomic(configFile,
                                makeWranglerConfig(accountId, workerName, true))) {
         std::cerr << "Gecici Worker dosyalari yazilamadi.\n";
         return deployment;
@@ -507,14 +567,20 @@ DeployResult Client::deploy(const std::string& accountId,
     };
 
     ProcessResult codeResult = deployCode();
+    bool deployedWithoutRateLimiter = false;
     if (!codeResult.ok()) {
-        spdlog::warn("Rate limit binding'i kabul edilmemis olabilir; binding olmadan "
-                     "bir kez daha deneniyor");
-        if (!fileutil::writeAtomic(configPath.string(),
+        // Any failure lands here, not only a rejected binding, so say plainly
+        // what the retry gives up instead of burying it in the debug log.
+        std::cerr << "UYARI: Worker deploy edilemedi; hesap duzeyindeki rate limit binding'i "
+                     "olmadan bir kez daha deneniyor.\n"
+                     "Basarili olursa Worker'in yalnizca isolate basina yedek sayaci olur "
+                     "(hesap capinda hiz siniri yok).\n";
+        if (!fileutil::writeAtomic(configFile,
                                    makeWranglerConfig(accountId, workerName, false))) {
             return deployment;
         }
         codeResult = deployCode();
+        deployedWithoutRateLimiter = codeResult.ok();
     }
     if (!codeResult.ok()) {
         if (codeResult.timedOut) std::cerr << "Wrangler deploy zaman asimina ugradi.\n";
@@ -533,8 +599,16 @@ DeployResult Client::deploy(const std::string& accountId,
         return deployment;
     }
 
-    deployment.workerUrl = parseWorkersDevUrl(codeResult.output);
-    if (deployment.workerUrl.empty() && previousWorkerUrl.starts_with("wss://") &&
+    if (deployedWithoutRateLimiter) {
+        std::cerr << "UYARI: Worker rate limit binding'i OLMADAN deploy edildi; yalnizca "
+                     "isolate basina yedek sayac aktif. Hesabiniz destekliyorsa --redeploy "
+                     "ile tekrar deneyin.\n";
+        spdlog::warn("Worker rate limit binding'i olmadan deploy edildi");
+    }
+
+    deployment.workerUrl = parseWorkersDevUrl(codeResult.output, workerName);
+    const std::string previousPrefix = "wss://" + workerName + ".";
+    if (deployment.workerUrl.empty() && previousWorkerUrl.starts_with(previousPrefix) &&
         previousWorkerUrl.ends_with(".workers.dev")) {
         deployment.workerUrl = previousWorkerUrl;
     }
