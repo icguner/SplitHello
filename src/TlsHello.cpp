@@ -47,20 +47,22 @@ bool readServerName(const uint8_t* data, size_t extStart, size_t extEnd, ClientH
     if (!r.u16(listLength)) return false;
     if (listLength > r.remaining()) return false;
 
-    const size_t listEnd = r.pos() + listLength;
-    while (r.pos() < listEnd) {
+    // Bounded to the declared list: a header that straddles listEnd must not be
+    // read, and remaining() must never be computed from a position past the end.
+    Reader list(data, r.pos(), r.pos() + listLength);
+    while (list.remaining() > 0) {
         uint8_t nameType = 0;
         uint16_t nameLength = 0;
-        if (!r.u8(nameType) || !r.u16(nameLength)) return false;
-        if (nameLength > listEnd - r.pos()) return false;
+        if (!list.u8(nameType) || !list.u16(nameLength)) return false;
+        if (nameLength > list.remaining()) return false;
 
         if (nameType == 0x00) { // host_name
-            out.sniOffset = r.pos();
+            out.sniOffset = list.pos();
             out.sniLength = nameLength;
-            out.serverName.assign((const char*)data + r.pos(), nameLength);
+            out.serverName.assign((const char*)data + list.pos(), nameLength);
             return true;
         }
-        if (!r.skip(nameLength)) return false;
+        if (!list.skip(nameLength)) return false;
     }
     return false; // well-formed list, but no host_name in it
 }
@@ -72,21 +74,23 @@ ParseStatus parseExtensions(const uint8_t* data, size_t pos, size_t bodyEnd, Cli
     if (!r.u16(extensionsLength)) return ParseStatus::Malformed;
     if (extensionsLength > r.remaining()) return ParseStatus::Malformed;
 
-    const size_t extensionsEnd = r.pos() + extensionsLength;
-    while (r.pos() < extensionsEnd) {
+    // Bounded to the declared block so a 4-byte extension header that runs past
+    // extensionsLength is Malformed instead of an out-of-range read.
+    Reader block(data, r.pos(), r.pos() + extensionsLength);
+    while (block.remaining() > 0) {
         uint16_t extType = 0;
         uint16_t extLength = 0;
-        if (!r.u16(extType) || !r.u16(extLength)) return ParseStatus::Malformed;
-        if (extLength > extensionsEnd - r.pos()) return ParseStatus::Malformed;
+        if (!block.u16(extType) || !block.u16(extLength)) return ParseStatus::Malformed;
+        if (extLength > block.remaining()) return ParseStatus::Malformed;
 
-        const size_t extStart = r.pos();
+        const size_t extStart = block.pos();
         if (extType == kExtEncryptedClientHello) {
             out.hasEch = true;
         } else if (extType == kExtServerName && !out.hasSni()) {
             readServerName(data, extStart, extStart + extLength, out);
         }
 
-        if (!r.skip(extLength)) return ParseStatus::Malformed;
+        if (!block.skip(extLength)) return ParseStatus::Malformed;
     }
     return ParseStatus::Ok;
 }
