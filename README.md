@@ -112,6 +112,8 @@ splithello.exe            # normal run
 
 Prebuilt zips are on the [releases page](https://github.com/icguner/SplitHello/releases). Keep `splithello.exe`, `WinDivert.dll` and `WinDivert64.sys` in the same folder.
 
+To build an installer (`dist\SplitHello-Setup-<version>.exe`) from a finished build, install [Inno Setup 6](https://jrsoftware.org/isinfo.php) and run `installer\build.ps1 [-Version 1.0.0] [-BuildDir build\Release]`. It installs to `C:\Program Files\SplitHello` by default because "Windows ile başlat" only works from an admin-only folder; the "just me" option installs under `%LOCALAPPDATA%\Programs` and leaves that tray option disabled. Settings stay in `%APPDATA%\splithello`, and the uninstaller asks before deleting them.
+
 <details>
 <summary>Command-line options</summary>
 
