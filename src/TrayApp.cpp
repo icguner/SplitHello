@@ -2,7 +2,9 @@
 
 #include "CommandLine.hpp"
 #include "DashboardPanel.hpp"
+#include "Config.hpp"
 #include "EngineExitCodes.hpp"
+#include "FileUtil.hpp"
 #include "SplitHelloIcon.hpp"
 
 #include <spdlog/spdlog.h>
@@ -12,6 +14,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <stop_token>
 #include <string_view>
@@ -35,6 +38,8 @@ constexpr UINT kCommandDashboard = 1006;
 constexpr UINT kCommandDnsWorker = 1007;
 constexpr UINT kCommandDnsSystem = 1008;
 constexpr UINT kCommandSetup = 1009;
+constexpr UINT kCommandAllowBase = 2000;     // + index into the "recently blocked" submenu
+constexpr size_t kRecentBlockedChoices = 10;
 
 // An engine that stays in Starting/Stopping this long is hung. Terminating it
 // closes its WinDivert handle in the kernel, which removes the filter (fail-open).
@@ -539,6 +544,46 @@ void TrayApp::showMenu() {
     AppendMenuW(menu, MF_STRING | (setupProcess_ ? MF_DISABLED : 0),
                 kCommandSetup, L"Cloudflare Worker kurulumunu çalıştır");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
+    // Written by the engine (see adblock::Updater): "#total<TAB>N", then
+    // "host<TAB>count" lines. Clicking a host allows it from now on.
+    recentBlocked_.clear();
+    if (config.adBlock) {
+        std::string recent;
+        std::wstring title = L"Reklam engeli";
+        HMENU submenu = CreatePopupMenu();
+        if (submenu && fileutil::readAll(Config::configDir() + "\\adblock-recent.txt", recent)) {
+            size_t position = 0;
+            while (position < recent.size() && recentBlocked_.size() < kRecentBlockedChoices) {
+                size_t end = recent.find('\n', position);
+                if (end == std::string::npos) end = recent.size();
+                const std::string line = recent.substr(position, end - position);
+                position = end + 1;
+                const size_t tab = line.find('\t');
+                if (tab == std::string::npos) continue;
+                if (line.compare(0, tab, "#total") == 0) {
+                    title += L" (" + std::to_wstring(std::strtoull(line.c_str() + tab + 1, nullptr, 10)) +
+                             L" engellendi)";
+                    continue;
+                }
+                const std::string host = line.substr(0, tab);
+                recentBlocked_.push_back(host);
+                const std::wstring label = std::wstring(host.begin(), host.end()) +
+                    L"  ×" + std::wstring(line.begin() + tab + 1, line.end()) +
+                    L"  — serbest bırak";
+                AppendMenuW(submenu, MF_STRING,
+                            kCommandAllowBase + (UINT)(recentBlocked_.size() - 1),
+                            label.c_str());
+            }
+        }
+        if (submenu && recentBlocked_.empty()) {
+            AppendMenuW(submenu, MF_STRING | MF_DISABLED, 0, L"Henüz engellenen yok");
+        }
+        if (submenu) {
+            AppendMenuW(menu, MF_POPUP, (UINT_PTR)submenu, title.c_str());
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        }
+    }
     AppendMenuW(menu, MF_STRING | (startupEnabled_ ? MF_CHECKED : 0),
                 kCommandStartup, L"Windows ile başlat");
     AppendMenuW(menu, MF_STRING, kCommandOpenLogs, L"Log klasörünü aç");
@@ -552,6 +597,22 @@ void TrayApp::showMenu() {
                                         cursor.x, cursor.y, 0, window_, nullptr);
     DestroyMenu(menu);
     if (command != 0) PostMessageW(window_, WM_COMMAND, command, 0);
+}
+
+void TrayApp::allowBlockedHost(size_t index) {
+    if (index >= recentBlocked_.size()) return;
+    const std::string& host = recentBlocked_[index];
+    std::ofstream file(fileutil::widen(Config::configDir() + "\\adblock-allow.txt"),
+                       std::ios::app);
+    file << host << "\n";
+    file.flush();
+    if (!file) {
+        showBalloon(L"Serbest bırakılamadı", L"Liste dosyasına yazılamadı.", NIIF_ERROR);
+        return;
+    }
+    showBalloon(L"Reklam engeli",
+                std::wstring(host.begin(), host.end()) +
+                    L" serbest bırakıldı (birkaç saniye içinde geçerli olur).");
 }
 
 void TrayApp::startEngine(bool automatic) {
@@ -1011,7 +1072,12 @@ LRESULT TrayApp::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         case kCommandOpenLogs: openLogDirectory(); break;
         case kCommandDashboard: openDashboard(); break;
         case kCommandExit: requestExit(); break;
-        default: break;
+        default:
+            if (LOWORD(wParam) >= kCommandAllowBase &&
+                LOWORD(wParam) < kCommandAllowBase + kRecentBlockedChoices) {
+                allowBlockedHost(LOWORD(wParam) - kCommandAllowBase);
+            }
+            break;
         }
         return 0;
     case WM_TIMER:

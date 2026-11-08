@@ -149,13 +149,16 @@ Response perform(const Request& request) {
         response.retryAfterSeconds = queryRetryAfterSeconds(handle);
     }
 
-    // Cap the body: these endpoints return small JSON, anything larger is a
-    // captive portal or an error page we have no use for.
-    constexpr size_t kMaxBody = 256 * 1024;
+    // Cap the body: the default suits small JSON; anything larger is a captive
+    // portal or an error page unless the caller raised maxBodyBytes. A capped
+    // body is a failure, never a silently truncated success.
     char buffer[8192];
     DWORD read = 0;
     while (WinHttpReadData(handle, buffer, sizeof(buffer), &read) && read > 0) {
-        if (response.body.size() + read > kMaxBody) break;
+        if (response.body.size() + read > request.maxBodyBytes) {
+            response.status = -1;
+            break;
+        }
         response.body.append(buffer, read);
     }
 

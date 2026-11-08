@@ -147,6 +147,43 @@ char lowerAscii(uint8_t c) {
     return (char)((c >= 'A' && c <= 'Z') ? c + 32 : c);
 }
 
+constexpr uint16_t kTypeCname = 5;
+constexpr uint16_t kTypeTxt = 16;
+constexpr uint16_t kTypeRrsig = 46;
+constexpr uint16_t kSvcParamEch = 5;
+
+// Reads the name at `offset`, following compression pointers, into `out` as
+// uncompressed wire bytes. `end` is the offset just past the name as written.
+bool readName(const uint8_t* data, size_t length, size_t offset,
+              std::vector<uint8_t>& out, size_t& end) {
+    out.clear();
+    size_t cursor = offset;
+    bool jumped = false;
+    unsigned hops = 0;
+    while (true) {
+        if (cursor >= length) return false;
+        const uint8_t first = data[cursor];
+        if (first == 0) {
+            out.push_back(0);
+            if (!jumped) end = cursor + 1;
+            return true;
+        }
+        if ((first & 0xC0) == 0xC0) {
+            if (cursor + 2 > length || ++hops > 16) return false;
+            if (!jumped) end = cursor + 2;
+            jumped = true;
+            cursor = (size_t)(((first & 0x3F) << 8) | data[cursor + 1]);
+            continue;
+        }
+        if ((first & 0xC0) != 0 || cursor + 1 + first > length ||
+            out.size() + 1 + first + 1 > 255) {
+            return false;
+        }
+        out.insert(out.end(), data + cursor, data + cursor + 1 + first);
+        cursor += 1 + (size_t)first;
+    }
+}
+
 } // namespace
 
 bool parseQuery(const uint8_t* data, size_t length, Query& out) {
@@ -312,6 +349,107 @@ bool echoesQuestion(const uint8_t* data, size_t length, const Query& query) {
             return false;
         }
     }
+    return true;
+}
+
+bool stripEch(std::vector<uint8_t>& message) {
+    const uint8_t* data = message.data();
+    const size_t length = message.size();
+    if (length < kHeaderSize) return false;
+
+    const size_t questions = read16(data + 4);
+    const size_t counts[3] = {read16(data + 6), read16(data + 8), read16(data + 10)};
+    size_t offset = kHeaderSize;
+    for (size_t index = 0; index < questions; ++index) {
+        if (!skipName(data, length, offset) || offset + 4 > length) return false;
+        offset += 4;
+    }
+
+    // Header and questions are copied verbatim, so a 0xC00C pointer to the
+    // question name stays valid in the rebuilt message.
+    std::vector<uint8_t> out(data, data + offset);
+    size_t removed = 0;
+    std::vector<uint8_t> name;
+
+    for (const size_t count : counts) {
+        for (size_t index = 0; index < count; ++index) {
+            const size_t nameStart = offset;
+            size_t nameEnd = 0;
+            if (!readName(data, length, offset, name, nameEnd) || nameEnd + 10 > length) {
+                return false;
+            }
+            const uint16_t type = read16(data + nameEnd);
+            const size_t rdStart = nameEnd + 10;
+            const size_t rdLength = read16(data + nameEnd + 8);
+            const size_t rdEnd = rdStart + rdLength;
+            if (rdEnd > length) return false;
+
+            if (nameEnd - nameStart == 2 && data[nameStart] == 0xC0 &&
+                data[nameStart + 1] == 0x0C) {
+                out.push_back(0xC0);
+                out.push_back(0x0C);
+            } else {
+                out.insert(out.end(), name.begin(), name.end());
+            }
+            out.insert(out.end(), data + nameEnd, data + nameEnd + 8); // type, class, TTL
+            const size_t lengthPos = out.size();
+            append16(out, 0);
+            const size_t rdataBegin = out.size();
+
+            switch (type) {
+            case kTypeHttps:
+            case kTypeSvcb: {
+                size_t targetEnd = 0;
+                if (rdLength < 3 ||
+                    !readName(data, length, rdStart + 2, name, targetEnd) ||
+                    targetEnd > rdEnd) {
+                    return false;
+                }
+                out.insert(out.end(), data + rdStart, data + rdStart + 2); // priority
+                out.insert(out.end(), name.begin(), name.end());
+                for (size_t cursor = targetEnd; cursor < rdEnd;) {
+                    if (cursor + 4 > rdEnd) return false;
+                    const uint16_t key = read16(data + cursor);
+                    const size_t valueLength = read16(data + cursor + 2);
+                    if (cursor + 4 + valueLength > rdEnd) return false;
+                    if (key == kSvcParamEch) {
+                        ++removed;
+                    } else {
+                        out.insert(out.end(), data + cursor,
+                                   data + cursor + 4 + valueLength);
+                    }
+                    cursor += 4 + valueLength;
+                }
+                break;
+            }
+            case kTypeCname: {
+                size_t targetEnd = 0;
+                if (!readName(data, length, rdStart, name, targetEnd) || targetEnd != rdEnd) {
+                    return false;
+                }
+                out.insert(out.end(), name.begin(), name.end());
+                break;
+            }
+            case kTypeA:
+            case kTypeAaaa:
+            case kTypeOpt:
+            case kTypeRrsig:
+            case kTypeTxt:
+                out.insert(out.end(), data + rdStart, data + rdEnd);
+                break;
+            default:
+                return false; // may hold compressed names this cannot rewrite
+            }
+
+            const size_t newLength = out.size() - rdataBegin;
+            if (newLength > 0xFFFF) return false;
+            write16(out.data() + lengthPos, (uint16_t)newLength);
+            offset = rdEnd;
+        }
+    }
+
+    if (removed == 0) return false;
+    message = std::move(out);
     return true;
 }
 

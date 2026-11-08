@@ -1,3 +1,4 @@
+#include "AdBlock.hpp"
 #include "CommandLine.hpp"
 #include "Config.hpp"
 #include "Dns.hpp"
@@ -744,6 +745,16 @@ int main(int argc, char* argv[]) {
     process_filter::Filter processFilter(process_filter::Rules(
         config.processInclude, config.processExclude));
     strategies.load();
+    // HaGeZi lists (GPL-3.0) are downloaded, never bundled; the updater thread is
+    // joined when this scope ends.
+    std::unique_ptr<adblock::Updater> adBlockUpdater;
+    if (config.adBlock && !Config::configDir().empty()) {
+        const std::string dir = Config::configDir();
+        adBlockUpdater = std::make_unique<adblock::Updater>(
+            adblock::UpdaterFiles{dir, dir + "\\adblock-allow.txt",
+                                  dir + "\\adblock-recent.txt"},
+            config.adBlockLists, config.adBlockAllow);
+    }
     if (!telemetryStore->start()) {
         spdlog::warn("Yerel telemetri baslatilamadi; ag motoru istatistiksiz devam ediyor");
     }

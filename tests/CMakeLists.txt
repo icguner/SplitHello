@@ -1,5 +1,6 @@
 add_executable(splithello_tests
     TestMain.cpp
+    TestAdBlock.cpp
     TestWsLifecycle.cpp
     TestCommandLine.cpp
     TestConfig.cpp

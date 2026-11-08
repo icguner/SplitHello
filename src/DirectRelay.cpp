@@ -1,5 +1,6 @@
 #include "DirectRelay.hpp"
 
+#include "AdBlock.hpp"
 #include "PacketStrategy.hpp"
 #include "Relay.hpp"
 #include "TcpConnect.hpp"
@@ -310,6 +311,13 @@ bool DirectRelay::collectClientHello() {
             helloComplete_ = true;
             if (!hello_.serverName.empty()) {
                 targetHost_ = strategy::normalizeHost(hello_.serverName);
+            }
+            if (adblock::global().blocks(targetHost_)) {
+                // Returning false closes both sockets: the client fails fast and
+                // nothing is ever sent to the ad host.
+                adblock::recordBlocked(targetHost_);
+                spdlog::debug("Reklam/izleyici engellendi: {}", targetHost_);
+                return false;
             }
             if (hello_.hasEch) {
                 spdlog::debug("{}: ECH uzantisi var (gercek ECH veya GREASE); tum guvenli profiller acik",

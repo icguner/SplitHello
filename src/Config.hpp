@@ -26,6 +26,10 @@ struct Config {
     bool tunnelFallback = false;                 // use the Worker /tunnel relay as a last resort
     std::vector<std::string> processInclude;     // wildcard executable allow-list
     std::vector<std::string> processExclude;     // wildcard executable deny-list
+    bool adBlock = true;                         // block ad/tracker domains (HaGeZi list)
+    std::vector<std::string> adBlockAllow;       // domains never blocked, with their subdomains
+    // HaGeZi lists to merge: light, pro, tif (malware/phishing), doh (DoH servers).
+    std::vector<std::string> adBlockLists = {"pro"};
 
     // True when load() upgraded a plaintext token; main() re-saves in that case.
     bool migratedFromPlaintext = false;

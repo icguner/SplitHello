@@ -9,6 +9,8 @@ namespace dns_message {
 
 inline constexpr uint16_t kTypeA = 1;
 inline constexpr uint16_t kTypeAaaa = 28;
+inline constexpr uint16_t kTypeSvcb = 64;
+inline constexpr uint16_t kTypeHttps = 65;
 
 inline constexpr uint8_t kRcodeNoError = 0;
 inline constexpr uint8_t kRcodeFormErr = 1;
@@ -70,6 +72,13 @@ bool inspectResponse(const uint8_t* data, size_t length, ResponseInfo& out);
 
 // True when `data` repeats the query's single question (ASCII case-insensitive).
 bool echoesQuestion(const uint8_t* data, size_t length, const Query& query);
+
+// Removes the "ech" SvcParam from every HTTPS/SVCB record of a response, so a
+// browser falls back to a plain ClientHello whose SNI can be filtered. The
+// message is rebuilt with uncompressed names. Returns true only when something
+// was removed; a malformed message, or one holding record types whose RDATA
+// this cannot rewrite safely, is left exactly as it was (and returns false).
+bool stripEch(std::vector<uint8_t>& message);
 
 void setId(std::vector<uint8_t>& message, uint16_t id);
 

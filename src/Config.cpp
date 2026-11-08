@@ -163,6 +163,13 @@ bool Config::load() {
     tunnelFallback = json::getBool(json, "tunnel_fallback");
     processInclude = readProcessRules(json, "process_include");
     processExclude = readProcessRules(json, "process_exclude");
+    // On unless the file says otherwise, so configs from older releases get it.
+    adBlock = json::findValue(json, "ad_block") == std::string::npos ||
+              json::getBool(json, "ad_block");
+    adBlockAllow = json::getStringArray(json, "ad_block_allow");
+    if (json::findValue(json, "ad_block_lists") != std::string::npos) {
+        adBlockLists = json::getStringArray(json, "ad_block_lists");
+    }
 
     // An include list that normalizes to nothing would read as "no include
     // rules" = every process. Flag it so the engine fails closed instead.
@@ -218,7 +225,10 @@ bool Config::save() const {
     content += "  \"probe_timeout_ms\": " + std::to_string(probeTimeoutMs) + ",\n";
     content += "  \"tunnel_fallback\": " + std::string(tunnelFallback ? "true" : "false") + ",\n";
     content += "  \"process_include\": " + stringArrayJson(processInclude) + ",\n";
-    content += "  \"process_exclude\": " + stringArrayJson(processExclude) + "\n";
+    content += "  \"process_exclude\": " + stringArrayJson(processExclude) + ",\n";
+    content += "  \"ad_block\": " + std::string(adBlock ? "true" : "false") + ",\n";
+    content += "  \"ad_block_allow\": " + stringArrayJson(adBlockAllow) + ",\n";
+    content += "  \"ad_block_lists\": " + stringArrayJson(adBlockLists) + "\n";
     content += "}\n";
 
     const std::string path = configPath();

@@ -33,6 +33,7 @@ struct Request {
     std::string body;
     unsigned timeoutMs = 8000;
     uint16_t connectPort = 0;   // transport-only override; TLS/Host still use `host`
+    size_t maxBodyBytes = 256 * 1024;   // larger bodies are cut off (raise for list downloads)
 };
 
 Response perform(const Request& request);

@@ -66,6 +66,8 @@ private:
     void setDnsMode(DnsMode mode);
     void openLogDirectory() const;
     void openDashboard();
+    // Appends a recently blocked host to the engine's live-reloaded allow file.
+    void allowBlockedHost(size_t index);
     void restartEngineForConfiguration();
     // Runs "splithello.exe --setup-only" in its own console (Cloudflare login +
     // Worker deploy). pollSetup() picks up the result and starts the engine.
@@ -76,6 +78,7 @@ private:
     std::wstring logDirectory_;
     std::wstring liveStatsName_;
     std::string telemetryPath_;
+    std::vector<std::string> recentBlocked_;   // menu entries of the last showMenu()
     std::unique_ptr<DashboardPanel> dashboard_;
     bool canStart_ = false;
     bool startupEnabled_ = false;

@@ -96,6 +96,7 @@ add_custom_command(
 
 # ---- Core logic, shared by the executable and the tests ----
 add_library(splithello_core STATIC
+    src/AdBlock.cpp
     src/Config.cpp
     src/Diagnosis.cpp
     src/DirectRelay.cpp

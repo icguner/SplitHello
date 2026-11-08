@@ -1,5 +1,6 @@
 #include "TransparentDnsProxy.hpp"
 
+#include "AdBlock.hpp"
 #include "DnsMessage.hpp"
 #include "RecoveryPolicy.hpp"
 
@@ -232,6 +233,19 @@ std::vector<uint8_t> TransparentDnsProxy::buildReply(const uint8_t* data, size_t
                                 : std::vector<uint8_t>{};
     }
 
+    // The Worker's own bootstrap names are never filtered, whatever the list says.
+    if (!resolver_.isBootstrapHost(query.name) &&
+        adblock::global().blocks(query.name)) {
+        adblock::recordBlocked(query.name);
+        // A sinkhole address makes the client's connect() fail at once; NXDOMAIN
+        // would send some apps off to another resolver. Other record types (HTTPS
+        // included) get an empty NOERROR answer. A short TTL keeps "allow" quick.
+        std::vector<std::string> sink;
+        if (query.type == dns_message::kTypeA) sink = {"0.0.0.0"};
+        else if (query.type == dns_message::kTypeAaaa) sink = {"::"};
+        return dns_message::buildResponse(query, sink, 30);
+    }
+
     std::vector<uint8_t> response;
     if (query.type == dns_message::kTypeA ||
         query.type == dns_message::kTypeAaaa) {
@@ -257,6 +271,13 @@ std::vector<uint8_t> TransparentDnsProxy::buildReply(const uint8_t* data, size_t
         }
     } else {
         response = resolver_.queryWire(data, length, deadlineMs);
+        // ECH would hide the SNI from the filter (and from the DPI bypass); with
+        // the key removed the browser sends a normal ClientHello instead.
+        if (query.type == dns_message::kTypeHttps || query.type == dns_message::kTypeSvcb) {
+            if (dns_message::stripEch(response)) {
+                spdlog::debug("DNS relay: {} icin ECH anahtari kaldirildi", query.name);
+            }
+        }
     }
     if (response.empty()) {
         response = dns_message::buildResponse(query, {}, 60, true);
