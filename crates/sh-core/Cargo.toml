@@ -1,0 +1,12 @@
+[package]
+name = "sh-core"
+description = "Platform plumbing shared by every SplitHello component (files, config, logging, live stats)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
