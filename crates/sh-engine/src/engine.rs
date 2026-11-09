@@ -83,6 +83,24 @@ pub fn run(options: &Options) -> i32 {
         }
     }
 
+    if options.action == crate::options::Action::Setup && !sh_setup::run_setup(&mut config, &dir) {
+        return 1;
+    }
+    if options.worker_url.is_empty()
+        && config.worker_url.is_empty()
+        && config.dns_mode == DnsMode::Worker
+    {
+        if options.engine {
+            // The hidden engine has no console; never block it on setup.
+            tracing::error!("Worker yapilandirmasi yok; once splithello.exe --setup calistirin");
+            return EXIT_SETUP_REQUIRED;
+        }
+        println!("Yapilandirma bulunamadi. Setup baslatiliyor...");
+        if !sh_setup::run_setup(&mut config, &dir) {
+            return 1;
+        }
+    }
+
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -130,8 +148,6 @@ async fn serve(options: &Options, mut config: Config, dir: PathBuf) -> i32 {
     };
     let use_worker_dns = config.dns_mode == DnsMode::Worker;
     if worker_url.is_empty() && use_worker_dns {
-        // shortcut: the interactive first-run setup arrives with the setup
-        // port; until then every caller gets the engine's setup-required code.
         tracing::error!("Worker yapilandirmasi yok; once splithello.exe --setup calistirin");
         return EXIT_SETUP_REQUIRED;
     }

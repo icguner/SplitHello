@@ -10,6 +10,21 @@ use base64::engine::general_purpose::STANDARD;
 /// cannot be dropped into our config and decrypted by us. No trailing NUL.
 const ENTROPY: &[u8] = b"SplitHello/config/v1";
 
+/// `bytes` of OS randomness as lowercase hex (the Worker shared secret);
+/// empty when the system RNG fails.
+pub fn random_hex(bytes: usize) -> String {
+    use windows::Win32::Security::Cryptography::{
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+    };
+    let mut buffer = vec![0u8; bytes];
+    // SAFETY: fills our buffer from the system-preferred RNG.
+    let status = unsafe { BCryptGenRandom(None, &mut buffer, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
+    if status.is_err() {
+        return String::new();
+    }
+    buffer.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Encrypts `plaintext`; empty on failure (callers never fall back to writing
 /// the secret in the clear).
 pub fn protect(plaintext: &str) -> String {
@@ -145,6 +160,14 @@ mod platform {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn random_hex_is_fresh_hex() {
+        let (a, b) = (random_hex(32), random_hex(32));
+        assert_eq!(a.len(), 64);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
 
     #[test]
     fn round_trips_and_rejects_foreign_blobs() {

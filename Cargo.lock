@@ -3043,6 +3043,7 @@ dependencies = [
  "sh-flow",
  "sh-net",
  "sh-relay",
+ "sh-setup",
  "sh-strategy",
  "sh-telemetry",
  "tokio",
@@ -3091,6 +3092,18 @@ dependencies = [
  "socket2",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "sh-setup"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sh-core",
+ "sh-net",
+ "tokio",
+ "tracing",
+ "windows",
 ]
 
 [[package]]

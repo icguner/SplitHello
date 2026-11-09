@@ -14,6 +14,7 @@ sh-dns = { path = "../sh-dns" }
 sh-flow = { path = "../sh-flow" }
 sh-net = { path = "../sh-net" }
 sh-relay = { path = "../sh-relay" }
+sh-setup = { path = "../sh-setup" }
 sh-strategy = { path = "../sh-strategy" }
 sh-telemetry = { path = "../sh-telemetry" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync", "signal"] }
