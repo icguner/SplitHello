@@ -90,7 +90,7 @@ pub fn run(options: &Options) -> i32 {
         && config.worker_url.is_empty()
         && config.dns_mode == DnsMode::Worker
     {
-        if options.engine {
+        if options.engine || options.action == crate::options::Action::Service {
             // The hidden engine has no console; never block it on setup.
             tracing::error!("Worker yapilandirmasi yok; once splithello.exe --setup calistirin");
             return EXIT_SETUP_REQUIRED;

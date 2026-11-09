@@ -15,6 +15,8 @@ fn main() {
             sh_ui::panel::run(&options.live_stats)
         }
         Action::EnableStartup => sh_ui::startup::enable_from_command_line(),
+        Action::InstallService => sh_ui::service::install(),
+        Action::UninstallService => sh_ui::service::uninstall(),
         Action::Run if options.tray_mode() => sh_ui::run_tray(&options, &args),
         _ => sh_engine::run(options),
     };

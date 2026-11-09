@@ -93,9 +93,18 @@ mod platform {
     }
 
     pub fn protect(plaintext: &[u8]) -> Option<Vec<u8>> {
+        use windows::Win32::Security::Cryptography::CRYPTPROTECT_LOCAL_MACHINE;
         let input = blob(plaintext);
         let entropy = blob(ENTROPY);
         let mut output = CRYPT_INTEGER_BLOB::default();
+        // The SYSTEM service cannot open a user-scoped blob, so the shared
+        // folder (readable by that user and SYSTEM only) holds machine-scoped
+        // ones. CryptUnprotectData reads either scope without a flag.
+        let flags = if crate::paths::shared_mode() {
+            CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE
+        } else {
+            CRYPTPROTECT_UI_FORBIDDEN
+        };
         // SAFETY: all pointers reference live buffers for the duration of the call.
         let result = unsafe {
             CryptProtectData(
@@ -104,7 +113,7 @@ mod platform {
                 Some(&entropy),
                 None,
                 None,
-                CRYPTPROTECT_UI_FORBIDDEN,
+                flags,
                 &mut output,
             )
         };

@@ -3,6 +3,7 @@
 //! egui panel, which runs as its own process (`--panel`).
 
 pub mod panel;
+pub mod service;
 pub mod startup;
 mod theme;
 pub mod tray;
@@ -38,7 +39,9 @@ pub fn detach_console() {
 pub fn run_tray(options: &Options, args: &[String]) -> i32 {
     detach_console();
     sh_core::logging::init(false, None);
-    if !sh_engine::win::is_elevated() {
+    // With the service installed the engine already has its rights: the
+    // tray runs as the normal user and never asks for elevation.
+    if !service::installed() && !sh_engine::win::is_elevated() {
         // Decide "already running" before the UAC prompt; otherwise a second
         // launch asks for elevation and then exits without a word.
         if tray::instance_running() {

@@ -4,6 +4,7 @@
 pub mod adblock_updater;
 pub mod engine;
 pub mod options;
+pub mod service;
 pub mod win;
 
 use options::Action;
@@ -25,6 +26,7 @@ pub fn run(options: options::Options) -> i32 {
         Action::ForgetStrategies => forget_strategies(),
         Action::ForgetToken => forget_token(),
         Action::Run | Action::Setup => engine::run(&options),
+        Action::Service => service::run(),
         Action::SetupOnly | Action::Redeploy => setup_only(options.action),
         _ => {
             eprintln!(

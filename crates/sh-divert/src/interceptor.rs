@@ -886,12 +886,40 @@ mod tests {
     fn per_packet_cost() {
         let p = processor(QuicMode::Allow);
         // An owned upstream flow: SYN seen, then 1400-byte data both ways.
-        let syn = build(false, true, ("10.0.0.5", 40000), ("1.2.3.4", CONNECT), TCP_SYN, b"");
+        let syn = build(
+            false,
+            true,
+            ("10.0.0.5", 40000),
+            ("1.2.3.4", CONNECT),
+            TCP_SYN,
+            b"",
+        );
         run_one(&p, syn, outbound());
         let payload = vec![0x17u8; 1400];
-        let up = build(false, true, ("10.0.0.5", 40000), ("1.2.3.4", CONNECT), TCP_ACK, &payload);
-        let down = build(false, true, ("1.2.3.4", 443), ("10.0.0.5", 40000), TCP_ACK, &payload);
-        let foreign = build(false, true, ("10.0.0.5", 41000), ("5.6.7.8", 443), TCP_ACK, &payload);
+        let up = build(
+            false,
+            true,
+            ("10.0.0.5", 40000),
+            ("1.2.3.4", CONNECT),
+            TCP_ACK,
+            &payload,
+        );
+        let down = build(
+            false,
+            true,
+            ("1.2.3.4", 443),
+            ("10.0.0.5", 40000),
+            TCP_ACK,
+            &payload,
+        );
+        let foreign = build(
+            false,
+            true,
+            ("10.0.0.5", 41000),
+            ("5.6.7.8", 443),
+            TCP_ACK,
+            &payload,
+        );
         let mut inbound = Address::default();
         inbound.set_outbound(false);
         let mut out = Batch::default();

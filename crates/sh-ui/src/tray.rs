@@ -189,6 +189,9 @@ struct Tray {
     engine: Option<Engine>,
     setup: Option<(Child, bool)>,
     panel: Option<Child>,
+    /// Set when the engine is the SplitHello Windows service: the tray then
+    /// runs unelevated and starts/stops it through the SCM.
+    service: Option<crate::service::Control>,
 }
 
 thread_local! {
@@ -262,13 +265,18 @@ fn run_window(engine_arguments: Vec<String>, can_start: bool) -> i32 {
         }
     };
 
+    let service = crate::service::Control::open();
     let mut tray = Tray {
         window,
         icon: NOTIFYICONDATAW::default(),
         // SAFETY: registers (or looks up) a system-wide message id.
         taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
         engine_arguments,
-        live_stats_name: unique_name("live-stats"),
+        live_stats_name: if service.is_some() {
+            sh_core::live_stats::SERVICE_MAPPING.into()
+        } else {
+            unique_name("live-stats")
+        },
         recent_blocked: Vec::new(),
         can_start,
         startup_enabled: false,
@@ -283,6 +291,7 @@ fn run_window(engine_arguments: Vec<String>, can_start: bool) -> i32 {
         engine: None,
         setup: None,
         panel: None,
+        service,
     };
     if !tray.add_icon() {
         // SAFETY: our window.
@@ -689,6 +698,19 @@ impl Tray {
         if !automatic {
             self.budget.reset();
         }
+        if let Some(service) = &self.service {
+            if service.start() {
+                self.set_state(EngineState::Starting);
+            } else {
+                self.set_state(EngineState::Failed);
+                self.balloon(
+                    "SplitHello başlatılamadı",
+                    "SplitHello hizmeti başlatılamadı.",
+                    NIIF_ERROR,
+                );
+            }
+            return;
+        }
         let Some(executable) = exe() else {
             self.set_state(EngineState::Failed);
             self.balloon(
@@ -761,6 +783,13 @@ impl Tray {
             );
             return;
         }
+        if let Some(service) = &self.service {
+            if matches!(self.state, EngineState::Starting | EngineState::Running) {
+                service.stop();
+                self.set_state(EngineState::Stopping);
+            }
+            return;
+        }
         let Some(engine) = &self.engine else {
             return;
         };
@@ -777,7 +806,14 @@ impl Tray {
         self.restart_pending = false;
         self.restart_at_ms = 0;
         self.configuration_restart_pending = false;
-        if self.engine.is_some() {
+        let service_active = self.service.is_some()
+            && matches!(
+                self.state,
+                EngineState::Starting | EngineState::Running | EngineState::Stopping
+            );
+        if self.engine.is_some() || service_active {
+            // Quitting the tray ends protection, as before; poll() closes the
+            // window once the engine or service has stopped.
             self.request_stop();
         } else {
             self.destroy();
@@ -868,6 +904,10 @@ impl Tray {
             self.panel = None;
         }
         let now = now_ms();
+        if self.service.is_some() {
+            self.poll_service(now);
+            return;
+        }
         let Some(engine) = &mut self.engine else {
             if self.restart_pending && now >= self.restart_at_ms {
                 self.start_engine(true);
@@ -909,6 +949,45 @@ impl Tray {
         self.handle_engine_exit(code, now);
     }
 
+    /// Service mode: follow the SCM state. The service restarts transient
+    /// engine exits itself, so a stop seen here is final for this run.
+    fn poll_service(&mut self, now: u64) {
+        use crate::service::State;
+        let Some(status) = self.service.as_ref().and_then(|s| s.status()) else {
+            return;
+        };
+        match status.state {
+            State::Running if self.state != EngineState::Running => {
+                self.set_state(EngineState::Running);
+                self.balloon("SplitHello", "Koruma aktif.", NIIF_INFO);
+            }
+            State::Starting
+                if !matches!(self.state, EngineState::Starting | EngineState::Stopping) =>
+            {
+                self.set_state(EngineState::Starting); // started elsewhere, or restarting
+            }
+            State::Stopping if self.state != EngineState::Stopping => {
+                self.set_state(EngineState::Stopping);
+            }
+            State::Stopped => {
+                // StartService can report "stopped" for a moment before the
+                // service process registers; do not read that as a failure.
+                let just_started =
+                    self.state == EngineState::Starting && now - self.state_since_ms < 2000;
+                if matches!(
+                    self.state,
+                    EngineState::Starting | EngineState::Running | EngineState::Stopping
+                ) && !just_started
+                {
+                    self.handle_engine_exit(status.exit_code, now);
+                } else if self.exiting {
+                    self.destroy();
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_engine_exit(&mut self, code: u32, now: u64) {
         let expected = self.state == EngineState::Stopping || self.exiting;
         self.engine = None;
@@ -947,6 +1026,18 @@ impl Tray {
                 &format!(
                     "{} Düzelttikten sonra Başlat seçin.",
                     reason.unwrap_or("Ağ motoru başlatılamadı.")
+                ),
+                NIIF_ERROR,
+            );
+        } else if self.service.is_some() {
+            // The service already spent its restart budget (or was stopped
+            // from outside): report, do not restart from here.
+            self.set_state(EngineState::Failed);
+            self.balloon(
+                "SplitHello koruması durdu",
+                &format!(
+                    "Normal internet yolu açık; yeniden denemek için Başlat seçin.{}",
+                    reason.map(|r| format!(" {r}")).unwrap_or_default()
                 ),
                 NIIF_ERROR,
             );
@@ -1086,6 +1177,13 @@ impl Tray {
             EngineState::Starting | EngineState::Running => {
                 self.restart_pending = false;
                 self.restart_at_ms = 0;
+                // The service restarts its engine in place on this control.
+                if let Some(service) = &self.service
+                    && service.reload()
+                {
+                    self.set_state(EngineState::Starting);
+                    return;
+                }
                 self.configuration_restart_pending = true;
                 self.request_stop();
             }

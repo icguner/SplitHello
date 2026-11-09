@@ -17,6 +17,20 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// Set while waiting on an elevated child, so Ctrl+C reaches it.
 static ELEVATION_EVENT: AtomicIsize = AtomicIsize::new(0);
 
+static READY: AtomicBool = AtomicBool::new(false);
+
+/// Set once relay, DNS proxy and WinDivert are all up (the service reports
+/// RUNNING on it); cleared for the next run by `reset`.
+pub fn engine_ready() -> bool {
+    READY.load(Ordering::SeqCst)
+}
+
+/// Lets the service run the engine again in the same process.
+pub fn reset() {
+    SHUTDOWN.store(false, Ordering::SeqCst);
+    READY.store(false, Ordering::SeqCst);
+}
+
 pub fn shutdown_requested() -> bool {
     SHUTDOWN.load(Ordering::SeqCst)
 }
@@ -155,6 +169,7 @@ pub fn relaunch_elevated(wait: bool) -> Option<i32> {
 }
 
 pub fn signal_ready_event(name: &str) {
+    READY.store(true, Ordering::SeqCst);
     if name.is_empty() {
         return;
     }

@@ -10,6 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAGIC: i32 = 0x5348_4C53; // "SHLS"
 const VERSION: i32 = 2;
 pub const MAX_PROFILES: usize = 16;
+/// The mapping the SYSTEM service publishes (fixed: the tray in the user's
+/// session cannot hand it a per-run name).
+pub const SERVICE_MAPPING: &str = "Global\\SplitHello-LiveStats";
 
 /// 44 consecutive 32-bit integers (176 bytes), as in the C++ `SharedState`.
 #[repr(C)]
@@ -286,23 +289,51 @@ mod platform {
     unsafe impl Sync for Mapping {}
 
     impl Mapping {
-        // shortcut: default (token) DACL, i.e. Administrators + SYSTEM for the
-        // elevated engine; revisit with an explicit descriptor if the engine or
-        // tray ever run unelevated.
+        /// A `Global\` name (the SYSTEM service) gets an explicit DACL:
+        /// SYSTEM and Administrators full, interactive users read-only, so the
+        /// user's tray and panel can read it and nothing else can write it.
+        /// Other names keep the creator's default DACL.
         pub fn create(name: &str, size: usize) -> Option<Self> {
-            // SAFETY: pagefile-backed mapping with a valid name.
+            use windows::Win32::Foundation::{HLOCAL, LocalFree};
+            use windows::Win32::Security::Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+            };
+            use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+
+            let mut descriptor = PSECURITY_DESCRIPTOR::default();
+            let shared = name.starts_with("Global\\")
+                // SAFETY: converts a constant SDDL string; freed below.
+                && unsafe {
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                        windows::core::w!("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;IU)"),
+                        SDDL_REVISION_1,
+                        &mut descriptor,
+                        None,
+                    )
+                }
+                .is_ok();
+            let attributes = SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor.0,
+                bInheritHandle: false.into(),
+            };
+            // SAFETY: pagefile-backed mapping with a valid name; the
+            // descriptor outlives the call.
             let handle = unsafe {
                 CreateFileMappingW(
                     INVALID_HANDLE_VALUE,
-                    None,
+                    shared.then_some(&attributes as *const _),
                     PAGE_READWRITE,
                     0,
                     size as u32,
                     &HSTRING::from(name),
                 )
+            };
+            if shared {
+                // SAFETY: allocated by the conversion above.
+                let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
             }
-            .ok()?;
-            Self::map(handle, FILE_MAP_ALL_ACCESS.0, size)
+            Self::map(handle.ok()?, FILE_MAP_ALL_ACCESS.0, size)
         }
 
         pub fn open_read(name: &str, size: usize) -> Option<Self> {

@@ -50,12 +50,69 @@ fn run_hidden(program: &Path, arguments: &[&str]) -> Option<i32> {
     None
 }
 
+const RUN_KEY: &str = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+fn reg() -> PathBuf {
+    schtasks().with_file_name("reg.exe")
+}
+
+/// With the service installed the tray runs unelevated, so "start with
+/// Windows" is the user's own Run entry for the tray (the engine is the
+/// service); no elevated task is needed.
+pub fn set_run_entry(enabled: bool) -> bool {
+    if !enabled {
+        return run_entry_exists() == Some(false)
+            || run_hidden(&reg(), &["delete", RUN_KEY, "/v", "SplitHello", "/f"]) == Some(0);
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        return false;
+    };
+    let value = format!("\"{}\"", executable.display());
+    run_hidden(
+        &reg(),
+        &[
+            "add",
+            RUN_KEY,
+            "/v",
+            "SplitHello",
+            "/t",
+            "REG_SZ",
+            "/d",
+            &value,
+            "/f",
+        ],
+    ) == Some(0)
+}
+
+fn run_entry_exists() -> Option<bool> {
+    run_hidden(&reg(), &["query", RUN_KEY, "/v", "SplitHello"]).map(|code| code == 0)
+}
+
+/// Install-time checks shared with the service installer.
+pub fn location_is_admin_only(path: &Path) -> bool {
+    security::location_needs_admin_to_modify(path)
+}
+
+pub fn current_user() -> Option<String> {
+    security::current_user_id()
+}
+
 /// None: the Task Scheduler did not answer in time.
 pub fn task_exists() -> Option<bool> {
+    if crate::service::installed() {
+        return run_entry_exists();
+    }
     run_hidden(&schtasks(), &["/Query", "/TN", TASK_NAME]).map(|code| code == 0)
 }
 
 pub fn set_enabled(enabled: bool) -> StartupResult {
+    if crate::service::installed() {
+        return if set_run_entry(enabled) {
+            StartupResult::Ok
+        } else {
+            StartupResult::Failed
+        };
+    }
     if !enabled {
         if task_exists() == Some(false) {
             return StartupResult::Ok;

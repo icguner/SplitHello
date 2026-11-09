@@ -718,9 +718,13 @@ impl Panel {
             let most = used.iter().map(|pr| pr.decisions).max().unwrap_or(1).max(1);
             for profile in used {
                 ui.horizontal(|ui| {
-                    ui.add_sized(
+                    ui.allocate_ui_with_layout(
                         egui::vec2(170.0, 22.0),
-                        egui::Label::new(RichText::new(&profile.name)).halign(egui::Align::LEFT),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_min_width(170.0);
+                            ui.label(&profile.name);
+                        },
                     );
                     let width = (ui.available_width() - 150.0).max(40.0);
                     let (rect, _) =

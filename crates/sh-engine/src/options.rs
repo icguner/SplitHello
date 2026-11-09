@@ -25,6 +25,11 @@ pub enum Action {
     ListStrategies,
     /// Internal: the egui panel process the tray opens.
     Panel,
+    /// Internal: run as the Windows service (started by the SCM).
+    Service,
+    /// Installer: register the service and the shared state folder.
+    InstallService,
+    UninstallService,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +187,9 @@ pub fn parse(args: &[String]) -> Result<Options, i32> {
             "--redeploy" => options.action = Action::Redeploy,
             "--help" => options.action = Action::Help,
             "--panel" => options.action = Action::Panel,
+            "--service" => options.action = Action::Service,
+            "--install-service" => options.action = Action::InstallService,
+            "--uninstall-service" => options.action = Action::UninstallService,
             other => {
                 eprintln!("Bilinmeyen parametre: {other}\n");
                 print_usage();

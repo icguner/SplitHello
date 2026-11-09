@@ -63,19 +63,37 @@ Name: "{autoprograms}\SplitHello"; Filename: "{app}\splithello.exe"; WorkingDir:
 Name: "{autodesktop}\SplitHello"; Filename: "{app}\splithello.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
+; Registers the SYSTEM service that runs the engine: the only elevation SplitHello
+; needs. The tray and panel then run as the user, without UAC prompts.
+Filename: "{app}\splithello.exe"; Parameters: "--install-service"; WorkingDir: "{app}"; Flags: runhidden
 ; The exe elevates itself (UAC), so start it as the original user.
 Filename: "{app}\splithello.exe"; WorkingDir: "{app}"; Description: "{cm:LaunchProgram,SplitHello}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [UninstallRun]
+Filename: "{app}\splithello.exe"; Parameters: "--uninstall-service"; Flags: runhidden; RunOnceId: "UninstallService"
 ; The tray's "Windows ile başlat" task; absent if it was never enabled (error ignored).
 Filename: "{sys}\schtasks.exe"; Parameters: "/Delete /TN ""\SplitHello"" /F"; Flags: runhidden; RunOnceId: "DeleteStartupTask"
 
 [Code]
+// An upgrade must replace splithello.exe, which the running service keeps open.
+// shortcut: a fixed 3 s wait for the stop; poll the service state if that proves short.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  if Exec(ExpandConstant('{sys}\sc.exe'), 'stop SplitHello', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
+    Sleep(3000);
+  Result := '';
+end;
+
 // Settings, history and the DPAPI-protected Worker secret live in %APPDATA%\splithello;
 // keep them unless the user says otherwise (default button is "No").
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if (CurUninstallStep = usPostUninstall) and not UninstallSilent then
     if MsgBox(CustomMessage('RemoveData'), mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+    begin
       DelTree(ExpandConstant('{userappdata}\splithello'), True, True, True);
+      DelTree(ExpandConstant('{commonappdata}\SplitHello'), True, True, True);
+    end;
 end;
