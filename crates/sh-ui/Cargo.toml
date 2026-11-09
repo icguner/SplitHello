@@ -11,6 +11,7 @@ eframe = { version = "=0.37.0", default-features = false, features = ["accesskit
 sh-core = { path = "../sh-core" }
 sh-divert = { path = "../sh-divert" }
 sh-engine = { path = "../sh-engine" }
+sh-net = { path = "../sh-net" }
 sh-strategy = { path = "../sh-strategy" }
 sh-telemetry = { path = "../sh-telemetry" }
 tracing = "0.1"

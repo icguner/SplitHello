@@ -3132,6 +3132,7 @@ dependencies = [
  "sh-core",
  "sh-divert",
  "sh-engine",
+ "sh-net",
  "sh-strategy",
  "sh-telemetry",
  "tracing",

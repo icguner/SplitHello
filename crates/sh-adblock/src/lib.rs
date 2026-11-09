@@ -181,10 +181,17 @@ pub fn top_blocked(limit: usize) -> Vec<(String, u32)> {
 /// dns-blocklists repository.
 pub fn list_path(name: &str) -> Option<String> {
     let file = match name {
-        "light" => "light-onlydomains.txt",    // fewest false positives
-        "pro" => "pro-onlydomains.txt",        // recommended
+        "light" => "light-onlydomains.txt", // fewest false positives
+        "multi" => "multi-onlydomains.txt", // "normal"
+        "pro" => "pro-onlydomains.txt",     // recommended
+        "pro.plus" => "pro.plus-onlydomains.txt", // aggressive
         "tif" => "tif.medium-onlydomains.txt", // malware / phishing / scam feeds
-        "doh" => "doh-onlydomains.txt",        // DoH servers: pushes apps onto our DNS
+        "fake" => "fake-onlydomains.txt",   // fake shops and scams
+        "popupads" => "popupads-onlydomains.txt", // pop-up ad networks
+        "doh" => "doh-onlydomains.txt",     // DoH servers: pushes apps onto our DNS
+        "native.winoffice" => "native.winoffice-onlydomains.txt", // Windows/Office telemetry
+        "gambling" => "gambling-onlydomains.txt",
+        "nsfw" => "nsfw-onlydomains.txt",
         _ => return None,
     };
     Some(format!("/hagezi/dns-blocklists/main/wildcard/{file}"))

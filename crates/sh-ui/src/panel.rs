@@ -9,32 +9,40 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText};
-use sh_core::config::Config;
+use sh_core::config::{Config, DnsMode};
 use sh_core::live_stats::Snapshot;
 use sh_telemetry::DashboardData;
 
 use crate::theme::{self, icon, palette};
 
-/// HaGeZi lists the updater knows (see `sh_adblock::list_path`).
-const LISTS: [(&str, &str, &str); 4] = [
+/// Ad-blocking strengths, weakest first: HaGeZi list names in
+/// `ad_block_lists` (see `sh_adblock::list_path`) and what the panel shows.
+const STRENGTHS: [(&str, &str, &str); 4] = [
     (
         "light",
-        "Light",
-        "En az yanlış pozitif; temel reklam ve izleyiciler.",
-    ),
-    ("pro", "Pro", "Önerilen denge: reklam, izleyici, telemetri."),
-    (
-        "tif",
-        "Tehdit istihbaratı",
-        "Kötü amaçlı yazılım, oltalama ve dolandırıcılık alanları.",
+        "Hafif",
+        "89 bin alan adı; neredeyse hiç yanlış engel yok.",
     ),
     (
-        "doh",
-        "DoH sunucuları",
-        "Uygulamaların kendi DNS'ini kapatır, DNS'imize yönlendirir.",
+        "multi",
+        "Normal",
+        "207 bin alan adı; günlük kullanım için dengeli.",
+    ),
+    ("pro", "Pro", "224 bin alan adı; önerilen."),
+    (
+        "pro.plus",
+        "Pro++",
+        "241 bin alan adı; en sıkı, nadiren bir siteyi bozabilir.",
     ),
 ];
+const TRACKING: &str = "native.winoffice";
+const ANNOYANCES: &str = "popupads";
+const DOH: &str = "doh";
+const SECURITY: [&str; 2] = ["tif", "fake"];
+const GAMBLING: &str = "gambling";
+const ADULT: &str = "nsfw";
 const TELEMETRY_DAYS: u32 = 7;
+const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 
 pub fn run(live_stats_name: &str) -> i32 {
     let options = eframe::NativeOptions {
@@ -65,24 +73,117 @@ pub fn run(live_stats_name: &str) -> i32 {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Status,
-    AdBlock,
+    Protection,
+    Connection,
     Processes,
     Diagnostics,
     Log,
 }
 
 /// What the panel edits in config.json; compared with the saved copy to show
-/// the save bar only when something changed.
+/// the save bar only when something changed. Protection features map onto
+/// `ad_block_lists` names; names the panel does not know are kept as they are.
 #[derive(Clone, PartialEq, Eq, Default)]
 struct Settings {
-    ad_block: bool,
-    lists: Vec<bool>,
+    ads: bool,
+    strength: usize, // index into STRENGTHS
+    tracking: bool,
+    annoyances: bool,
+    doh: bool,
+    security: bool,
+    gambling: bool,
+    adult: bool,
+    other_lists: Vec<String>,
+    dns_worker: bool,
+    tunnel_fallback: bool,
     allow: Vec<String>,
     include: Vec<String>,
     exclude: Vec<String>,
 }
 
+impl Settings {
+    fn from_config(config: &Config) -> Self {
+        // With blocking off every feature shows off, whatever the lists say.
+        let has = |name: &str| config.ad_block && config.ad_block_lists.iter().any(|l| l == name);
+        let strongest = STRENGTHS.iter().rposition(|(name, _, _)| has(name));
+        let managed: Vec<&str> = STRENGTHS
+            .iter()
+            .map(|(name, _, _)| *name)
+            .chain([TRACKING, ANNOYANCES, DOH, GAMBLING, ADULT])
+            .chain(SECURITY)
+            .collect();
+        Self {
+            ads: strongest.is_some(),
+            strength: strongest.unwrap_or(2),
+            tracking: has(TRACKING),
+            annoyances: has(ANNOYANCES),
+            doh: has(DOH),
+            security: SECURITY.iter().any(|name| has(name)),
+            gambling: has(GAMBLING),
+            adult: has(ADULT),
+            other_lists: config
+                .ad_block_lists
+                .iter()
+                .filter(|l| !managed.contains(&l.as_str()))
+                .cloned()
+                .collect(),
+            dns_worker: config.dns_mode == DnsMode::Worker,
+            tunnel_fallback: config.tunnel_fallback,
+            allow: config.ad_block_allow.clone(),
+            include: config.process_include.clone(),
+            exclude: config.process_exclude.clone(),
+        }
+    }
+
+    fn lists(&self) -> Vec<String> {
+        let mut lists: Vec<&str> = Vec::new();
+        if self.ads {
+            lists.push(STRENGTHS[self.strength].0);
+        }
+        for (on, names) in [
+            (self.tracking, &[TRACKING][..]),
+            (self.annoyances, &[ANNOYANCES][..]),
+            (self.doh, &[DOH][..]),
+            (self.security, &SECURITY[..]),
+            (self.gambling, &[GAMBLING][..]),
+            (self.adult, &[ADULT][..]),
+        ] {
+            if on {
+                lists.extend(names);
+            }
+        }
+        lists
+            .into_iter()
+            .map(String::from)
+            .chain(self.other_lists.iter().cloned())
+            .collect()
+    }
+
+    fn apply(&self, config: &mut Config) {
+        let lists = self.lists();
+        config.ad_block = lists.len() > self.other_lists.len();
+        if config.ad_block {
+            config.ad_block_lists = lists;
+        }
+        config.dns_mode = if self.dns_worker {
+            DnsMode::Worker
+        } else {
+            DnsMode::System
+        };
+        config.tunnel_fallback = self.tunnel_fallback;
+        config.ad_block_allow = self.allow.clone();
+        config.process_include = self.include.clone();
+        config.process_exclude = self.exclude.clone();
+    }
+}
+
 struct Panel {
+    /// The setup console this panel started, and whether to switch DNS to
+    /// the Worker once it succeeds.
+    setup: Option<(std::process::Child, bool)>,
+    worker_url: String,
+    worker_name: String,
+    learned_sites: Option<usize>,
     page: Page,
     dir: Option<PathBuf>,
     live_name: String,
@@ -108,6 +209,10 @@ struct Panel {
 impl Panel {
     fn new(live_name: String) -> Self {
         let mut panel = Self {
+            setup: None,
+            worker_url: String::new(),
+            worker_name: String::new(),
+            learned_sites: None,
             page: Page::Status,
             dir: sh_core::paths::config_dir(),
             live_name,
@@ -143,17 +248,66 @@ impl Panel {
             self.status = Some(("Yapılandırma okunamadı.".into(), false));
             return;
         };
-        self.saved = Settings {
-            ad_block: config.ad_block,
-            lists: LISTS
-                .iter()
-                .map(|(name, _, _)| config.ad_block_lists.iter().any(|l| l == name))
-                .collect(),
-            allow: config.ad_block_allow.clone(),
-            include: config.process_include.clone(),
-            exclude: config.process_exclude.clone(),
-        };
+        self.saved = Settings::from_config(&config);
         self.settings = self.saved.clone();
+        self.worker_url = config.worker_url;
+        self.worker_name = config.worker_name;
+    }
+
+    /// Opens `splithello.exe --setup-only` (or `--redeploy`) in its own console.
+    fn launch_setup(&mut self, redeploy: bool, enable_worker: bool) {
+        use std::os::windows::process::CommandExt;
+        if self.setup.is_some() {
+            return;
+        }
+        let spawned = std::env::current_exe().and_then(|exe| {
+            std::process::Command::new(exe)
+                .arg(if redeploy {
+                    "--redeploy"
+                } else {
+                    "--setup-only"
+                })
+                .creation_flags(CREATE_NEW_CONSOLE)
+                .spawn()
+        });
+        match spawned {
+            Ok(child) => self.setup = Some((child, enable_worker)),
+            Err(error) => self.status = Some((format!("Kurulum açılamadı: {error}"), false)),
+        }
+    }
+
+    fn poll_setup(&mut self) {
+        let Some((child, enable_worker)) = &mut self.setup else {
+            return;
+        };
+        let Ok(Some(status)) = child.try_wait() else {
+            return;
+        };
+        let enable_worker = *enable_worker;
+        self.setup = None;
+        let Some(mut config) = self.load_config() else {
+            return;
+        };
+        self.worker_url = config.worker_url.clone();
+        self.worker_name = config.worker_name.clone();
+        if !status.success() || config.worker_url.is_empty() {
+            self.status = Some((
+                "Kurulum tamamlanamadı; ayrıntı için kurulum penceresine veya kayıtlara bakın."
+                    .into(),
+                false,
+            ));
+            return;
+        }
+        if enable_worker {
+            config.dns_mode = DnsMode::Worker;
+            if let Some(dir) = &self.dir {
+                let _ = config.save_to(dir);
+            }
+            self.saved.dns_worker = true;
+            self.settings.dns_worker = true;
+        }
+        crate::tray::notify_tray_restart();
+        self.status = Some(("Worker hazır; ağ motoru yeniden başlıyor.".into(), true));
     }
 
     /// Re-reads config.json and changes only what this panel edits, so a
@@ -163,17 +317,15 @@ impl Panel {
             self.status = Some(("Yapılandırma okunamadı; kaydedilmedi.".into(), false));
             return;
         };
-        let s = &self.settings;
-        config.ad_block = s.ad_block;
-        config.ad_block_lists = LISTS
-            .iter()
-            .zip(&s.lists)
-            .filter(|(_, on)| **on)
-            .map(|((name, _, _), _)| (*name).to_string())
-            .collect();
-        config.ad_block_allow = s.allow.clone();
-        config.process_include = s.include.clone();
-        config.process_exclude = s.exclude.clone();
+        if self.settings.dns_worker && config.worker_url.is_empty() {
+            // Worker DNS without a Worker would stop the engine (exit 14).
+            self.status = Some((
+                "Şifreli DNS için önce Worker kurulumu gerekli.".into(),
+                false,
+            ));
+            return;
+        }
+        self.settings.apply(&mut config);
         if let Err(error) = config.save_to(&dir) {
             self.status = Some((format!("Kaydedilemedi: {error}"), false));
             return;
@@ -303,6 +455,7 @@ impl eframe::App for Panel {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.refresh_live();
         self.refresh_files(false);
+        self.poll_setup();
         ui.ctx().request_repaint_after(Duration::from_secs(1));
         let p = palette(ui);
 
@@ -318,7 +471,12 @@ impl eframe::App for Panel {
             .show(ui, |ui| self.sidebar(ui));
 
         let dirty = self.settings != self.saved;
-        if dirty && matches!(self.page, Page::AdBlock | Page::Processes) {
+        if dirty
+            && matches!(
+                self.page,
+                Page::Protection | Page::Connection | Page::Processes
+            )
+        {
             egui::Panel::bottom("save")
                 .show_separator_line(false)
                 .frame(
@@ -362,7 +520,8 @@ impl eframe::App for Panel {
                                 self.status_banner(ui);
                                 match self.page {
                                     Page::Status => self.status_page(ui),
-                                    Page::AdBlock => self.ad_block_page(ui),
+                                    Page::Protection => self.protection_page(ui),
+                                    Page::Connection => self.connection_page(ui),
                                     Page::Processes => self.process_page(ui),
                                     Page::Diagnostics => self.diagnostics_page(ui),
                                     Page::Log => self.log_page(ui),
@@ -389,7 +548,8 @@ impl Panel {
         ui.spacing_mut().item_spacing.y = 4.0;
         for (page, glyph, label) in [
             (Page::Status, icon::STATUS, "Durum"),
-            (Page::AdBlock, icon::SHIELD, "Reklam engeli"),
+            (Page::Protection, icon::SHIELD, "Koruma"),
+            (Page::Connection, icon::LINK, "Bağlantı"),
             (Page::Processes, icon::APPS, "Uygulamalar"),
             (Page::Diagnostics, icon::CHART, "Teşhis"),
             (Page::Log, icon::DOCUMENT, "Kayıtlar"),
@@ -399,6 +559,14 @@ impl Panel {
                 self.status = None;
                 if page == Page::Diagnostics {
                     self.refresh_telemetry(ui.ctx());
+                }
+                if page == Page::Connection {
+                    self.learned_sites = self.dir.as_ref().map(|dir| {
+                        let store =
+                            sh_strategy::Store::new(dir.join(sh_core::paths::STRATEGY_FILE));
+                        store.load();
+                        store.len()
+                    });
                 }
             }
         }
@@ -562,37 +730,116 @@ impl Panel {
         });
     }
 
-    fn ad_block_page(&mut self, ui: &mut egui::Ui) {
+    fn protection_page(&mut self, ui: &mut egui::Ui) {
         let p = palette(ui);
         theme::page_title(
             ui,
-            "Reklam engeli",
-            "Reklamları ve izleyicileri tüm uygulamalarda, DNS ve TLS düzeyinde engeller.",
+            "Koruma",
+            "Tüm uygulamalarda DNS ve TLS düzeyinde çalışır; tarayıcı eklentisi gerekmez.",
         );
+        let mut want_worker = false;
         theme::card(ui, |ui| {
-            theme::switch_row(
+            let s = &mut self.settings;
+            theme::feature_row(
                 ui,
-                &mut self.settings.ad_block,
-                "Reklam ve izleyicileri engelle",
-                "Engellenen alan adlarına hiç bağlanılmaz; sayfalar daha hızlı açılır.",
+                icon::BLOCKED,
+                &mut s.ads,
+                "Reklam engelleme",
+                "Banner, video, açılır pencere ve uygulama içi reklamları engeller.",
             );
-        });
-        ui.add_space(14.0);
-        theme::card(ui, |ui| {
-            theme::card_title(ui, "Engel listeleri");
-            theme::secondary(ui, "HaGeZi listeleri; her gün otomatik güncellenir.");
-            ui.add_space(6.0);
-            let enabled = self.settings.ad_block;
-            for (index, ((_, title, description), on)) in
-                LISTS.iter().zip(self.settings.lists.iter_mut()).enumerate()
-            {
-                if index > 0 {
-                    ui.separator();
-                }
-                ui.add_enabled_ui(enabled, |ui| {
-                    theme::switch_row(ui, on, title, description);
+            if s.ads {
+                ui.horizontal(|ui| {
+                    ui.add_space(42.0);
+                    ui.vertical(|ui| {
+                        let labels: Vec<&str> =
+                            STRENGTHS.iter().map(|(_, label, _)| *label).collect();
+                        theme::segmented(ui, &mut s.strength, &labels);
+                        theme::secondary(ui, STRENGTHS[s.strength].2);
+                    });
                 });
             }
+            ui.separator();
+            theme::feature_row(
+                ui,
+                icon::HIDE,
+                &mut s.tracking,
+                "İzleyici koruması",
+                "Windows ve Office telemetrisini keser; web izleyicileri reklam listesiyle engellenir.",
+            );
+            ui.separator();
+            theme::feature_row(
+                ui,
+                icon::MESSAGE,
+                &mut s.annoyances,
+                "Rahatsız edici öğeler",
+                "Açılır pencere reklam ağlarını engeller. Sayfa içi çerez bildirimleri DNS düzeyinde engellenemez.",
+            );
+            ui.separator();
+            let was_worker = s.dns_worker;
+            theme::feature_row(
+                ui,
+                icon::CLOUD,
+                &mut s.dns_worker,
+                "DNS koruması",
+                "Sorgular şifreli olarak kendi Cloudflare Worker'ınızda çözülür; ISS'nin DNS engelleri aşılır.",
+            );
+            if s.dns_worker && !was_worker && self.worker_url.is_empty() {
+                s.dns_worker = false;
+                want_worker = true;
+            }
+            if s.dns_worker {
+                ui.horizontal(|ui| {
+                    ui.add_space(42.0);
+                    ui.vertical(|ui| {
+                        theme::switch_row(
+                            ui,
+                            &mut s.doh,
+                            "Uygulamaların kendi DNS'ini kapat",
+                            "Tarayıcıların gizli DoH sunucularını engeller; tüm sorgular korumadan geçer.",
+                        );
+                    });
+                });
+            }
+            ui.separator();
+            theme::feature_row(
+                ui,
+                icon::GLOBE,
+                &mut s.security,
+                "Gezinme güvenliği",
+                "Kötü amaçlı, oltalama ve sahte alışveriş sitelerine bağlantıyı keser.",
+            );
+        });
+        if want_worker {
+            self.status = Some((
+                "DNS koruması için Cloudflare Worker kuruluyor; açılan pencerede tarayıcıdan izin verin.".into(),
+                true,
+            ));
+            self.launch_setup(false, true);
+        }
+        ui.add_space(14.0);
+        theme::card(ui, |ui| {
+            theme::card_title(ui, "Ebeveyn denetimi");
+            theme::secondary(
+                ui,
+                "Bu kategorilerdeki siteler tüm cihaz trafiğinde engellenir.",
+            );
+            ui.add_space(6.0);
+            let s = &mut self.settings;
+            theme::feature_row(
+                ui,
+                icon::GAME,
+                &mut s.gambling,
+                "Kumar ve bahis",
+                "Bahis, casino ve kumar siteleri (yaklaşık 640 bin alan adı).",
+            );
+            ui.separator();
+            theme::feature_row(
+                ui,
+                icon::LOCK,
+                &mut s.adult,
+                "Yetişkin içerik",
+                "Yetişkinlere yönelik siteler.",
+            );
         });
         ui.add_space(14.0);
         theme::card(ui, |ui| {
@@ -645,6 +892,125 @@ impl Panel {
         });
         if let Some(host) = allow {
             self.allow_host(&host);
+        }
+    }
+
+    fn connection_page(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui);
+        theme::page_title(
+            ui,
+            "Bağlantı",
+            "Sansürlü sitelere erişim: otomatik DPI atlatma ve kendi Cloudflare Worker'ınız.",
+        );
+        theme::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 28.0, p.blue.gamma_multiply(0.16));
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icon::LINK,
+                    theme::icons(24.0),
+                    p.blue,
+                );
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("DPI atlatma her zaman açık").font(theme::semibold(22.0)));
+                    theme::secondary(
+                        ui,
+                        "Engellenen bir siteye bağlanırken TLS el sıkışması parçalanır; çalışan yöntem \
+                         ağ ve site başına öğrenilir, sonraki bağlantılar ilk denemede açılır.",
+                    );
+                });
+            });
+        });
+        ui.add_space(14.0);
+        theme::metrics(
+            ui,
+            &[
+                (
+                    "Öğrenilmiş site",
+                    self.learned_sites.map_or("—".into(), |n| n.to_string()),
+                    None,
+                ),
+                (
+                    "Bu oturumda aşılan",
+                    self.live.bypassed_decisions.to_string(),
+                    Some(p.green),
+                ),
+                (
+                    "Çözülemeyen",
+                    self.live.unresolved_decisions.to_string(),
+                    Some(p.red),
+                ),
+            ],
+        );
+        ui.add_space(14.0);
+
+        let mut action = None;
+        theme::card(ui, |ui| {
+            theme::card_title(ui, "Cloudflare Worker");
+            theme::secondary(
+                ui,
+                "Ücretsiz Cloudflare hesabınızda çalışan kişisel sunucu. Türkiye'de ISS DNS'i engelli \
+                 sitelere sahte yanıt verdiği için şifreli DNS bunun üzerinden çözülür; hiçbir profil \
+                 işe yaramazsa trafik onun üzerinden tünellenebilir.",
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let installed = !self.worker_url.is_empty();
+                let (dot, text) = if installed {
+                    (
+                        p.green,
+                        format!("Kurulu: {}", sh_net::http::host_from_url(&self.worker_url)),
+                    )
+                } else {
+                    (p.orange, "Kurulu değil".to_string())
+                };
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 5.0, dot);
+                ui.label(text);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.setup.is_some() {
+                        ui.spinner();
+                        theme::secondary(ui, "Kurulum penceresi açık…");
+                        return;
+                    }
+                    let label = if installed {
+                        "Yeniden kur"
+                    } else {
+                        "Kurulumu başlat"
+                    };
+                    if theme::primary_button(ui, label).clicked() {
+                        action = Some(false);
+                    }
+                    if !self.worker_name.is_empty() && ui.button("Worker'ı güncelle").clicked() {
+                        action = Some(true);
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_enabled_ui(!self.worker_url.is_empty(), |ui| {
+                theme::switch_row(
+                    ui,
+                    &mut self.settings.dns_worker,
+                    "Şifreli DNS",
+                    "Tüm DNS sorguları Worker üzerinden şifreli çözülür (Koruma › DNS koruması ile aynı).",
+                );
+                ui.separator();
+                theme::switch_row(
+                    ui,
+                    &mut self.settings.tunnel_fallback,
+                    "Tünel yedeği",
+                    "Hiçbir atlatma yöntemi işe yaramazsa bağlantı Worker üzerinden tünellenir.",
+                );
+            });
+        });
+        if let Some(redeploy) = action {
+            self.launch_setup(redeploy, !redeploy && self.worker_url.is_empty());
         }
     }
 
@@ -901,6 +1267,34 @@ impl Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn features_round_trip_through_config_lists() {
+        let mut config = Config {
+            ad_block: true,
+            ad_block_lists: vec!["light".into(), "pro".into(), "tif".into(), "future-list".into()],
+            ..Config::default()
+        };
+        let mut settings = Settings::from_config(&config);
+        assert!(settings.ads && settings.security && !settings.tracking);
+        assert_eq!(STRENGTHS[settings.strength].0, "pro"); // strongest wins
+        assert_eq!(settings.other_lists, ["future-list"]);
+
+        settings.strength = 0;
+        settings.tracking = true;
+        settings.apply(&mut config);
+        assert_eq!(config.ad_block_lists, ["light", "native.winoffice", "tif", "fake", "future-list"]);
+        assert!(config.ad_block);
+
+        // Everything off: blocking off, list names left for next time.
+        let mut off = Settings::from_config(&config);
+        off.ads = false;
+        off.tracking = false;
+        off.security = false;
+        off.apply(&mut config);
+        assert!(!config.ad_block);
+        assert!(!Settings::from_config(&config).ads);
+    }
 
     #[test]
     fn tail_starts_at_a_line_boundary() {

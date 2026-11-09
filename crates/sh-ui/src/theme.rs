@@ -69,6 +69,14 @@ pub mod icon {
     pub const DOCUMENT: &str = "\u{E8A5}";
     pub const REFRESH: &str = "\u{E72C}";
     pub const REMOVE: &str = "\u{E711}"; // Cancel
+    pub const BLOCKED: &str = "\u{E733}";
+    pub const HIDE: &str = "\u{ED1A}";
+    pub const MESSAGE: &str = "\u{E8BD}";
+    pub const CLOUD: &str = "\u{E753}";
+    pub const GLOBE: &str = "\u{E774}";
+    pub const LINK: &str = "\u{E71B}";
+    pub const GAME: &str = "\u{E7FC}";
+    pub const LOCK: &str = "\u{E72E}";
 }
 
 pub fn semibold(size: f32) -> FontId {
@@ -502,6 +510,74 @@ pub fn editable_list(
             }
         }
     });
+    changed
+}
+
+/// An AdGuard-style feature row: icon, title and description, a thin
+/// divider and a switch. Returns true when the switch changed.
+pub fn feature_row(
+    ui: &mut Ui,
+    glyph: &str,
+    on: &mut bool,
+    title: &str,
+    description: &str,
+) -> bool {
+    let p = palette(ui);
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(32.0, 40.0), Sense::hover());
+        ui.painter().text(
+            rect.left_top() + vec2(4.0, 4.0),
+            egui::Align2::LEFT_TOP,
+            glyph,
+            icons(20.0),
+            if *on { p.blue } else { p.secondary },
+        );
+        ui.vertical(|ui| {
+            ui.set_width((ui.available_width() - 90.0).max(120.0));
+            ui.label(RichText::new(title).font(semibold(15.5)));
+            secondary(ui, description);
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            changed = switch(ui, on, title).changed();
+            let (line, _) = ui.allocate_exact_size(vec2(16.0, 40.0), Sense::hover());
+            ui.painter()
+                .vline(line.center().x, line.y_range(), Stroke::new(1.0, p.stroke));
+        });
+    });
+    changed
+}
+
+/// A macOS-style segmented control; returns true when the choice changed.
+pub fn segmented(ui: &mut Ui, selected: &mut usize, labels: &[&str]) -> bool {
+    let p = palette(ui);
+    let mut changed = false;
+    egui::Frame::new()
+        .fill(p.field)
+        .corner_radius(CornerRadius::same(9))
+        .inner_margin(Margin::same(3))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.horizontal(|ui| {
+                for (index, label) in labels.iter().enumerate() {
+                    let active = *selected == index;
+                    let text = RichText::new(*label).size(14.0).color(if active {
+                        Color32::WHITE
+                    } else {
+                        p.text
+                    });
+                    let button = egui::Button::new(text)
+                        .fill(if active { p.blue } else { Color32::TRANSPARENT })
+                        .corner_radius(CornerRadius::same(7))
+                        .min_size(vec2(84.0, 28.0))
+                        .selected(active);
+                    if ui.add(button).clicked() && !active {
+                        *selected = index;
+                        changed = true;
+                    }
+                }
+            });
+        });
     changed
 }
 
