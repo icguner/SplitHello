@@ -1,10 +1,17 @@
 # Builds dist\SplitHello-Setup-<version>.exe from an already built splithello.exe.
 # Needs Inno Setup 6 (winget install JRSoftware.InnoSetup).
 param(
-    [string]$Version = '1.0.0',
-    [string]$BuildDir = (Join-Path $PSScriptRoot '..\build')
+    [string]$Version = '2.0.0',
+    [string]$BuildDir = (Join-Path $PSScriptRoot '..\target\release')
 )
 $ErrorActionPreference = 'Stop'
+
+if (-not (Test-Path (Join-Path $BuildDir 'splithello.exe'))) {
+    throw "splithello.exe not found in $BuildDir. Run: cargo build --release"
+}
+if (-not (Test-Path (Join-Path $BuildDir 'WinDivert64.sys'))) {
+    & (Join-Path $PSScriptRoot 'fetch-windivert.ps1') -OutDir $BuildDir
+}
 
 $iscc = @(
     "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe",

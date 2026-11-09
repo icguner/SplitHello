@@ -6,7 +6,7 @@ Censorship bypass and AdGuard-style ad blocking for Windows, in one small app. N
 - **Blocks ads, trackers and threats** in every application, at the DNS and TLS level, with HaGeZi lists. No browser extension.
 - **Light.** About 27 MB of memory with the default list, under 40 MB with every protection list loaded, and no UAC prompt after installation (the engine runs as a Windows service).
 
-Version 2 is a rewrite in Rust. The C++ engine of v1 is still in `src/` for reference but is no longer shipped.
+Version 2 is a rewrite in Rust; the C++ engine of v1 lives on only in the git history (tag `v1.0.1`).
 
 ## What it does
 
@@ -190,15 +190,16 @@ If the engine cannot start, the tray shows the reason: port in use, WinDivert co
 
 ## Building
 
-Requirements: Rust 1.99 (pinned in `rust-toolchain.toml`), the Windows SDK (for the icon resource), and the WinDivert 2.2.2 x64 runtime (`WinDivert.dll`, `WinDivert64.sys`) next to the exe. `cmake -B build -S .` fetches WinDivert with a pinned SHA-256 into `build\`.
+Requirements: Rust 1.99 (pinned in `rust-toolchain.toml`) and the Windows SDK (for the icon resource).
 
 ```
 cargo build --release
 cargo test --workspace
-installer\build.ps1 -Version 2.0.0 -BuildDir target\release
+installer\fetch-windivert.ps1      # WinDivert 2.2.2 runtime next to the exe, SHA-256 pinned
+installer\build.ps1                # dist\SplitHello-Setup-<version>.exe
 ```
 
-The installer script needs [Inno Setup 6](https://jrsoftware.org/isinfo.php) and `WinDivert.dll`, `WinDivert64.sys` and `WinDivert-LICENSE.txt` in the build folder.
+`splithello.exe` needs `WinDivert.dll` and `WinDivert64.sys` beside it. The installer script needs [Inno Setup 6](https://jrsoftware.org/isinfo.php) and fetches WinDivert itself if it is missing.
 
 The workspace is split by layer: `sh-proto` (TLS, DNS, QUIC parsing and packet builders), `sh-strategy` (profiles, diagnosis, learning store), `sh-flow` (flow registries), `sh-core` (config, logging, live stats), `sh-telemetry` (SQLite history), `sh-adblock`, `sh-net` (HTTP, Worker tunnel), `sh-dns`, `sh-relay`, `sh-divert` (WinDivert loop and process scope), `sh-engine` (composition, service), `sh-setup` (Cloudflare setup), `sh-ui` (tray, panel). Parsers are fuzzed with cargo-fuzz (`fuzz-rs/`); CI runs fmt, clippy, the tests and a short fuzz pass on every push.
 

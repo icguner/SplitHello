@@ -1,12 +1,12 @@
 ﻿; Build with installer\build.ps1, or directly:
-;   ISCC /DAppVersion=1.0.0 /DBuildDir=<folder with splithello.exe> splithello.iss
+;   ISCC /DAppVersion=2.0.0 /DBuildDir=<folder with splithello.exe> splithello.iss
 ; Saved as UTF-8 with BOM so the Turkish text survives.
 
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "2.0.0"
 #endif
 #ifndef BuildDir
-  #define BuildDir "..\build"
+  #define BuildDir "..\target\release"
 #endif
 
 [Setup]
@@ -16,10 +16,10 @@ AppVersion={#AppVersion}
 AppPublisher=icguner
 AppPublisherURL=https://github.com/icguner/SplitHello
 AppSupportURL=https://github.com/icguner/SplitHello/issues
-; The engine loads a kernel driver and runs elevated, and the app only enables
-; "start with Windows" from a folder a standard user cannot write to. So the
+; The engine runs as a SYSTEM service and loads a kernel driver, and the service
+; is only registered from a folder a standard user cannot write to. So the
 ; default is Program Files; "just me" (%LOCALAPPDATA%\Programs) is still offered
-; but leaves that tray option disabled.
+; but then runs without the service (UAC on every start).
 PrivilegesRequired=admin
 PrivilegesRequiredOverridesAllowed=dialog
 DefaultDirName={autopf}\SplitHello
