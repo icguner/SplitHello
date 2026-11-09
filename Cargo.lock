@@ -1155,6 +1155,23 @@ name = "sh-proto"
 version = "0.1.0"
 
 [[package]]
+name = "sh-relay"
+version = "0.1.0"
+dependencies = [
+ "sh-adblock",
+ "sh-core",
+ "sh-dns",
+ "sh-flow",
+ "sh-net",
+ "sh-proto",
+ "sh-strategy",
+ "sh-telemetry",
+ "socket2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sh-strategy"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,27 @@
+[package]
+name = "sh-relay"
+description = "The local relay: transparent and SOCKS5/HTTP CONNECT listener, the adaptive ClientHello prober and the byte pump"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sh-adblock = { path = "../sh-adblock" }
+sh-core = { path = "../sh-core" }
+sh-dns = { path = "../sh-dns" }
+sh-flow = { path = "../sh-flow" }
+sh-net = { path = "../sh-net" }
+sh-proto = { path = "../sh-proto" }
+sh-strategy = { path = "../sh-strategy" }
+sh-telemetry = { path = "../sh-telemetry" }
+socket2 = "0.6"
+tokio = { version = "1", features = ["net", "time", "rt", "macros", "io-util", "sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+sh-proto = { path = "../sh-proto", features = ["testing"] }
+tokio = { version = "1", features = ["full"] }
+
+[lints]
+workspace = true
