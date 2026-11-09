@@ -1,0 +1,24 @@
+# Rust rewrite of SplitHello (see docs/rust-rewrite.md). The C++ build under
+# src/ stays the shipping product until each crate reaches parity.
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "allow"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# unwind (default): a panicking connection task must not take the engine down.

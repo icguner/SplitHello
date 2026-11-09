@@ -1,0 +1,16 @@
+[package]
+name = "splithello"
+description = "SplitHello entry point: tray, engine, panel and one-shot commands"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "splithello"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

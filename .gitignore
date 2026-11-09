@@ -8,3 +8,7 @@ node_modules/
 .wrangler/
 dist/
 installer/gen/
+/target/
+fuzz-rs/target/
+fuzz-rs/corpus/
+fuzz-rs/artifacts/
