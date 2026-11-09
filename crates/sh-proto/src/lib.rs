@@ -5,6 +5,7 @@
 
 pub mod dns;
 pub mod packet;
+pub mod quic;
 pub mod tls;
 
 #[cfg(any(test, feature = "testing"))]

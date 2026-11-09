@@ -7,6 +7,7 @@
 
 mod address;
 mod policy;
+pub mod quic;
 mod registry;
 mod route;
 
