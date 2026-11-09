@@ -1,0 +1,16 @@
+[package]
+name = "sh-proto"
+description = "Pure, bounds-checked wire parsers and builders (TLS, DNS, QUIC, IP/TCP)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# Test-vector builders shared with other crates' tests.
+testing = []
+
+[dependencies]
+
+[lints]
+workspace = true
