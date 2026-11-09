@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "sh-flow"
+version = "0.1.0"
+dependencies = [
+ "sh-proto",
+]
+
+[[package]]
 name = "sh-proto"
 version = "0.1.0"
 

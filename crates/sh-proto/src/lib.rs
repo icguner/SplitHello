@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod dns;
+pub mod packet;
 pub mod tls;
 
 #[cfg(any(test, feature = "testing"))]
