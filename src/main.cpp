@@ -326,6 +326,7 @@ struct Options {
     std::vector<std::string> processInclude;
     std::vector<std::string> processExclude;
     uint16_t port = 1080;
+    bool portExplicit = false;
     unsigned splitDelayMs = 0;
     bool splitDelaySet = false;
     bool setup = false;
@@ -365,6 +366,7 @@ bool parseArgs(int argc, char* argv[], Options& options, int& exitCode) {
                 return false;
             }
             options.port = (uint16_t)port;
+            options.portExplicit = true;
         } else if (arg == "--split-delay" && hasValue) {
             if (!parseUnsigned(argv[++i], options.splitDelayMs) || options.splitDelayMs > 2000) {
                 std::cerr << "Gecersiz gecikme (0-2000 ms): " << argv[i] << "\n";
@@ -463,6 +465,27 @@ bool parseArgs(int argc, char* argv[], Options& options, int& exitCode) {
         }
     }
     return true;
+}
+
+// True when this process could bind `port` the way the engine will (dual-stack,
+// exclusive). Fails for ports inside a Windows-reserved range or held by others.
+bool canBind(int type, uint16_t port) {
+    const SOCKET probe = socket(AF_INET6, type, 0);
+    if (probe == INVALID_SOCKET) return true; // cannot tell; let the real bind report it
+    int exclusive = 1;
+    setsockopt(probe, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+               reinterpret_cast<const char*>(&exclusive), sizeof(exclusive));
+    int ipv6Only = 0;
+    setsockopt(probe, IPPROTO_IPV6, IPV6_V6ONLY,
+               reinterpret_cast<const char*>(&ipv6Only), sizeof(ipv6Only));
+    sockaddr_in6 local{};
+    local.sin6_family = AF_INET6;
+    local.sin6_addr = in6addr_any;
+    local.sin6_port = htons(port);
+    const bool ok = bind(probe, reinterpret_cast<const sockaddr*>(&local), sizeof(local)) !=
+                    SOCKET_ERROR;
+    closesocket(probe);
+    return ok;
 }
 
 bool shouldRunTray(const Options& options) {
@@ -717,14 +740,37 @@ int main(int argc, char* argv[]) {
     // by older builds before opening WinDivert.
     SystemProxy::restoreLeftovers(Config::proxyBackupPath());
 
+    // Windows reserves port ranges (Hyper-V, WSL, Docker/WinNAT) that change
+    // between boots; binding inside one fails with WSAEACCES (10013). In
+    // transparent mode these ports are only internal redirect targets, so step
+    // aside when the defaults are unusable. A port the user chose, and the
+    // manual-proxy port apps are configured with, are never changed.
+    if (!options.portExplicit && !options.manualProxy) {
+        for (const uint16_t candidate : {options.port, uint16_t{18080}, uint16_t{28080},
+                                         uint16_t{38080}, uint16_t{48080}}) {
+            if (canBind(SOCK_STREAM, candidate)) {
+                if (candidate != options.port) {
+                    spdlog::warn("Port {} kullanilamiyor (Windows ayirmis olabilir); {} kullaniliyor",
+                                 options.port, candidate);
+                }
+                options.port = candidate;
+                break;
+            }
+        }
+    }
+
     constexpr uint16_t kPreferredConnectPort = 65534;
     constexpr uint16_t kAlternateConnectPort = 65533;
-    constexpr uint16_t kPreferredDnsProxyPort = 1053;
-    constexpr uint16_t kAlternateDnsProxyPort = 1054;
     const uint16_t connectPort = options.port == kPreferredConnectPort
         ? kAlternateConnectPort : kPreferredConnectPort;
-    const uint16_t dnsProxyPort = options.port == kPreferredDnsProxyPort
-        ? kAlternateDnsProxyPort : kPreferredDnsProxyPort;
+    uint16_t dnsProxyPort = 1053;
+    for (const uint16_t candidate : {uint16_t{1053}, uint16_t{1054}, uint16_t{15353},
+                                     uint16_t{25353}, uint16_t{35353}}) {
+        if (candidate != options.port && canBind(SOCK_DGRAM, candidate)) {
+            dnsProxyPort = candidate;
+            break;
+        }
+    }
 
     const bool useWorkerDns = config.dnsMode == DnsMode::Worker;
     dns::Resolver resolver(useWorkerDns ? workerUrl : std::string{},
