@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use sh_adblock::{DomainSet, parse_domains};
+use sh_adblock::{CompactSet, for_each_domain, parse_domains};
 use sh_dns::Resolver;
 use sh_net::http::{HttpClient, Request};
 use tokio::sync::watch;
@@ -92,7 +92,9 @@ async fn download(route: &Route, source: &Source) -> bool {
         );
         return false;
     }
-    if parse_domains(&String::from_utf8_lossy(&response.body)).len() < MIN_PLAUSIBLE_ENTRIES {
+    let mut entries = 0;
+    for_each_domain(&String::from_utf8_lossy(&response.body), |_| entries += 1);
+    if entries < MIN_PLAUSIBLE_ENTRIES {
         tracing::warn!(
             "Reklam listesi '{}' reddedildi: cok az gecerli girdi",
             source.name
@@ -109,13 +111,16 @@ async fn download(route: &Route, source: &Source) -> bool {
     true
 }
 
+/// One list file at a time is in memory as text; names go straight into the
+/// compact hash set, so peak memory is the largest file plus the set.
 fn rebuild(sources: &[Source]) {
-    let mut merged = DomainSet::new();
+    let mut merged = CompactSet::default();
     for source in sources {
         let Some(bytes) = sh_core::fsutil::read_all(&source.cache_file) else {
             continue;
         };
-        let parsed = parse_domains(&String::from_utf8_lossy(&bytes));
+        let mut parsed = CompactSet::default();
+        for_each_domain(&String::from_utf8_lossy(&bytes), |name| parsed.push(name));
         if parsed.len() < MIN_PLAUSIBLE_ENTRIES {
             continue;
         }
@@ -124,8 +129,9 @@ fn rebuild(sources: &[Source]) {
             source.name,
             parsed.len()
         );
-        merged.extend(parsed);
+        merged.append(parsed);
     }
+    let merged = merged.finish();
     if !merged.is_empty() {
         tracing::info!("Reklam engeli aktif: toplam {} alan adi", merged.len());
         sh_adblock::global().replace(merged);

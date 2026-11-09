@@ -6,10 +6,75 @@
 #![forbid(unsafe_code)]
 
 use std::collections::{BTreeMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
+/// Parsed names as strings: small lists (allow list, tests).
 pub type DomainSet = HashSet<String>;
+
+fn name_hash(name: &str) -> u64 {
+    // SipHash-1-3 with fixed keys: same value for the same name within this
+    // process, which is all a rebuilt-at-load set needs.
+    let mut hasher = std::hash::DefaultHasher::new();
+    name.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Blocked names as sorted 64-bit hashes: 8 bytes per name and one
+/// allocation, instead of ~130 bytes and one allocation per name in a
+/// `HashSet<String>` (measured: 1.25 M names, 168 MB -> ~10 MB).
+/// A false match needs a 64-bit collision: about 1e-13 per lookup.
+#[derive(Default, Clone)]
+pub struct CompactSet {
+    hashes: Vec<u64>,
+    sorted: bool,
+}
+
+impl CompactSet {
+    /// `name` must already be normalized (see `for_each_domain`).
+    pub fn push(&mut self, name: &str) {
+        self.hashes.push(name_hash(name));
+        self.sorted = false;
+    }
+
+    pub fn append(&mut self, other: CompactSet) {
+        self.hashes.extend(other.hashes);
+        self.sorted = false;
+    }
+
+    /// Sorts, removes duplicates and drops spare capacity; lookups need it.
+    pub fn finish(mut self) -> Self {
+        self.hashes.sort_unstable();
+        self.hashes.dedup();
+        self.hashes.shrink_to_fit();
+        self.sorted = true;
+        self
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        debug_assert!(self.sorted || self.hashes.is_empty());
+        self.hashes.binary_search(&name_hash(name)).is_ok()
+    }
+
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
+    }
+}
+
+impl From<DomainSet> for CompactSet {
+    fn from(names: DomainSet) -> Self {
+        let mut set = CompactSet::default();
+        for name in &names {
+            set.push(name);
+        }
+        set.finish()
+    }
+}
 
 const MAX_TRACKED_HOSTS: usize = 2000;
 
@@ -36,6 +101,15 @@ fn valid_hostname(name: &str) -> bool {
 /// `#` and `!` lines are comments; anything that is not a hostname is skipped.
 pub fn parse_domains(text: &str) -> DomainSet {
     let mut result = DomainSet::new();
+    for_each_domain(text, |name| {
+        result.insert(name.to_string());
+    });
+    result
+}
+
+/// Streams the normalized names of a list without building a set, so a
+/// multi-megabyte list never exists twice in memory.
+pub fn for_each_domain(text: &str, mut each: impl FnMut(&str)) {
     for line in text.lines() {
         let mut line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
@@ -52,15 +126,14 @@ pub fn parse_domains(text: &str) -> DomainSet {
         let line = line.strip_prefix("*.").unwrap_or(line);
         let name = lower_host(line);
         if valid_hostname(&name) {
-            result.insert(name);
+            each(&name);
         }
     }
-    result
 }
 
 #[derive(Default)]
 struct Sets {
-    blocked: Arc<DomainSet>,
+    blocked: Arc<CompactSet>,
     allowed: DomainSet,
 }
 
@@ -78,8 +151,12 @@ impl Blocklist {
         *self.sets.write().unwrap_or_else(|p| p.into_inner()) = Arc::new(sets);
     }
 
-    pub fn replace(&self, blocked: DomainSet) {
+    pub fn replace(&self, blocked: impl Into<CompactSet>) {
         let current = self.snapshot();
+        let mut blocked = blocked.into();
+        if !blocked.sorted {
+            blocked = blocked.finish();
+        }
         self.store(Sets {
             blocked: Arc::new(blocked),
             allowed: current.allowed.clone(),
@@ -276,6 +353,19 @@ mod tests {
             .find(|(h, _)| h == "tally-test.example.com")
             .map(|(_, c)| c);
         assert_eq!(count, Some(2));
+    }
+
+    #[test]
+    fn compact_set_streams_and_dedups() {
+        let mut set = CompactSet::default();
+        for_each_domain("a.com\nA.com\nb.org\n# c.net\n", |name| set.push(name));
+        let set = set.finish();
+        assert_eq!(set.len(), 2);
+        assert!(set.contains("a.com") && set.contains("b.org"));
+        assert!(!set.contains("c.net"));
+        let list = Blocklist::default();
+        list.replace(set);
+        assert!(list.blocks("x.a.com"));
     }
 
     #[test]
