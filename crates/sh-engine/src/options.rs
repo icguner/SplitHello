@@ -23,6 +23,8 @@ pub enum Action {
     ForgetToken,
     ForgetStrategies,
     ListStrategies,
+    /// Internal: the egui panel process the tray opens.
+    Panel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +48,17 @@ pub struct Options {
     pub ready_event: String,
     pub live_stats: String,
     pub parent_pid: u32,
+}
+
+impl Options {
+    /// A plain launch (no engine/console/manual flags) runs the tray.
+    pub fn tray_mode(&self) -> bool {
+        self.action == Action::Run
+            && !self.engine
+            && !self.console
+            && !self.verbose
+            && !self.manual_proxy
+    }
 }
 
 impl Default for Options {
@@ -168,6 +181,7 @@ pub fn parse(args: &[String]) -> Result<Options, i32> {
             "--setup-only" => options.action = Action::SetupOnly,
             "--redeploy" => options.action = Action::Redeploy,
             "--help" => options.action = Action::Help,
+            "--panel" => options.action = Action::Panel,
             other => {
                 eprintln!("Bilinmeyen parametre: {other}\n");
                 print_usage();

@@ -1,30 +1,18 @@
 //! Engine composition (port of `src/main.cpp`): command line, the
-//! transparent (WinDivert) and manual-proxy engines and one-shot commands. The
-//! tray, panel and setup arrive in stage 5.
+//! transparent (WinDivert) and manual-proxy engines and one-shot commands.
 
 pub mod adblock_updater;
 pub mod engine;
 pub mod options;
-mod win;
+pub mod win;
 
 use options::Action;
 
-/// `%APPDATA%\splithello`, or `SPLITHELLO_CONFIG_DIR` when set. The override is
-/// a development aid: it lets a Rust build run beside the C++ engine against a
-/// copy of the state instead of both rewriting the same strategies.json.
-pub fn config_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("SPLITHELLO_CONFIG_DIR")
-        .filter(|value| !value.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(sh_core::paths::config_dir)
-}
+pub use sh_core::paths::config_dir;
 
-/// Entry point for the `splithello` binary; returns the process exit code.
-pub fn run(args: Vec<String>) -> i32 {
-    let options = match options::parse(&args) {
-        Ok(options) => options,
-        Err(code) => return code,
-    };
+/// Engine runs and one-shot commands; returns the process exit code. The
+/// binary sends tray, panel and startup-task launches to `sh-ui` instead.
+pub fn run(options: options::Options) -> i32 {
     match options.action {
         Action::Help => {
             options::print_usage();
@@ -43,8 +31,8 @@ pub fn run(args: Vec<String>) -> i32 {
         }
         _ => {
             eprintln!(
-                "Bu islem Rust surumunde henuz yok (asama 5: tray, kurulum). Motoru calistirmak icin \
-                 --console veya --manual-proxy kullanin."
+                "Bu islem Rust surumunde henuz yok (kurulum, --restore-proxy). Simdilik C++ \
+                 splithello.exe ile calistirin."
             );
             1
         }
