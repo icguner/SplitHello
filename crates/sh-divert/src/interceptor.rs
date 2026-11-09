@@ -880,6 +880,34 @@ mod tests {
         )
     }
 
+    /// `cargo test --release -p sh-divert -- --ignored --nocapture per_packet`
+    #[test]
+    #[ignore]
+    fn per_packet_cost() {
+        let p = processor(QuicMode::Allow);
+        // An owned upstream flow: SYN seen, then 1400-byte data both ways.
+        let syn = build(false, true, ("10.0.0.5", 40000), ("1.2.3.4", CONNECT), TCP_SYN, b"");
+        run_one(&p, syn, outbound());
+        let payload = vec![0x17u8; 1400];
+        let up = build(false, true, ("10.0.0.5", 40000), ("1.2.3.4", CONNECT), TCP_ACK, &payload);
+        let down = build(false, true, ("1.2.3.4", 443), ("10.0.0.5", 40000), TCP_ACK, &payload);
+        let foreign = build(false, true, ("10.0.0.5", 41000), ("5.6.7.8", 443), TCP_ACK, &payload);
+        let mut inbound = Address::default();
+        inbound.set_outbound(false);
+        let mut out = Batch::default();
+        let rounds = 200_000;
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            out.clear();
+            for (packet, address) in [(&up, outbound()), (&down, inbound), (&foreign, outbound())] {
+                let mut data = packet.clone();
+                p.process(&mut data, address, &mut out, 1000);
+            }
+        }
+        let per = started.elapsed().as_nanos() / (rounds * 3);
+        println!("per packet: {per} ns (owned rewrite + checksum, and pass-through)");
+    }
+
     #[test]
     fn filter_text_matches_the_cpp_engine() {
         let settings = Settings {
