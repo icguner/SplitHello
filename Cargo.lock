@@ -33,7 +33,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sh-adblock"
+version = "0.1.0"
+
+[[package]]
 name = "sh-core"
+version = "0.1.0"
+
+[[package]]
+name = "sh-divert"
 version = "0.1.0"
 
 [[package]]

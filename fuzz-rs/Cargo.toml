@@ -1,0 +1,38 @@
+# cargo-fuzz targets for the Rust parsers (nightly + Linux in CI). Kept out of
+# the main workspace so stable `cargo test --workspace` never builds libFuzzer.
+[package]
+name = "splithello-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sh-proto = { path = "../crates/sh-proto" }
+sh-adblock = { path = "../crates/sh-adblock" }
+
+[workspace]
+
+[[bin]]
+name = "fuzz_tls"
+path = "fuzz_targets/fuzz_tls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_dns"
+path = "fuzz_targets/fuzz_dns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_adblock"
+path = "fuzz_targets/fuzz_adblock.rs"
+test = false
+doc = false
+bench = false

@@ -33,6 +33,35 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+  rust-fuzz-smoke:
+    name: Rust parser fuzz smoke (cargo-fuzz)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Nightly toolchain and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo +nightly install cargo-fuzz --locked
+
+      - name: Run each target for 20 seconds
+        working-directory: fuzz-rs
+        run: |
+          for target in fuzz_tls fuzz_dns fuzz_adblock; do
+            cargo +nightly fuzz run "$target" -- -max_total_time=20 -timeout=2 -max_len=65536
+          done
+
+      - name: Upload crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-fuzz-crashes
+          if-no-files-found: ignore
+          retention-days: 14
+          path: fuzz-rs/artifacts/
+
   windows-release:
     name: Windows Release build and tests
     runs-on: windows-latest

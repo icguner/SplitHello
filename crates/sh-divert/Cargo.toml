@@ -1,0 +1,12 @@
+[package]
+name = "sh-divert"
+description = "WinDivert packet interception: rewrite rules, packet strategies and process scope"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
