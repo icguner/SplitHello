@@ -11,6 +11,7 @@ name = "splithello"
 path = "src/main.rs"
 
 [dependencies]
+sh-engine = { path = "../sh-engine" }
 
 [lints]
 workspace = true

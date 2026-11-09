@@ -1,0 +1,25 @@
+[package]
+name = "sh-engine"
+description = "Engine composition: command line, start/stop order, ad-block list updater"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sh-adblock = { path = "../sh-adblock" }
+sh-core = { path = "../sh-core" }
+sh-dns = { path = "../sh-dns" }
+sh-flow = { path = "../sh-flow" }
+sh-net = { path = "../sh-net" }
+sh-relay = { path = "../sh-relay" }
+sh-strategy = { path = "../sh-strategy" }
+sh-telemetry = { path = "../sh-telemetry" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync", "signal"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[lints]
+workspace = true

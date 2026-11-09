@@ -194,7 +194,10 @@ fn prune_old_logs(dir: &Path, keep: &Path) {
 /// Installs the global subscriber: console always, the rotating file when
 /// `log_file` is given (only the engine owns it, avoiding rotation races).
 pub fn init(verbose: bool, log_file: Option<&Path>) {
-    let console_level = if verbose {
+    // SPLITHELLO_LOG=trace opens the per-connection trace on the console.
+    let console_level = if std::env::var("SPLITHELLO_LOG").is_ok_and(|v| v == "trace") {
+        LevelFilter::TRACE
+    } else if verbose {
         LevelFilter::DEBUG
     } else {
         LevelFilter::INFO

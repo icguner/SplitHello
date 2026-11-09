@@ -10,5 +10,5 @@ mod listener;
 mod negotiate;
 mod pump;
 
-pub use direct::{RelayContext, relay};
+pub use direct::{RelayContext, TunnelSettings, relay};
 pub use listener::{Listener, ListenerMode};

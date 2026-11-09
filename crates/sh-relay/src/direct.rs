@@ -183,6 +183,12 @@ impl Session<'_> {
                 && self.prepare_candidates().await
                 && self.connect_target().await
         };
+        tracing::trace!(
+            "{}: hazir={prepared} hello_tam={} tampon={} bayt",
+            self.target_host,
+            self.hello_complete,
+            self.buffer.len()
+        );
         if prepared {
             if self.deliver_hello().await && self.flush_trailing_client_data().await {
                 // Whatever the probe already read has to reach the client first.
@@ -366,7 +372,12 @@ impl Session<'_> {
                 // A server-first protocol, or a client that stopped mid-hello:
                 // forward whatever we have.
                 Err(_) => return Collected::Ready,
-                Ok(Ok(0)) | Ok(Err(_)) => {
+                Ok(read @ (Ok(0) | Err(_))) => {
+                    tracing::debug!(
+                        "{}: istemci ClientHello'dan once kapandi ({read:?}, {} bayt)",
+                        self.target_host,
+                        self.buffer.len()
+                    );
                     return if self.buffer.is_empty() {
                         Collected::Failed
                     } else {

@@ -1,7 +1,7 @@
-//! Rust entry point. Until the engine reaches parity (stage 4 of the plan) this
-//! binary does nothing on the network; the C++ `splithello.exe` stays in use.
+//! SplitHello (Rust). Until stage 4 lands, only the manual-proxy engine and
+//! the strategy one-shots run here; the C++ splithello.exe stays the product.
 
 fn main() {
-    eprintln!("SplitHello (Rust) gelistirme surumu: henuz ag motoru yok; C++ surumunu kullanin.");
-    std::process::exit(1);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    std::process::exit(sh_engine::run(args));
 }

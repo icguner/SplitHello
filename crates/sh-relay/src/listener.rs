@@ -217,11 +217,16 @@ mod tests {
     async fn manual_listener_relays_http_connect_to_an_echo_origin() {
         let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin_port = origin.local_addr().unwrap().port();
+        // The origin keeps its socket open until the test is done: on the
+        // development machine a filter driver can turn an early close into a
+        // reset that overtakes the echo.
+        let (done, finished) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             let (mut socket, _) = origin.accept().await.unwrap();
             let mut buffer = [0u8; 64];
             let n = socket.read(&mut buffer).await.unwrap();
             socket.write_all(&buffer[..n]).await.unwrap();
+            let _ = finished.await;
         });
 
         let listener = Listener::bind(0, ListenerMode::Manual, context()).unwrap();
@@ -246,6 +251,7 @@ mod tests {
             .unwrap();
         assert_eq!(&echo, b"plain");
         drop(client);
+        let _ = done.send(());
         stop.send(true).unwrap();
         server.await.unwrap();
     }

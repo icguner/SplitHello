@@ -1129,6 +1129,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sh-engine"
+version = "0.1.0"
+dependencies = [
+ "sh-adblock",
+ "sh-core",
+ "sh-dns",
+ "sh-flow",
+ "sh-net",
+ "sh-relay",
+ "sh-strategy",
+ "sh-telemetry",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sh-flow"
 version = "0.1.0"
 dependencies = [
@@ -1266,6 +1282,9 @@ dependencies = [
 [[package]]
 name = "splithello"
 version = "0.1.0"
+dependencies = [
+ "sh-engine",
+]
 
 [[package]]
 name = "sqlite-wasm-rs"
