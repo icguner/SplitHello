@@ -1468,6 +1468,29 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    /// Loads the strategies.json the C++ engine wrote on this machine (from a
+    /// copy, never the original). Run with `-- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads the developer's real %APPDATA%\\splithello\\strategies.json"]
+    fn compat_loads_the_live_cpp_strategies() {
+        let source = PathBuf::from(std::env::var_os("APPDATA").expect("APPDATA"))
+            .join("splithello")
+            .join("strategies.json");
+        let copy = temp_path("live-copy.json");
+        fs::copy(&source, &copy).expect("no strategies.json");
+        let text = fs::read_to_string(&copy).unwrap();
+        let on_disk = lenient::domains(&text).expect("domains object").len();
+        let store = Store::new(&copy);
+        store.load();
+        println!(
+            "on disk={on_disk} winners={} candidates={}",
+            store.len(),
+            store.candidate_count()
+        );
+        assert!(store.len() + store.candidate_count() > 0 || on_disk == 0);
+        let _ = fs::remove_file(&copy);
+    }
+
     #[test]
     fn sequential_saves_leave_the_newest_state_on_disk() {
         let path = temp_path("snapshot-order.json");
