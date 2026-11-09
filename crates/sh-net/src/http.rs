@@ -103,13 +103,14 @@ impl Default for HttpClient {
 impl HttpClient {
     fn client_for(&self, request: &Request) -> Option<reqwest::Client> {
         let key = request.connect.as_ref().map(|(addresses, port)| {
-            (
-                request.host.clone(),
-                addresses
-                    .iter()
-                    .map(|ip| SocketAddr::new(*ip, *port))
-                    .collect::<Vec<_>>(),
-            )
+            let mut targets: Vec<SocketAddr> = addresses
+                .iter()
+                .map(|ip| SocketAddr::new(*ip, *port))
+                .collect();
+            // The same addresses in another order (a bootstrap refresh) must
+            // reuse the warm client, not build a new one with cold TLS.
+            targets.sort_unstable();
+            (request.host.clone(), targets)
         });
         let mut clients = self.clients.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(client) = clients.get(&key) {

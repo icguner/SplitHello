@@ -507,7 +507,8 @@ impl Processor {
                                     tracing::trace!("QUIC Initial prime: {server}:{sp}");
                                 }
                             }
-                            Decision::Drop => {
+                            Decision::Drop => drop = true,
+                            Decision::Fallback => {
                                 drop = true;
                                 tracing::info!("QUIC yanitsiz; TCP fallback: {server}:{sp}");
                             }

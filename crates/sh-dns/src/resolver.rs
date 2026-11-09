@@ -21,6 +21,7 @@ const NEGATIVE_CACHE_SECONDS: u32 = 30;
 const TRANSIENT_CACHE_SECONDS: u32 = 3;
 const MAX_CACHE_ENTRIES: usize = 2048;
 const MAX_WIRE_CACHE_ENTRIES: usize = 1024;
+const MAX_CACHED_WIRE_BYTES: usize = 4096;
 const WIRE_MIN_TTL_SECONDS: u32 = 10;
 const WIRE_MAX_TTL_SECONDS: u32 = 3600;
 const WIRE_NEGATIVE_MAX_SECONDS: u32 = 60;
@@ -712,7 +713,9 @@ impl Resolver {
         dns::set_id(&mut answer, parsed.id);
 
         let lifetime = wire_lifetime(&info);
-        if lifetime != 0 {
+        // Normal answers are a few hundred bytes; caching rare 64 KiB ones
+        // would let 1024 entries pin ~64 MiB.
+        if lifetime != 0 && answer.len() <= MAX_CACHED_WIRE_BYTES {
             let mut state = self.lock();
             if !state.wire_cache.contains_key(&key)
                 && state.wire_cache.len() >= MAX_WIRE_CACHE_ENTRIES

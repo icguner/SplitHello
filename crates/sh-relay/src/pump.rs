@@ -12,11 +12,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{ReadHalf, WriteHalf};
 
-const PUMP_BUFFER: usize = 64 * 1024;
+/// One TLS record (16 KiB) per read: the buffer lives as long as the
+/// connection, so at the 1024 cap this is 32 MiB instead of 128 MiB.
+const PUMP_BUFFER: usize = 16 * 1024;
 /// Once one side sent FIN the other normally follows within a round trip.
 const HALF_CLOSED_LINGER: Duration = Duration::from_secs(30);
-/// The watchdog wakes at least this often.
-const WATCHDOG_TICK: Duration = Duration::from_secs(1);
+/// The watchdog sleeps until the idle deadline, but never longer than this,
+/// so a half-close shortens the limit within one tick (and 1024 idle
+/// connections cost ~34 wake-ups a second, not 1024).
+const WATCHDOG_MAX_SLEEP: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PumpEnd {
@@ -68,7 +72,6 @@ pub async fn pump(
     let downstream = direction(target_read, client_write, &activity, &target_eof);
     let watchdog = async {
         loop {
-            tokio::time::sleep(WATCHDOG_TICK).await;
             let half_closed =
                 client_eof.load(Ordering::SeqCst) || target_eof.load(Ordering::SeqCst);
             let limit = if half_closed {
@@ -76,10 +79,13 @@ pub async fn pump(
             } else {
                 idle_timeout
             };
-            let idle = sh_core::clock::now_ms().saturating_sub(activity.load(Ordering::Relaxed));
-            if Duration::from_millis(idle) >= limit {
+            let idle = Duration::from_millis(
+                sh_core::clock::now_ms().saturating_sub(activity.load(Ordering::Relaxed)),
+            );
+            if idle >= limit {
                 return;
             }
+            tokio::time::sleep((limit - idle).min(WATCHDOG_MAX_SLEEP)).await;
         }
     };
 

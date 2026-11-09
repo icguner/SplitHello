@@ -13,6 +13,10 @@ pub enum Decision {
     Pass,
     PrimeAndPass,
     Drop,
+    /// Drop: this server just went unanswered and is blocked from now on
+    /// (reported once, so callers can log the fallback without a log line
+    /// per dropped datagram).
+    Fallback,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -137,7 +141,7 @@ impl AdaptiveRegistry {
                 .blocked_until
                 .insert(server, now_ms + self.fallback_ms);
             self.publish_blocked(&state);
-            return Decision::Drop;
+            return Decision::Fallback;
         }
         Decision::Pass
     }
@@ -212,7 +216,10 @@ mod tests {
             registry.outbound(server, 50000, true, 1000),
             Decision::PrimeAndPass
         );
-        assert_eq!(registry.outbound(server, 50000, true, 1900), Decision::Drop);
+        assert_eq!(
+            registry.outbound(server, 50000, true, 1900),
+            Decision::Fallback
+        );
         assert_eq!(registry.outbound(server, 50001, true, 2000), Decision::Drop);
         assert_eq!(
             registry.outbound(server, 50001, true, 7000),
@@ -240,7 +247,7 @@ mod tests {
         registry.outbound(blocked, 50001, true, 2000);
         assert_eq!(
             registry.outbound(blocked, 50001, true, 2900),
-            Decision::Drop
+            Decision::Fallback
         );
         assert!(registry.needs_outbound(false));
         assert_eq!(

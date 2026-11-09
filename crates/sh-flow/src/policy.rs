@@ -54,16 +54,11 @@ fn infer_path_hops(received_ttl: u8) -> u8 {
         .map_or(0, |initial| (initial - u16::from(received_ttl)) as u8)
 }
 
-fn make_room<V>(map: &mut HashMap<Key, V>, now_ms: u64, expires: impl Fn(&V) -> u64) {
-    map.retain(|_, value| expires(value) > now_ms);
-    if map.len() < MAX_ENTRIES {
-        return;
-    }
-    // Genuinely full of live entries: drop the one closest to expiry instead of
-    // wiping every in-flight policy.
-    if let Some(oldest) = map.iter().min_by_key(|(_, v)| expires(v)).map(|(k, _)| *k) {
-        map.remove(&oldest);
-    }
+/// Called with the map full, right after `prune_if_due` (expired entries
+/// are swept at most once a second): drop the 1/16 closest to expiry
+/// instead of wiping every in-flight policy or rescanning on every insert.
+fn make_room<V>(map: &mut HashMap<Key, V>, _now_ms: u64, expires: impl Fn(&V) -> u64) {
+    crate::registry::evict_oldest(map, expires);
 }
 
 impl State {
@@ -350,8 +345,10 @@ mod tests {
                 1000 + u64::from(port),
             );
         }
+        // Full: the 1/16 closest to expiry (ports 1..=512) made room at once.
         assert!(registry.take(server, 1, None, 9300).is_none());
-        assert!(registry.take(server, 2, None, 9300).is_some());
+        assert!(registry.take(server, 512, None, 9300).is_none());
+        assert!(registry.take(server, 513, None, 9300).is_some());
         assert!(registry.take(server, 8193, None, 9300).is_some());
     }
 }

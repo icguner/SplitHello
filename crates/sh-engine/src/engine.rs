@@ -101,7 +101,13 @@ pub fn run(options: &Options) -> i32 {
         }
     }
 
+    // A desktop relay is I/O-bound: a few workers carry a thousand
+    // connections, and a bounded blocking pool keeps a burst of system DNS
+    // lookups (Worker down) from spawning hundreds of threads.
+    let workers = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 4));
     let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .max_blocking_threads(32)
         .enable_all()
         .build()
     {

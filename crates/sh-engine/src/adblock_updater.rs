@@ -21,6 +21,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const RETRY_MIN: Duration = Duration::from_secs(10 * 60);
 const RETRY_MAX: Duration = Duration::from_secs(60 * 60);
 const TICK: Duration = Duration::from_secs(5);
+const RECENT_PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
 /// A real list has thousands of entries; fewer means an error page or a
 /// truncated body, which must not replace a good list.
 const MIN_PLAUSIBLE_ENTRIES: usize = 1000;
@@ -189,6 +190,7 @@ pub async fn run(
         .and_then(|m| m.modified())
         .ok();
     let mut published = u64::MAX;
+    let mut last_publish = Instant::now() - RECENT_PUBLISH_INTERVAL;
 
     loop {
         let mut changed = false;
@@ -218,9 +220,12 @@ pub async fn run(
             allow_stamp = stamp;
             refresh_allow(&files, &config_allow);
         }
+        // The count changes constantly while browsing; the tray and panel
+        // only need a fresh file now and then, not a fsync'd write per tick.
         let total = sh_adblock::blocked_count();
-        if total != published {
+        if total != published && last_publish.elapsed() >= RECENT_PUBLISH_INTERVAL {
             published = total;
+            last_publish = Instant::now();
             publish_recent(&files);
         }
         tokio::select! {

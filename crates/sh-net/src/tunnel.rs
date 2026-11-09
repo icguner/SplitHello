@@ -94,9 +94,13 @@ async fn open(
             .map_err(|_| "yetki")?;
         request.headers_mut().insert("Authorization", value);
     }
+    // tungstenite defaults to 128 KiB per direction; a tunnel carries one
+    // TLS stream, so 16 KiB keeps per-connection memory small.
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE))
-        .max_frame_size(Some(MAX_MESSAGE));
+        .max_frame_size(Some(MAX_MESSAGE))
+        .read_buffer_size(16 * 1024)
+        .write_buffer_size(16 * 1024);
     let (mut socket, response) =
         tokio_tungstenite::client_async_with_config(request, tls, Some(config))
             .await
@@ -134,11 +138,22 @@ async fn open(
     Ok(socket)
 }
 
+/// A silent tunnel gives its connection slot back like an idle direct pump.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 async fn pump(client: &mut TcpStream, socket: &mut Socket) {
     let (mut client_read, mut client_write) = client.split();
-    let mut buffer = vec![0u8; 32 * 1024];
+    let mut buffer = vec![0u8; 16 * 1024];
+    let idle = tokio::time::sleep(IDLE_TIMEOUT);
+    tokio::pin!(idle);
     loop {
+        idle.as_mut()
+            .reset(tokio::time::Instant::now() + IDLE_TIMEOUT);
         tokio::select! {
+            () = &mut idle => {
+                tracing::debug!("Tunel bosta kaldi, kapatiliyor");
+                break;
+            }
             read = client_read.read(&mut buffer) => match read {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {

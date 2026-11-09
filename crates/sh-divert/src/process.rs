@@ -232,7 +232,7 @@ fn windows_image(pid: u32) -> String {
 /// The connection table can grow between the size query and the fetch (a
 /// burst of new connections is exactly when this runs), so the buffer is
 /// padded and the fetch retried instead of treating the race as "unknown".
-fn fetch_table(fetch: impl Fn(*mut core::ffi::c_void, &mut u32) -> u32) -> Option<Vec<u8>> {
+fn fetch_table(fetch: impl Fn(*mut core::ffi::c_void, &mut u32) -> u32) -> Option<Vec<u32>> {
     const INSUFFICIENT_BUFFER: u32 = 122;
     let mut size = 0u32;
     let mut status = fetch(std::ptr::null_mut(), &mut size);
@@ -241,17 +241,38 @@ fn fetch_table(fetch: impl Fn(*mut core::ffi::c_void, &mut u32) -> u32) -> Optio
             break;
         }
         size += size / 8 + 4096;
-        // u32-aligned rows: allocate as u32 and view as bytes.
+        // Rows are DWORD-aligned: allocate as u32, read through `as_bytes`.
         let mut words = vec![0u32; size.div_ceil(4) as usize];
         let mut length = size;
         status = fetch(words.as_mut_ptr().cast(), &mut length);
         if status == 0 {
-            let bytes = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
-            return Some(bytes);
+            return Some(words);
         }
         size = length;
     }
     None
+}
+
+fn as_bytes(words: &[u32]) -> &[u8] {
+    // SAFETY: u8 has no alignment requirement and the length covers exactly
+    // the words' memory, which stays borrowed for the returned lifetime.
+    unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), size_of_val(words)) }
+}
+
+/// A recent owner table, reused while a burst of new tuples arrives: one
+/// SYN burst or DNS burst costs one table walk instead of one per packet.
+/// A tuple missing from it always triggers a fresh fetch, so a socket newer
+/// than the snapshot is never misclassified.
+struct Snapshot {
+    words: std::sync::Arc<Vec<u32>>,
+    taken: std::time::Instant,
+}
+
+const SNAPSHOT_MAX_AGE: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn snapshots() -> &'static Mutex<[Option<Snapshot>; 4]> {
+    static TABLES: std::sync::OnceLock<Mutex<[Option<Snapshot>; 4]>> = std::sync::OnceLock::new();
+    TABLES.get_or_init(Mutex::default)
 }
 
 fn port(value: u32) -> u16 {
@@ -276,28 +297,60 @@ fn u32_at(row: &[u8], at: usize) -> u32 {
 
 /// Owner PID of the tuple from the system TCP/UDP tables.
 fn owner(endpoint: &Endpoint) -> Option<u32> {
+    let kind = usize::from(endpoint.udp) * 2 + usize::from(endpoint.ipv6);
+    let cached = {
+        let tables = snapshots().lock().unwrap_or_else(|p| p.into_inner());
+        tables[kind]
+            .as_ref()
+            .filter(|s| s.taken.elapsed() < SNAPSHOT_MAX_AGE)
+            .map(|s| s.words.clone())
+    };
+    if let Some(words) = cached
+        && let Some(pid) = find_owner(endpoint, as_bytes(&words))
+    {
+        return Some(pid);
+    }
+    let words = std::sync::Arc::new(fetch_owner_table(endpoint)?);
+    let pid = find_owner(endpoint, as_bytes(&words));
+    snapshots().lock().unwrap_or_else(|p| p.into_inner())[kind] = Some(Snapshot {
+        words,
+        taken: std::time::Instant::now(),
+    });
+    pid
+}
+
+fn fetch_owner_table(endpoint: &Endpoint) -> Option<Vec<u32>> {
     use windows::Win32::NetworkManagement::IpHelper::{
         GetExtendedTcpTable, GetExtendedUdpTable, TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
     };
     use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 
     let family = u32::from(if endpoint.ipv6 { AF_INET6.0 } else { AF_INET.0 });
+    if endpoint.udp {
+        // SAFETY: the buffer pointer/length pair comes from `fetch_table`.
+        return fetch_table(|buffer, size| unsafe {
+            GetExtendedUdpTable(Some(buffer), size, false, family, UDP_TABLE_OWNER_PID, 0)
+        });
+    }
+    // SAFETY: as above.
+    fetch_table(|buffer, size| unsafe {
+        GetExtendedTcpTable(
+            Some(buffer),
+            size,
+            false,
+            family,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        )
+    })
+}
+
+fn find_owner(endpoint: &Endpoint, bytes: &[u8]) -> Option<u32> {
     let length = if endpoint.ipv6 { 16 } else { 4 };
     let local = &endpoint.local_address[..length];
     let remote = &endpoint.remote_address[..length];
 
     if !endpoint.udp {
-        // SAFETY: the buffer pointer/length pair comes from `fetch_table`.
-        let bytes = fetch_table(|buffer, size| unsafe {
-            GetExtendedTcpTable(
-                Some(buffer),
-                size,
-                false,
-                family,
-                TCP_TABLE_OWNER_PID_ALL,
-                0,
-            )
-        })?;
         // MIB_TCPROW_OWNER_PID: state, local addr, local port, remote addr,
         // remote port, pid. MIB_TCP6ROW_OWNER_PID: local addr[16], scope,
         // local port, remote addr[16], scope, remote port, state, pid.
@@ -306,7 +359,7 @@ fn owner(endpoint: &Endpoint) -> Option<u32> {
         } else {
             (24, 4, 8, 12, 16, 20)
         };
-        return rows(&bytes, row_size)
+        return rows(bytes, row_size)
             .find(|row| {
                 port(u32_at(row, l_port)) == endpoint.local_port
                     && port(u32_at(row, r_port)) == endpoint.remote_port
@@ -316,10 +369,6 @@ fn owner(endpoint: &Endpoint) -> Option<u32> {
             .map(|row| u32_at(row, pid));
     }
 
-    // SAFETY: as above.
-    let bytes = fetch_table(|buffer, size| unsafe {
-        GetExtendedUdpTable(Some(buffer), size, false, family, UDP_TABLE_OWNER_PID, 0)
-    })?;
     // MIB_UDPROW_OWNER_PID: local addr, local port, pid.
     // MIB_UDP6ROW_OWNER_PID: local addr[16], scope, local port, pid.
     let (row_size, l_addr, l_port, pid) = if endpoint.ipv6 {
@@ -328,7 +377,7 @@ fn owner(endpoint: &Endpoint) -> Option<u32> {
         (12, 0, 4, 8)
     };
     let mut selected = None;
-    for row in rows(&bytes, row_size) {
+    for row in rows(bytes, row_size) {
         let address = &row[l_addr..l_addr + length];
         if port(u32_at(row, l_port)) != endpoint.local_port
             || (address.iter().any(|b| *b != 0) && address != local)
@@ -376,6 +425,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         assert_eq!(owner(&endpoint_of(&stream)), Some(std::process::id()));
+        // Newer than the cached snapshot: the miss must refetch, not fail.
+        let newer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        assert_eq!(owner(&endpoint_of(&newer)), Some(std::process::id()));
         let image = process_image(std::process::id());
         assert!(image.ends_with(".exe"), "{image}");
     }

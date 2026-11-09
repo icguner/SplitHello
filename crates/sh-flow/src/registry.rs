@@ -23,17 +23,21 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Drops the entry closest to expiry when the map is genuinely full.
-fn evict_oldest<K: Clone + Eq + std::hash::Hash, V>(
+/// The map is genuinely full of live entries: drop the 1/16 closest to
+/// expiry. One O(n) pass frees room for n/16 inserts, so a connection storm
+/// costs amortized O(1) per insert instead of a full scan on every one.
+pub(crate) fn evict_oldest<K: Clone + Eq + std::hash::Hash, V>(
     map: &mut HashMap<K, V>,
     expires: impl Fn(&V) -> u64,
 ) {
-    if let Some(oldest) = map
-        .iter()
-        .min_by_key(|(_, v)| expires(v))
-        .map(|(k, _)| k.clone())
-    {
-        map.remove(&oldest);
+    let mut oldest: Vec<(u64, K)> = map.iter().map(|(k, v)| (expires(v), k.clone())).collect();
+    if oldest.is_empty() {
+        return;
+    }
+    let evict = (oldest.len() / 16).max(1);
+    oldest.select_nth_unstable_by_key(evict - 1, |(expires, _)| *expires);
+    for (_, key) in &oldest[..evict] {
+        map.remove(key);
     }
 }
 
@@ -70,12 +74,11 @@ impl<T> Expiring<T> {
         }
     }
 
-    fn make_room(&mut self, now_ms: u64) {
+    /// Call after `prune_if_due`: expired entries are swept at most once a
+    /// second, never on every insert.
+    fn make_room(&mut self, _now_ms: u64) {
         if self.entries.len() >= MAX_PENDING_FLOWS {
-            self.prune(now_ms);
-            if self.entries.len() >= MAX_PENDING_FLOWS {
-                evict_oldest(&mut self.entries, |(_, expires)| *expires);
-            }
+            evict_oldest(&mut self.entries, |(_, expires)| *expires);
         }
     }
 }
@@ -331,6 +334,30 @@ impl TcpTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eviction_frees_a_sixteenth_closest_to_expiry() {
+        let mut map: HashMap<u32, u64> = (0..160).map(|i| (i, u64::from(i))).collect();
+        evict_oldest(&mut map, |expires| *expires);
+        assert_eq!(map.len(), 150);
+        assert!((0..10).all(|i| !map.contains_key(&i)));
+        assert!(map.contains_key(&10));
+    }
+
+    #[test]
+    fn a_full_flow_registry_keeps_accepting_new_flows() {
+        let flows = FlowRegistry::default();
+        let server = addr("203.0.113.9");
+        for port in 1..=(MAX_PENDING_FLOWS as u16 + 100) {
+            flows.observe(server, port, 443, 65534, 1000);
+        }
+        assert!(flows.len(1000) <= MAX_PENDING_FLOWS);
+        assert!(
+            flows
+                .claim(server, MAX_PENDING_FLOWS as u16 + 100, 1000)
+                .is_some()
+        );
+    }
 
     fn addr(text: &str) -> PeerAddr {
         PeerAddr::parse(text).unwrap()

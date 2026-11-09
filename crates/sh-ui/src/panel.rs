@@ -379,7 +379,9 @@ impl Panel {
                 }
             }
         }
-        self.log = tail(&dir.join(sh_core::paths::LOG_FILE), 96 * 1024);
+        if self.page == Page::Log {
+            self.log = tail(&dir.join(sh_core::paths::LOG_FILE), 96 * 1024);
+        }
     }
 
     fn refresh_telemetry(&self, ctx: &egui::Context) {
@@ -434,11 +436,18 @@ impl Panel {
 
 /// The last `limit` bytes of a text file, starting at a line boundary.
 fn tail(path: &std::path::Path, limit: usize) -> String {
-    let Ok(bytes) = std::fs::read(path) else {
+    use std::io::{Read, Seek, SeekFrom};
+    // Reads only the tail, not the whole (up to 512 KiB) file.
+    let Ok(mut file) = std::fs::File::open(path) else {
         return String::new();
     };
-    let start = bytes.len().saturating_sub(limit);
-    let text = String::from_utf8_lossy(&bytes[start..]);
+    let length = file.metadata().map_or(0, |m| m.len());
+    let start = length.saturating_sub(limit as u64);
+    let mut bytes = Vec::with_capacity(limit);
+    if file.seek(SeekFrom::Start(start)).is_err() || file.read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
     match (start, text.find('\n')) {
         (0, _) | (_, None) => text.into_owned(),
         (_, Some(newline)) => text[newline + 1..].to_string(),
@@ -557,6 +566,9 @@ impl Panel {
             if theme::nav_item(ui, glyph, label, self.page == page).clicked() && self.page != page {
                 self.page = page;
                 self.status = None;
+                if page == Page::Log {
+                    self.refresh_files(true);
+                }
                 if page == Page::Diagnostics {
                     self.refresh_telemetry(ui.ctx());
                 }
@@ -1272,7 +1284,12 @@ mod tests {
     fn features_round_trip_through_config_lists() {
         let mut config = Config {
             ad_block: true,
-            ad_block_lists: vec!["light".into(), "pro".into(), "tif".into(), "future-list".into()],
+            ad_block_lists: vec![
+                "light".into(),
+                "pro".into(),
+                "tif".into(),
+                "future-list".into(),
+            ],
             ..Config::default()
         };
         let mut settings = Settings::from_config(&config);
@@ -1283,7 +1300,10 @@ mod tests {
         settings.strength = 0;
         settings.tracking = true;
         settings.apply(&mut config);
-        assert_eq!(config.ad_block_lists, ["light", "native.winoffice", "tif", "fake", "future-list"]);
+        assert_eq!(
+            config.ad_block_lists,
+            ["light", "native.winoffice", "tif", "fake", "future-list"]
+        );
         assert!(config.ad_block);
 
         // Everything off: blocking off, list names left for next time.
