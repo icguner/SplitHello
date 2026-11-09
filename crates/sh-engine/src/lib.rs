@@ -1,10 +1,11 @@
-//! Engine composition (port of `src/main.cpp`). Stage 3 runs the manual
-//! (SOCKS5 / HTTP CONNECT) mode end to end; the transparent WinDivert engine,
-//! the tray and setup arrive in stages 4 and 5.
+//! Engine composition (port of `src/main.cpp`): command line, the
+//! transparent (WinDivert) and manual-proxy engines and one-shot commands. The
+//! tray, panel and setup arrive in stage 5.
 
 pub mod adblock_updater;
-mod manual;
+pub mod engine;
 pub mod options;
+mod win;
 
 use options::Action;
 
@@ -34,11 +35,16 @@ pub fn run(args: Vec<String>) -> i32 {
             0
         }
         Action::ForgetStrategies => forget_strategies(),
-        Action::Run if options.manual_proxy => manual::run(&options),
+        Action::ForgetToken => forget_token(),
+        Action::Run
+            if options.manual_proxy || options.engine || options.console || options.verbose =>
+        {
+            engine::run(&options)
+        }
         _ => {
             eprintln!(
-                "Bu islem Rust surumunde henuz yok (asama 4-5). Simdilik C++ splithello.exe'yi kullanin; \
-                 Rust surumu yalnizca --manual-proxy, --list-strategies ve --forget-strategies destekliyor."
+                "Bu islem Rust surumunde henuz yok (asama 5: tray, kurulum). Motoru calistirmak icin \
+                 --console veya --manual-proxy kullanin."
             );
             1
         }
@@ -60,6 +66,33 @@ fn list_strategies() {
             "\nCalisan profil ag + alan adi bazinda ogrenilir ve {} dosyasinda saklanir.",
             dir.join(sh_core::paths::STRATEGY_FILE).display()
         );
+    }
+}
+
+fn forget_token() -> i32 {
+    let Some(dir) = config_dir() else {
+        eprintln!("APPDATA yolu belirlenemedi");
+        return 1;
+    };
+    let mut config = sh_core::config::Config::default();
+    config.load_from(&dir);
+    if config.load_failed {
+        eprintln!("Token silinemedi.");
+        return 1;
+    }
+    // accountId stays: it is not a secret and selects the same account.
+    config.api_token.clear();
+    match config.save_to(&dir) {
+        Ok(()) => {
+            println!(
+                "Eski Cloudflare API token alani silindi.\nWrangler OAuth oturumu etkilenmedi."
+            );
+            0
+        }
+        Err(_) => {
+            eprintln!("Token silinemedi.");
+            1
+        }
     }
 }
 

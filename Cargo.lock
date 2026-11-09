@@ -1112,6 +1112,13 @@ dependencies = [
 [[package]]
 name = "sh-divert"
 version = "0.1.0"
+dependencies = [
+ "sh-core",
+ "sh-flow",
+ "sh-proto",
+ "tracing",
+ "windows",
+]
 
 [[package]]
 name = "sh-dns"
@@ -1134,6 +1141,7 @@ version = "0.1.0"
 dependencies = [
  "sh-adblock",
  "sh-core",
+ "sh-divert",
  "sh-dns",
  "sh-flow",
  "sh-net",
@@ -1142,6 +1150,7 @@ dependencies = [
  "sh-telemetry",
  "tokio",
  "tracing",
+ "windows",
 ]
 
 [[package]]
