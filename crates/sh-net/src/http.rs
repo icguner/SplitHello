@@ -83,10 +83,13 @@ pub trait Fetch: Send + Sync {
     fn fetch(&self, request: Request) -> FetchFuture<'_>;
 }
 
+/// None: resolve normally; Some: (host, addresses with the connect port).
+type ClientKey = Option<(String, Vec<SocketAddr>)>;
+
 /// reqwest clients keyed by their connect override, so keep-alive connections
 /// to the same Worker are reused across DoH queries.
 pub struct HttpClient {
-    clients: Mutex<HashMap<Option<(String, Vec<SocketAddr>)>, reqwest::Client>>,
+    clients: Mutex<HashMap<ClientKey, reqwest::Client>>,
 }
 
 impl Default for HttpClient {

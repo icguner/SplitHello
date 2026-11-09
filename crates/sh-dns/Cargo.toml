@@ -1,0 +1,25 @@
+[package]
+name = "sh-dns"
+description = "DNS through the Cloudflare Worker (cached /resolve and wire DoH) and the transparent DNS proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+sh-adblock = { path = "../sh-adblock" }
+sh-core = { path = "../sh-core" }
+sh-flow = { path = "../sh-flow" }
+sh-net = { path = "../sh-net" }
+sh-proto = { path = "../sh-proto" }
+serde_json = "1"
+socket2 = "0.6"
+tokio = { version = "1", features = ["net", "time", "rt", "macros", "sync"] }
+tracing = "0.1"
+
+[dev-dependencies]
+sh-proto = { path = "../sh-proto", features = ["testing"] }
+tokio = { version = "1", features = ["full"] }
+
+[lints]
+workspace = true

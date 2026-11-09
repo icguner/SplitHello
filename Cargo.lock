@@ -1114,6 +1114,21 @@ name = "sh-divert"
 version = "0.1.0"
 
 [[package]]
+name = "sh-dns"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sh-adblock",
+ "sh-core",
+ "sh-flow",
+ "sh-net",
+ "sh-proto",
+ "socket2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sh-flow"
 version = "0.1.0"
 dependencies = [
