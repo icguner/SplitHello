@@ -42,8 +42,8 @@ foreach ($scale in 100, 200) {
     # Welcome / finish panel, 164x314 at 100%.
     $panel, $g = New-Canvas (164 * $k) (314 * $k)
     $area = New-Object System.Drawing.Rectangle 0, 0, $panel.Width, $panel.Height
-    $top = [System.Drawing.Color]::FromArgb(10, 36, 99)
-    $bottom = [System.Drawing.Color]::FromArgb(0, 150, 190)
+    $top = [System.Drawing.Color]::FromArgb(27, 31, 46)
+    $bottom = [System.Drawing.Color]::FromArgb(58, 66, 92)
     $g.FillRectangle((New-Object System.Drawing.Drawing2D.LinearGradientBrush $area, $top, $bottom, 90), $area)
     $g.DrawImage($logo, (22 * $k), (70 * $k), (120 * $k), (120 * $k))
     $font = New-Object System.Drawing.Font 'Segoe UI Semibold', (17 * $k), ([System.Drawing.FontStyle]::Regular), ([System.Drawing.GraphicsUnit]::Pixel)

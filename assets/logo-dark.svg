@@ -1,0 +1,15 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="386 16 770 770" width="512" height="512">
+  <!-- SplitHello mark: an S whose stroke splits around the DPI box. -->
+  <g fill="none" stroke="#FF4F0A" stroke-width="48">
+    <path d="M395 453 L560 453"/>
+    <path d="M555 452 C 610 450, 640 312, 735 302 C 820 296, 900 373, 1040 373"/>
+    <path d="M555 454 C 640 458, 690 529, 775 527 C 840 526, 890 512, 960 482"/>
+  </g>
+  <path fill="#FF4F0A" d="M1038 303 L1150 373 L1038 443 Z"/>
+  <mask id="gap" maskUnits="userSpaceOnUse" x="386" y="16" width="770" height="770"><rect x="386" y="16" width="770" height="770" fill="#fff"/><path d="M555 452 C 610 450, 640 312, 735 302" fill="none" stroke="#000" stroke-width="78"/></mask>
+  <g fill="#E6EDF3" mask="url(#gap)">
+    <path id="stroke" d="M1110 145 L790 145 C 650 145, 540 232, 526 402 C 574 394, 604 366, 618 340 C 652 266, 712 228, 795 228 L1050 228 Z"/>
+    <use href="#stroke" transform="rotate(180 771 401)"/>
+  </g>
+  <rect fill="#E6EDF3" x="708" y="356" width="120" height="116" rx="18"/>
+</svg>

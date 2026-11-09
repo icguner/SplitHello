@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+  <img src="assets/logo.svg" width="96" alt="SplitHello logo">
+</picture>
+
 # SplitHello
 
 [Türkçe](README.md) · English

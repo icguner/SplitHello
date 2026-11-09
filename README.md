@@ -1,6 +1,9 @@
 <div align="center">
 
-<img src="assets/splithello-icon.png" width="88" alt="SplitHello">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+  <img src="assets/logo.svg" width="128" alt="SplitHello logosu">
+</picture>
 
 # SplitHello
 
