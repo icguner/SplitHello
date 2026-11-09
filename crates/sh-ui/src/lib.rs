@@ -4,6 +4,7 @@
 
 pub mod panel;
 pub mod startup;
+mod theme;
 pub mod tray;
 
 use sh_engine::options::Options;

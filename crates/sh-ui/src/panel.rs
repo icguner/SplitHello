@@ -2,26 +2,37 @@
 //! process, opened by the tray with `--panel --live-stats <name>`. It reads
 //! the engine's live-stats mapping, the telemetry database and the files in
 //! the config folder; settings it saves are applied by asking the tray to
-//! restart the engine.
+//! restart the engine. The look lives in `theme`.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 use sh_core::config::Config;
 use sh_core::live_stats::Snapshot;
 use sh_telemetry::DashboardData;
 
-const ACCENT: Color32 = Color32::from_rgb(0x2E, 0x9C, 0x6A);
-const WARN: Color32 = Color32::from_rgb(0xD9, 0x8E, 0x04);
-const BAD: Color32 = Color32::from_rgb(0xD1, 0x43, 0x43);
+use crate::theme::{self, icon, palette};
+
 /// HaGeZi lists the updater knows (see `sh_adblock::list_path`).
-const LISTS: [(&str, &str); 4] = [
-    ("light", "Light — en az yanlış pozitif"),
-    ("pro", "Pro — önerilen"),
-    ("tif", "TIF — kötü amaçlı / oltalama"),
-    ("doh", "DoH sunucuları — uygulamaları DNS'imize yönlendirir"),
+const LISTS: [(&str, &str, &str); 4] = [
+    (
+        "light",
+        "Light",
+        "En az yanlış pozitif; temel reklam ve izleyiciler.",
+    ),
+    ("pro", "Pro", "Önerilen denge: reklam, izleyici, telemetri."),
+    (
+        "tif",
+        "Tehdit istihbaratı",
+        "Kötü amaçlı yazılım, oltalama ve dolandırıcılık alanları.",
+    ),
+    (
+        "doh",
+        "DoH sunucuları",
+        "Uygulamaların kendi DNS'ini kapatır, DNS'imize yönlendirir.",
+    ),
 ];
 const TELEMETRY_DAYS: u32 = 7;
 
@@ -29,15 +40,18 @@ pub fn run(live_stats_name: &str) -> i32 {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("SplitHello")
-            .with_inner_size([1000.0, 700.0])
-            .with_min_inner_size([680.0, 440.0]),
+            .with_inner_size(theme::WINDOW_SIZE)
+            .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
     let name = live_stats_name.to_string();
     let result = eframe::run_native(
         "SplitHello",
         options,
-        Box::new(move |_| Ok(Box::new(Panel::new(name)))),
+        Box::new(move |cc| {
+            theme::install(&cc.egui_ctx);
+            Ok(Box::new(Panel::new(name)))
+        }),
     );
     match result {
         Ok(()) => 0,
@@ -57,6 +71,17 @@ enum Page {
     Log,
 }
 
+/// What the panel edits in config.json; compared with the saved copy to show
+/// the save bar only when something changed.
+#[derive(Clone, PartialEq, Eq, Default)]
+struct Settings {
+    ad_block: bool,
+    lists: Vec<bool>,
+    allow: Vec<String>,
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
 struct Panel {
     page: Page,
     dir: Option<PathBuf>,
@@ -64,13 +89,13 @@ struct Panel {
     profile_names: Vec<&'static str>,
     live: Snapshot,
     live_at: Option<Instant>,
-    // Settings being edited (loaded from config.json on open / after save).
-    ad_block: bool,
-    lists: Vec<bool>,
-    allow_text: String,
-    include_text: String,
-    exclude_text: String,
-    status: Option<(String, Color32)>,
+    settings: Settings,
+    saved: Settings,
+    // Add-field contents, kept out of Settings so typing is not "unsaved".
+    allow_draft: String,
+    include_draft: String,
+    exclude_draft: String,
+    status: Option<(String, bool)>, // (message, success)
     recent: Vec<(String, String)>,
     total_blocked: String,
     files_at: Option<Instant>,
@@ -89,11 +114,11 @@ impl Panel {
             profile_names: sh_strategy::PROFILES.iter().map(|p| p.name).collect(),
             live: Snapshot::default(),
             live_at: None,
-            ad_block: false,
-            lists: vec![false; LISTS.len()],
-            allow_text: String::new(),
-            include_text: String::new(),
-            exclude_text: String::new(),
+            settings: Settings::default(),
+            saved: Settings::default(),
+            allow_draft: String::new(),
+            include_draft: String::new(),
+            exclude_draft: String::new(),
             status: None,
             recent: Vec::new(),
             total_blocked: "0".into(),
@@ -115,56 +140,53 @@ impl Panel {
 
     fn load_settings(&mut self) {
         let Some(config) = self.load_config() else {
-            self.status = Some(("Yapılandırma okunamadı.".into(), BAD));
+            self.status = Some(("Yapılandırma okunamadı.".into(), false));
             return;
         };
-        self.ad_block = config.ad_block;
-        self.lists = LISTS
-            .iter()
-            .map(|(name, _)| config.ad_block_lists.iter().any(|l| l == name))
-            .collect();
-        self.allow_text = config.ad_block_allow.join("\n");
-        self.include_text = config.process_include.join("\n");
-        self.exclude_text = config.process_exclude.join("\n");
+        self.saved = Settings {
+            ad_block: config.ad_block,
+            lists: LISTS
+                .iter()
+                .map(|(name, _, _)| config.ad_block_lists.iter().any(|l| l == name))
+                .collect(),
+            allow: config.ad_block_allow.clone(),
+            include: config.process_include.clone(),
+            exclude: config.process_exclude.clone(),
+        };
+        self.settings = self.saved.clone();
     }
 
     /// Re-reads config.json and changes only what this panel edits, so a
     /// concurrent change (tray DNS toggle, setup) is not overwritten.
     fn save_settings(&mut self) {
-        let lines = |text: &str| -> Vec<String> {
-            text.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(String::from)
-                .collect()
-        };
         let (Some(dir), Some(mut config)) = (self.dir.clone(), self.load_config()) else {
-            self.status = Some(("Yapılandırma okunamadı; kaydedilmedi.".into(), BAD));
+            self.status = Some(("Yapılandırma okunamadı; kaydedilmedi.".into(), false));
             return;
         };
-        config.ad_block = self.ad_block;
+        let s = &self.settings;
+        config.ad_block = s.ad_block;
         config.ad_block_lists = LISTS
             .iter()
-            .zip(&self.lists)
+            .zip(&s.lists)
             .filter(|(_, on)| **on)
-            .map(|((name, _), _)| (*name).to_string())
+            .map(|((name, _, _), _)| (*name).to_string())
             .collect();
-        config.ad_block_allow = lines(&self.allow_text);
-        config.process_include = lines(&self.include_text);
-        config.process_exclude = lines(&self.exclude_text);
+        config.ad_block_allow = s.allow.clone();
+        config.process_include = s.include.clone();
+        config.process_exclude = s.exclude.clone();
         if let Err(error) = config.save_to(&dir) {
-            self.status = Some((format!("Kaydedilemedi: {error}"), BAD));
+            self.status = Some((format!("Kaydedilemedi: {error}"), false));
             return;
         }
         self.status = Some(if crate::tray::notify_tray_restart() {
             (
-                "Kaydedildi; ağ motoru yeni ayarlarla yeniden başlıyor.".into(),
-                ACCENT,
+                "Kaydedildi. Ağ motoru yeni ayarlarla yeniden başlıyor.".into(),
+                true,
             )
         } else {
             (
-                "Kaydedildi; tray kapalı, ayarlar bir sonraki başlatmada geçerli.".into(),
-                WARN,
+                "Kaydedildi. Tray kapalı; ayarlar bir sonraki başlatmada geçerli.".into(),
+                true,
             )
         });
         self.load_settings();
@@ -249,11 +271,11 @@ impl Panel {
         });
         self.status = Some(if written {
             (
-                format!("{host} serbest bırakıldı (birkaç saniye içinde geçerli olur)."),
-                ACCENT,
+                format!("{host} serbest bırakıldı; birkaç saniye içinde geçerli olur."),
+                true,
             )
         } else {
-            ("Liste dosyasına yazılamadı.".into(), BAD)
+            ("İzin listesine yazılamadı.".into(), false)
         });
     }
 }
@@ -271,22 +293,10 @@ fn tail(path: &std::path::Path, limit: usize) -> String {
     }
 }
 
-fn stat(ui: &mut egui::Ui, label: &str, value: impl ToString, color: Color32) {
-    ui.vertical(|ui| {
-        ui.label(RichText::new(label).small().weak());
-        ui.label(
-            RichText::new(value.to_string())
-                .size(22.0)
-                .strong()
-                .color(color),
-        );
-    });
-}
-
-fn section(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(10.0);
-    ui.label(RichText::new(title).strong().size(15.0));
-    ui.separator();
+fn refresh_button(ui: &mut egui::Ui) -> bool {
+    ui.button(RichText::new(icon::REFRESH).font(theme::icons(15.0)))
+        .on_hover_text("Yenile")
+        .clicked()
 }
 
 impl eframe::App for Panel {
@@ -294,339 +304,598 @@ impl eframe::App for Panel {
         self.refresh_live();
         self.refresh_files(false);
         ui.ctx().request_repaint_after(Duration::from_secs(1));
+        let p = palette(ui);
 
         egui::Panel::left("nav")
             .resizable(false)
-            .exact_size(170.0)
-            .show(ui, |ui| {
-                ui.add_space(12.0);
-                ui.label(
-                    RichText::new("SplitHello")
-                        .size(20.0)
-                        .strong()
-                        .color(ACCENT),
-                );
-                ui.add_space(12.0);
-                for (page, label) in [
-                    (Page::Status, "Durum"),
-                    (Page::AdBlock, "Reklam engeli"),
-                    (Page::Processes, "Süreç kuralları"),
-                    (Page::Diagnostics, "Teşhis"),
-                    (Page::Log, "Log"),
-                ] {
-                    let selected = self.page == page;
-                    if ui
-                        .selectable_label(selected, RichText::new(label).size(15.0))
-                        .clicked()
-                    {
-                        self.page = page;
-                        self.status = None;
-                        if page == Page::Diagnostics {
-                            self.refresh_telemetry(ui.ctx());
-                        }
-                    }
-                }
-            });
+            .exact_size(theme::SIDEBAR_WIDTH)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(p.sidebar)
+                    .inner_margin(egui::Margin::symmetric(14, 18)),
+            )
+            .show(ui, |ui| self.sidebar(ui));
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            if let Some((text, color)) = &self.status {
-                ui.label(RichText::new(text).color(*color));
-            }
-            egui::ScrollArea::vertical().show(ui, |ui| match self.page {
-                Page::Status => self.status_page(ui),
-                Page::AdBlock => self.ad_block_page(ui),
-                Page::Processes => self.process_page(ui),
-                Page::Diagnostics => self.diagnostics_page(ui),
-                Page::Log => self.log_page(ui),
+        let dirty = self.settings != self.saved;
+        if dirty && matches!(self.page, Page::AdBlock | Page::Processes) {
+            egui::Panel::bottom("save")
+                .show_separator_line(false)
+                .frame(
+                    egui::Frame::new()
+                        .fill(p.card)
+                        .stroke(egui::Stroke::new(1.0, p.stroke))
+                        .inner_margin(egui::Margin::symmetric(28, 14)),
+                )
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Kaydedilmemiş değişiklikler var").size(15.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if theme::primary_button(ui, "Kaydet ve uygula").clicked() {
+                                self.save_settings();
+                            }
+                            if ui.button("Geri al").clicked() {
+                                self.settings = self.saved.clone();
+                            }
+                        });
+                    });
+                });
+        }
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(p.background))
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        egui::Frame::new()
+                            .inner_margin(egui::Margin {
+                                left: 36,
+                                right: 36,
+                                top: 28,
+                                bottom: 36,
+                            })
+                            .show(ui, |ui| {
+                                // set_max_width can also widen; never past the window.
+                                let width = ui.available_width().min(theme::CONTENT_MAX_WIDTH);
+                                ui.set_max_width(width);
+                                self.status_banner(ui);
+                                match self.page {
+                                    Page::Status => self.status_page(ui),
+                                    Page::AdBlock => self.ad_block_page(ui),
+                                    Page::Processes => self.process_page(ui),
+                                    Page::Diagnostics => self.diagnostics_page(ui),
+                                    Page::Log => self.log_page(ui),
+                                }
+                            });
+                    });
             });
-        });
     }
 }
 
 impl Panel {
-    fn status_page(&mut self, ui: &mut egui::Ui) {
-        let live = &self.live;
-        section(ui, "Ağ motoru");
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui);
         ui.horizontal(|ui| {
-            let (text, color) = if live.online {
-                ("Koruma aktif", ACCENT)
-            } else {
-                ("Çevrimdışı", BAD)
-            };
-            stat(ui, "DURUM", text, color);
-            ui.add_space(24.0);
-            stat(ui, "AKTİF AKIŞ", live.active_flows, Color32::PLACEHOLDER);
-            ui.add_space(24.0);
-            stat(
-                ui,
-                "KARAR BEKLEYEN",
-                live.pending_flows,
-                Color32::PLACEHOLDER,
-            );
-            ui.add_space(24.0);
-            stat(ui, "OTURUM KARARI", live.decisions, Color32::PLACEHOLDER);
-        });
-        ui.horizontal(|ui| {
-            stat(ui, "BAŞARILI", live.successful_decisions, ACCENT);
-            ui.add_space(24.0);
-            stat(ui, "ATLATILDI", live.bypassed_decisions, ACCENT);
-            ui.add_space(24.0);
-            stat(ui, "ÇÖZÜLEMEDİ", live.unresolved_decisions, BAD);
-            ui.add_space(24.0);
-            stat(ui, "ENGELLENEN REKLAM", &self.total_blocked, WARN);
-        });
-        if !live.online {
+            ui.add_space(6.0);
             ui.label(
-                RichText::new("Canlı veri yok: motor kapalı ya da panel tray dışından açıldı.")
-                    .weak(),
+                RichText::new(icon::SHIELD)
+                    .font(theme::icons(22.0))
+                    .color(p.blue),
             );
-        }
-        section(ui, "Profiller");
-        egui::Grid::new("profiles")
-            .striped(true)
-            .num_columns(3)
-            .show(ui, |ui| {
-                ui.label(RichText::new("PROFİL").weak());
-                ui.label(RichText::new("AKTİF").weak());
-                ui.label(RichText::new("KARAR").weak());
-                ui.end_row();
-                for profile in live
-                    .profiles
-                    .iter()
-                    .filter(|p| p.active > 0 || p.decisions > 0)
-                {
-                    ui.label(&profile.name);
-                    ui.label(profile.active.to_string());
-                    ui.label(profile.decisions.to_string());
-                    ui.end_row();
+            ui.label(RichText::new("SplitHello").font(theme::semibold(21.0)));
+        });
+        ui.add_space(22.0);
+        ui.spacing_mut().item_spacing.y = 4.0;
+        for (page, glyph, label) in [
+            (Page::Status, icon::STATUS, "Durum"),
+            (Page::AdBlock, icon::SHIELD, "Reklam engeli"),
+            (Page::Processes, icon::APPS, "Uygulamalar"),
+            (Page::Diagnostics, icon::CHART, "Teşhis"),
+            (Page::Log, icon::DOCUMENT, "Kayıtlar"),
+        ] {
+            if theme::nav_item(ui, glyph, label, self.page == page).clicked() && self.page != page {
+                self.page = page;
+                self.status = None;
+                if page == Page::Diagnostics {
+                    self.refresh_telemetry(ui.ctx());
                 }
+            }
+        }
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            let (dot, text) = if self.live.online {
+                (p.green, "Koruma aktif")
+            } else {
+                (p.secondary, "Motor kapalı")
+            };
+            ui.horizontal(|ui| {
+                ui.add_space(8.0);
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 5.0, dot);
+                ui.label(RichText::new(text).size(13.5).color(p.secondary));
             });
+        });
+    }
+
+    fn status_banner(&mut self, ui: &mut egui::Ui) {
+        let Some((text, success)) = self.status.clone() else {
+            return;
+        };
+        let p = palette(ui);
+        let color = if success { p.green } else { p.red };
+        egui::Frame::new()
+            .fill(color.gamma_multiply(0.14))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(16, 10))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(text).color(color));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::quiet_button(ui, "Kapat").clicked() {
+                            self.status = None;
+                        }
+                    });
+                });
+            });
+        ui.add_space(12.0);
+    }
+
+    fn status_page(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui);
+        let live = self.live.clone();
+        theme::page_title(
+            ui,
+            "Durum",
+            "Ağ motorunun şu anki durumu ve bu oturumdaki kararlar.",
+        );
+
+        theme::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                let color = if live.online { p.green } else { p.secondary };
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
+                ui.painter()
+                    .circle_filled(rect.center(), 28.0, color.gamma_multiply(0.16));
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    icon::SHIELD,
+                    theme::icons(26.0),
+                    color,
+                );
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.add_space(4.0);
+                    let title = if live.online {
+                        "Koruma aktif"
+                    } else {
+                        "Koruma kapalı"
+                    };
+                    ui.label(RichText::new(title).font(theme::semibold(24.0)));
+                    theme::secondary(
+                        ui,
+                        if live.online {
+                            "HTTPS trafiği izleniyor; DPI müdahalesi otomatik olarak aşılıyor."
+                        } else {
+                            "Canlı veri yok. Motoru tray menüsünden başlatın."
+                        },
+                    );
+                });
+            });
+        });
+        ui.add_space(14.0);
+        theme::metrics(
+            ui,
+            &[
+                ("Aktif bağlantı", live.active_flows.to_string(), None),
+                ("Karar bekleyen", live.pending_flows.to_string(), None),
+                ("Oturum kararı", live.decisions.to_string(), None),
+                (
+                    "Engellenen reklam",
+                    self.total_blocked.clone(),
+                    Some(p.orange),
+                ),
+            ],
+        );
+        ui.add_space(4.0);
+        theme::metrics(
+            ui,
+            &[
+                (
+                    "Doğrudan geçti",
+                    live.successful_decisions.to_string(),
+                    None,
+                ),
+                (
+                    "DPI aşıldı",
+                    live.bypassed_decisions.to_string(),
+                    Some(p.green),
+                ),
+                (
+                    "Çözülemedi",
+                    live.unresolved_decisions.to_string(),
+                    Some(p.red),
+                ),
+            ],
+        );
+        ui.add_space(14.0);
+
+        theme::card(ui, |ui| {
+            theme::card_title(ui, "Profiller");
+            theme::secondary(ui, "Bu oturumda kullanılan atlatma profilleri.");
+            ui.add_space(8.0);
+            let used: Vec<_> = live
+                .profiles
+                .iter()
+                .filter(|pr| pr.active > 0 || pr.decisions > 0)
+                .collect();
+            if used.is_empty() {
+                theme::secondary(ui, "Henüz profil kullanılmadı.");
+                return;
+            }
+            let most = used.iter().map(|pr| pr.decisions).max().unwrap_or(1).max(1);
+            for profile in used {
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        egui::vec2(170.0, 22.0),
+                        egui::Label::new(RichText::new(&profile.name)).halign(egui::Align::LEFT),
+                    );
+                    let width = (ui.available_width() - 150.0).max(40.0);
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(width, 8.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 4.0, p.field);
+                    let mut filled = rect;
+                    filled.set_width(rect.width() * profile.decisions as f32 / most as f32);
+                    ui.painter().rect_filled(filled, 4.0, p.blue);
+                    ui.label(
+                        RichText::new(format!(
+                            "{} karar · {} aktif",
+                            profile.decisions, profile.active
+                        ))
+                        .size(13.0)
+                        .color(p.secondary),
+                    );
+                });
+            }
+        });
     }
 
     fn ad_block_page(&mut self, ui: &mut egui::Ui) {
-        section(ui, "Reklam ve izleyici engeli");
-        ui.checkbox(&mut self.ad_block, "Reklam engelini aç (DNS + SNI)");
-        ui.add_space(6.0);
-        ui.label(RichText::new("Listeler (HaGeZi, günlük güncellenir)").weak());
-        for ((_, label), on) in LISTS.iter().zip(self.lists.iter_mut()) {
-            ui.checkbox(on, *label);
-        }
-        section(ui, "Her zaman izinli alan adları");
-        ui.label(RichText::new("Satır başına bir alan adı; alt alan adlarını da kapsar.").weak());
-        ui.add(
-            egui::TextEdit::multiline(&mut self.allow_text)
-                .desired_rows(5)
-                .desired_width(f32::INFINITY)
-                .hint_text("ornek.com"),
-        );
-        if ui.button("Kaydet ve motoru yenile").clicked() {
-            self.save_settings();
-        }
-
-        section(
+        let p = palette(ui);
+        theme::page_title(
             ui,
-            &format!("Son engellenenler (toplam {})", self.total_blocked),
+            "Reklam engeli",
+            "Reklamları ve izleyicileri tüm uygulamalarda, DNS ve TLS düzeyinde engeller.",
         );
-        if self.recent.is_empty() {
-            ui.label(RichText::new("Henüz engellenen yok.").weak());
-        }
-        let mut allow = None;
-        egui::Grid::new("recent")
-            .striped(true)
-            .num_columns(3)
-            .show(ui, |ui| {
-                for (host, count) in &self.recent {
-                    ui.label(host);
-                    ui.label(format!("×{count}"));
-                    if ui.small_button("Serbest bırak").clicked() {
-                        allow = Some(host.clone());
-                    }
-                    ui.end_row();
+        theme::card(ui, |ui| {
+            theme::switch_row(
+                ui,
+                &mut self.settings.ad_block,
+                "Reklam ve izleyicileri engelle",
+                "Engellenen alan adlarına hiç bağlanılmaz; sayfalar daha hızlı açılır.",
+            );
+        });
+        ui.add_space(14.0);
+        theme::card(ui, |ui| {
+            theme::card_title(ui, "Engel listeleri");
+            theme::secondary(ui, "HaGeZi listeleri; her gün otomatik güncellenir.");
+            ui.add_space(6.0);
+            let enabled = self.settings.ad_block;
+            for (index, ((_, title, description), on)) in
+                LISTS.iter().zip(self.settings.lists.iter_mut()).enumerate()
+            {
+                if index > 0 {
+                    ui.separator();
                 }
+                ui.add_enabled_ui(enabled, |ui| {
+                    theme::switch_row(ui, on, title, description);
+                });
+            }
+        });
+        ui.add_space(14.0);
+        theme::card(ui, |ui| {
+            theme::card_title(ui, "Her zaman izin verilenler");
+            theme::secondary(ui, "Bu alan adları ve alt alan adları hiç engellenmez.");
+            ui.add_space(6.0);
+            theme::editable_list(
+                ui,
+                &mut self.settings.allow,
+                &mut self.allow_draft,
+                "ornek.com",
+                "Liste boş.",
+            );
+        });
+        ui.add_space(14.0);
+
+        let mut allow = None;
+        theme::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                theme::card_title(ui, "Son engellenenler");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("Toplam {}", self.total_blocked))
+                            .font(theme::semibold(15.0))
+                            .color(p.orange),
+                    );
+                });
             });
+            if self.recent.is_empty() {
+                theme::secondary(ui, "Henüz engellenen alan adı yok.");
+            }
+            for (index, (host, count)) in self.recent.iter().enumerate() {
+                if index > 0 {
+                    ui.separator();
+                }
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(host).size(15.0));
+                    ui.label(
+                        RichText::new(format!("×{count}"))
+                            .size(13.0)
+                            .color(p.secondary),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if theme::quiet_button(ui, "Serbest bırak").clicked() {
+                            allow = Some(host.clone());
+                        }
+                    });
+                });
+            }
+        });
         if let Some(host) = allow {
             self.allow_host(&host);
         }
     }
 
     fn process_page(&mut self, ui: &mut egui::Ui) {
-        section(ui, "Süreç kuralları");
-        ui.label(
-            RichText::new(
-                "Desenler büyük/küçük harf duyarsızdır, * ve ? destekler. Ters bölü içeren desen \
-                 tam yolu, diğerleri exe adını eşler. Hariç tutma her zaman kazanır.",
-            )
-            .weak(),
+        let p = palette(ui);
+        theme::page_title(
+            ui,
+            "Uygulamalar",
+            "SplitHello'nun hangi uygulamaların trafiğine dokunacağını seçin.",
         );
-        ui.add_space(6.0);
-        ui.label("Yalnız bunları işle (boş: tüm uygulamalar)");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.include_text)
-                .desired_rows(5)
-                .desired_width(f32::INFINITY)
-                .hint_text("chrome.exe"),
+        theme::card(ui, |ui| {
+            theme::card_title(ui, "Yalnızca bunlar");
+            theme::secondary(ui, "Boş bırakırsanız tüm uygulamalar korunur.");
+            ui.add_space(6.0);
+            theme::editable_list(
+                ui,
+                &mut self.settings.include,
+                &mut self.include_draft,
+                "chrome.exe",
+                "Liste boş: tüm uygulamalar korunuyor.",
+            );
+        });
+        ui.add_space(14.0);
+        theme::card(ui, |ui| {
+            theme::card_title(ui, "Bunlar hariç");
+            theme::secondary(ui, "Hariç tutma her zaman kazanır.");
+            ui.add_space(6.0);
+            theme::editable_list(
+                ui,
+                &mut self.settings.exclude,
+                &mut self.exclude_draft,
+                "C:\\Games\\*",
+                "Hariç tutulan uygulama yok.",
+            );
+        });
+        ui.add_space(10.0);
+        theme::secondary(
+            ui,
+            "Desenler büyük/küçük harf duyarsızdır; * ve ? kullanılabilir. Ters bölü içeren desen \
+             tam yolu, diğerleri yalnızca exe adını eşler.",
         );
-        ui.label("Bunları hiç işleme");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.exclude_text)
-                .desired_rows(5)
-                .desired_width(f32::INFINITY)
-                .hint_text("C:\\Games\\*"),
-        );
-        let rules = process_rules(&self.include_text, &self.exclude_text);
+        // The engine's own parser, for the "invalid include" warning.
+        let rules = sh_divert::rules::Rules::new(&self.settings.include, &self.settings.exclude);
         if rules.include_list_invalid() {
-            ui.label(RichText::new("Include listesi geçersiz: motor başlamaz.").color(BAD));
-        }
-        if ui.button("Kaydet ve motoru yenile").clicked() {
-            self.save_settings();
+            ui.label(RichText::new("Bu liste geçersiz: motor başlamaz.").color(p.red));
         }
     }
 
     fn diagnostics_page(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui);
         ui.horizontal(|ui| {
-            if ui.button("Yenile").clicked() {
-                self.refresh_telemetry(ui.ctx());
-            }
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width() - 60.0);
+                theme::page_title(
+                    ui,
+                    "Teşhis",
+                    &format!("Son {TELEMETRY_DAYS} günde verilen kararlar ve müdahale kanıtları."),
+                );
+            });
             if *self
                 .telemetry_loading
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
+                .unwrap_or_else(|e| e.into_inner())
             {
                 ui.spinner();
+            } else if refresh_button(ui) {
+                self.refresh_telemetry(ui.ctx());
             }
         });
-        let guard = self.telemetry.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(data) = guard.as_ref() else {
-            ui.label(RichText::new("Veri bekleniyor…").weak());
+        let snapshot = self
+            .telemetry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(data) = snapshot else {
+            theme::card(ui, |ui| theme::secondary(ui, "Veriler yükleniyor…"));
             return;
         };
         if !data.ready {
-            ui.label(RichText::new(format!("Telemetri okunamadı: {}", data.error)).color(BAD));
+            theme::card(ui, |ui| {
+                ui.label(
+                    RichText::new(format!("Telemetri okunamadı: {}", data.error)).color(p.red),
+                );
+            });
             return;
         }
-        section(ui, &format!("Özet (son {} gün)", data.window_days));
-        ui.horizontal(|ui| {
-            stat(ui, "TOPLAM KARAR", data.total, Color32::PLACEHOLDER);
-            ui.add_space(20.0);
-            stat(ui, "DOKUNULMADI", data.normal, Color32::PLACEHOLDER);
-            ui.add_space(20.0);
-            stat(ui, "ATLATILDI", data.bypassed, ACCENT);
-            ui.add_space(20.0);
-            stat(ui, "ÇÖZÜLEMEDİ", data.unresolved, BAD);
-            ui.add_space(20.0);
-            stat(
-                ui,
-                "p50 / p90 / p99 ms",
-                format!(
-                    "{} / {} / {}",
-                    data.latency.p50, data.latency.p90, data.latency.p99
+        theme::metrics(
+            ui,
+            &[
+                ("Toplam karar", data.total.to_string(), None),
+                ("Dokunulmadı", data.normal.to_string(), None),
+                ("DPI aşıldı", data.bypassed.to_string(), Some(p.green)),
+                ("Çözülemedi", data.unresolved.to_string(), Some(p.red)),
+            ],
+        );
+        ui.add_space(4.0);
+        theme::metrics(
+            ui,
+            &[
+                ("Medyan süre", format!("{} ms", data.latency.p50), None),
+                (
+                    "Yavaş (p90)",
+                    format!("{} ms", data.latency.p90),
+                    Some(p.orange),
                 ),
-                Color32::PLACEHOLDER,
-            );
+                (
+                    "Kuyruk (p99)",
+                    format!("{} ms", data.latency.p99),
+                    Some(p.red),
+                ),
+            ],
+        );
+        ui.add_space(14.0);
+
+        theme::card(ui, |ui| {
+            theme::card_title(ui, "Müdahale görülen alan adları");
+            ui.add_space(6.0);
+            let widths = [0.55, 0.15, 0.15, 0.15];
+            let header =
+                ["Alan adı", "Toplam", "Aşıldı", "Çözülemedi"].map(|h| (h.to_string(), None));
+            theme::table_row(ui, &header, &widths, true);
+            if data.top_hosts.is_empty() {
+                theme::secondary(ui, "Kayıt yok.");
+            }
+            for host in &data.top_hosts {
+                theme::table_row(
+                    ui,
+                    &[
+                        (host.host.clone(), None),
+                        (host.total.to_string(), None),
+                        (host.bypassed.to_string(), Some(p.green)),
+                        (
+                            host.unresolved.to_string(),
+                            (host.unresolved > 0).then_some(p.red),
+                        ),
+                    ],
+                    &widths,
+                    false,
+                );
+            }
         });
+        ui.add_space(14.0);
 
-        section(ui, "Müdahale gerektiren alanlar");
-        egui::Grid::new("hosts")
-            .striped(true)
-            .num_columns(4)
-            .show(ui, |ui| {
-                for title in ["ALAN ADI", "TOPLAM", "ATLATILDI", "ÇÖZÜLEMEDİ"] {
-                    ui.label(RichText::new(title).weak());
-                }
-                ui.end_row();
-                for host in &data.top_hosts {
-                    ui.label(&host.host);
-                    ui.label(host.total.to_string());
-                    ui.label(host.bypassed.to_string());
-                    ui.label(RichText::new(host.unresolved.to_string()).color(
-                        if host.unresolved > 0 {
-                            BAD
-                        } else {
-                            Color32::PLACEHOLDER
-                        },
-                    ));
-                    ui.end_row();
-                }
-            });
-
-        section(ui, "Profiller");
-        egui::Grid::new("profile-stats")
-            .striped(true)
-            .num_columns(4)
-            .show(ui, |ui| {
-                for title in ["PROFİL", "KARAR", "ORT. ms", "ORT. DENEME"] {
-                    ui.label(RichText::new(title).weak());
-                }
-                ui.end_row();
+        ui.columns(2, |columns| {
+            theme::card(&mut columns[0], |ui| {
+                theme::card_title(ui, "Profiller");
+                ui.add_space(6.0);
+                let widths = [0.46, 0.18, 0.18, 0.18];
+                let header = ["Profil", "Karar", "ms", "Deneme"].map(|h| (h.to_string(), None));
+                theme::table_row(ui, &header, &widths, true);
                 for profile in &data.profiles {
-                    ui.label(&profile.name);
-                    ui.label(profile.count.to_string());
-                    ui.label(format!("{:.0}", profile.average_latency_ms));
-                    ui.label(format!("{:.1}", profile.average_attempts));
-                    ui.end_row();
+                    theme::table_row(
+                        ui,
+                        &[
+                            (profile.name.clone(), None),
+                            (profile.count.to_string(), None),
+                            (format!("{:.0}", profile.average_latency_ms), None),
+                            (format!("{:.1}", profile.average_attempts), None),
+                        ],
+                        &widths,
+                        false,
+                    );
                 }
             });
-
-        section(ui, "Teşhis dağılımı");
-        for item in data.diagnoses.iter().chain(&data.signals) {
-            ui.label(format!("{}: {}", item.key, item.count));
-        }
-
-        section(ui, "Son kararlar");
-        ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("Alan adı ara…"));
-        let needle = self.search.to_ascii_lowercase();
-        egui::Grid::new("events")
-            .striped(true)
-            .num_columns(5)
-            .show(ui, |ui| {
-                for title in ["ALAN ADI", "TEŞHİS", "PROFİL", "DENEME", "ms"] {
-                    ui.label(RichText::new(title).weak());
-                }
-                ui.end_row();
-                for event in data
-                    .recent
-                    .iter()
-                    .filter(|e| e.host.contains(&needle))
-                    .take(200)
-                {
-                    ui.label(&event.host);
-                    ui.label(RichText::new(&event.diagnosis).color(if event.success {
-                        Color32::PLACEHOLDER
-                    } else {
-                        BAD
-                    }));
-                    ui.label(&event.winner);
-                    ui.label(event.attempt_count.to_string());
-                    ui.label(event.total_elapsed_ms.to_string());
-                    ui.end_row();
+            theme::card(&mut columns[1], |ui| {
+                theme::card_title(ui, "Teşhis dağılımı");
+                ui.add_space(6.0);
+                let total: i64 = data.diagnoses.iter().map(|d| d.count).sum::<i64>().max(1);
+                for item in &data.diagnoses {
+                    ui.horizontal(|ui| {
+                        ui.label(&item.key);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}  ·  %{}",
+                                    item.count,
+                                    item.count * 100 / total
+                                ))
+                                .color(p.secondary),
+                            );
+                        });
+                    });
                 }
             });
+        });
+        ui.add_space(14.0);
+
+        theme::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                theme::card_title(ui, "Son kararlar");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .hint_text("Alan adı ara")
+                            .desired_width(240.0)
+                            .margin(egui::Margin::symmetric(10, 6)),
+                    );
+                });
+            });
+            ui.add_space(6.0);
+            let needle = self.search.to_ascii_lowercase();
+            let widths = [0.4, 0.25, 0.15, 0.1, 0.1];
+            let header =
+                ["Alan adı", "Teşhis", "Profil", "Deneme", "ms"].map(|h| (h.to_string(), None));
+            theme::table_row(ui, &header, &widths, true);
+            for event in data
+                .recent
+                .iter()
+                .filter(|e| e.host.contains(&needle))
+                .take(150)
+            {
+                theme::table_row(
+                    ui,
+                    &[
+                        (event.host.clone(), None),
+                        (event.diagnosis.clone(), (!event.success).then_some(p.red)),
+                        (event.winner.clone(), None),
+                        (event.attempt_count.to_string(), None),
+                        (event.total_elapsed_ms.to_string(), None),
+                    ],
+                    &widths,
+                    false,
+                );
+            }
+        });
     }
 
     fn log_page(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if ui.button("Yenile").clicked() {
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width() - 60.0);
+                theme::page_title(ui, "Kayıtlar", "splithello.log dosyasının son 96 KB'ı.");
+            });
+            if refresh_button(ui) {
                 self.refresh_files(true);
             }
-            ui.label(RichText::new("splithello.log (son 96 KB)").weak());
         });
-        ui.add(
-            egui::TextEdit::multiline(&mut self.log.as_str())
-                .font(egui::TextStyle::Monospace)
-                .desired_width(f32::INFINITY),
-        );
+        theme::card(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(560.0)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.log.as_str())
+                            .font(egui::TextStyle::Monospace)
+                            .frame(egui::Frame::NONE)
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+        });
     }
-}
-
-/// The same rule parser the engine uses, for the "invalid include" warning.
-fn process_rules(include: &str, exclude: &str) -> sh_divert::rules::Rules {
-    fn lines(text: &str) -> Vec<&str> {
-        text.lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .collect()
-    }
-    sh_divert::rules::Rules::new(&lines(include), &lines(exclude))
 }
 
 #[cfg(test)]
