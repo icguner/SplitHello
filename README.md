@@ -1,137 +1,121 @@
 <div align="center">
 
-<img src="assets/splithello-icon.png" width="96" alt="SplitHello simgesi">
+<img src="assets/splithello-icon.png" width="88" alt="SplitHello">
 
 # SplitHello
 
-**Türkiye'deki erişim engellerini kendiliğinden aşar, reklamları ve izleyicileri engeller.**
-VPN değil, aradan sunucu geçmez, internetin yavaşlamaz. Ücretsiz ve açık kaynak.
+Türkiye'deki erişim engellerini kendiliğinden aşan, reklam ve izleyicileri engelleyen Windows uygulaması.
+VPN değildir; trafiğin başka bir sunucudan geçmez.
 
-[**İndir (Windows 10/11)**](https://github.com/icguner/SplitHello/releases/latest) · [English](README.en.md)
+[İndir](https://github.com/icguner/SplitHello/releases/latest) · [Nasıl çalışır](#nasıl-çalışır) · [Sık sorulanlar](#sık-sorulan-sorular) · [English](README.en.md)
 
 </div>
 
----
-
-## Ne işe yarar?
-
-- 🔓 **Engelli siteleri açar.** Discord gibi erişime kapatılmış siteler ayar yapmadan açılır. Hangi sitenin nasıl açılacağını kendisi bulur ve hatırlar.
-- 🛡️ **Reklam ve izleyici engeller.** AdGuard'daki gibi; tarayıcıda, oyunda, her uygulamada. Eklenti gerekmez.
-- 🧠 **Ayar istemez.** Kur, bir kez Cloudflare'e izin ver, unut. Windows ile birlikte açılır, yönetici izni bir daha sormaz.
-- 🪶 **Hafif.** Yaklaşık 27 MB bellek. Oyunlara, sesli sohbete ve 443 dışındaki trafiğe hiç dokunmaz.
-
 <p align="center">
-  <img src="docs/images/panel-durum.png" width="49%" alt="SplitHello paneli: Durum">
-  <img src="docs/images/panel-koruma.png" width="49%" alt="SplitHello paneli: Koruma">
+  <img src="docs/images/panel-durum.png" width="49%" alt="Panel: Durum">
+  <img src="docs/images/panel-koruma.png" width="49%" alt="Panel: Koruma">
 </p>
+
+## Öne çıkanlar
+
+| | |
+|---|---|
+| **Engelli siteleri açar** | Erişimi engellenmiş siteler ayar yapmadan açılır. Hangi sitenin hangi yöntemle açıldığını öğrenir ve hatırlar. |
+| **Reklam ve izleyici engeller** | Tarayıcıda, oyunda ve diğer bütün uygulamalarda çalışır; eklenti gerekmez. |
+| **Kur ve unut** | Windows ile açılır. Yönetici izni yalnızca kurulumda bir kez istenir. |
+| **Hafif** | Yaklaşık 27 MB bellek kullanır. Oyun ve sesli sohbet trafiğine dokunmaz. |
 
 ## Türkiye'de siteler nasıl engelleniyor?
 
-İnternet sağlayıcıları iki yöntem kullanıyor. SplitHello ikisini de aşıyor:
+İnternet sağlayıcıları iki yöntem kullanır. SplitHello ikisini de aşar.
 
-| Engel | Ne oluyor? | SplitHello ne yapıyor? |
+| Engel | Ne olur? | SplitHello ne yapar? |
 |---|---|---|
-| **DNS engeli** | Siteyi sorduğunda sağlayıcı yanlış adres veriyor, site hiç açılmıyor. | Adres sorgusunu şifreleyip kendi Cloudflare Worker'ından soruyor, doğru adresi alıyor. |
-| **DPI (SNI) engeli** | Bağlanırken gönderilen site adını sağlayıcının cihazı okuyor ve bağlantıyı kesiyor. | Site adını parçalara bölüyor; cihaz okuyamıyor, site normal açılıyor. |
+| **DNS engeli** | Site adresini sorduğunda sağlayıcı yanlış adres döner, site açılmaz. | Sorguyu şifreleyip kendi Cloudflare Worker'ına sorar ve gerçek adresi alır. |
+| **DPI (SNI) engeli** | Bağlanırken gönderilen site adını sağlayıcının cihazı okur ve bağlantıyı keser. | Site adını parçalara böler. Cihaz adı okuyamaz, site normal açılır. |
 
 ## Nasıl çalışır?
 
-```mermaid
-flowchart LR
-    A["Tarayıcı / uygulama"] --> B{"SplitHello"}
-    B -->|"Reklam veya zararlı site"| X["Engellenir"]
-    B -->|"Normal site"| C["Olduğu gibi gider"]
-    B -->|"Engelli site"| D["Site adı parçalanır"]
-    C --> S["Site"]
-    D --> S
-```
+<p align="center">
+  <img src="docs/images/nasil-calisir.svg" width="100%" alt="SplitHello bağlantıları üç yola ayırır: normal siteler olduğu gibi gider, engelli sitelerde site adı parçalanır, reklam ve zararlı siteler engellenir.">
+</p>
 
-1. Bir siteye bağlandığında SplitHello önce **hiçbir şeye dokunmadan** dener. Çalışıyorsa karışmaz.
-2. Bağlantı kesiliyorsa site adını farklı yöntemlerle parçalayıp dener.
-3. Çalışan yöntemi o ağ ve o site için **hatırlar**. Bir dahaki sefere site ilk denemede açılır.
+1. Her bağlantı önce **hiç değiştirilmeden** denenir. Çalışıyorsa SplitHello karışmaz.
+2. Bağlantı kesiliyorsa site adı farklı yöntemlerle parçalanarak tekrar denenir.
+3. Çalışan yöntem o ağ ve o site için kaydedilir; site bir dahaki sefere ilk denemede açılır.
 
-Yanlış bir şey öğrenmemesi için engeli iki ayrı denemede görmeden kalıcı kaydetmez ve öğrendiklerini her yarım saatte bir yeniden kontrol eder.
+Yanlış bir şey öğrenmemek için engel iki ayrı denemede görülmeden kayıt yapılmaz. Kayıtlar yarım saatte bir yeniden kontrol edilir.
 
-## Worker nedir, neden gerekli?
+## Worker nedir?
 
-Worker, **senin kendi** ücretsiz Cloudflare hesabında çalışan küçük bir koddur. Yalnızca site adreslerini (DNS) sormak için kullanılır.
+Worker, kendi ücretsiz Cloudflare hesabında çalışan küçük bir programdır. Yalnızca site adreslerini (DNS) sormak için kullanılır.
 
-```mermaid
-sequenceDiagram
-    participant U as Uygulama
-    participant S as SplitHello
-    participant W as Senin Worker'ın (Cloudflare)
-    participant I as Site
-    U->>S: discord.com nerede?
-    S->>W: Şifreli soru (HTTPS)
-    W-->>S: Gerçek adres
-    S-->>U: Gerçek adres
-    U->>I: Bağlantı doğrudan siteye
-```
+<p align="center">
+  <img src="docs/images/worker.svg" width="100%" alt="Adres sorguları şifreli HTTPS ile kendi Worker'ına gider; sayfa trafiği ise Worker'a uğramadan doğrudan siteye gider.">
+</p>
 
-- **Sağlayıcı DNS'i kurcalayamaz.** Onun gördüğü, senin `workers.dev` adresine yapılan sıradan bir HTTPS bağlantısıdır.
-- **Trafiğin oradan geçmez.** Sayfalar, videolar, mesajlar doğrudan senin bilgisayarından siteye gider. Worker yalnızca adres sorar.
-- **Senin.** Ortak bir sunucu yok. Worker rastgele bir gizli anahtarla korunur, başkası kullanamaz.
-- **Ücretsiz.** Cloudflare'in ücretsiz planı normal kullanım için fazlasıyla yeter.
-- **Kurulumu otomatik.** İlk açılışta tarayıcıda Cloudflare'e giriş yapıp izin vermen yeterli. Gerekirse **Bağlantı** sayfasından yeniden kurabilirsin.
+- **Sağlayıcı DNS'e karışamaz.** Gördüğü şey, kendi `workers.dev` adresine yapılan sıradan bir HTTPS bağlantısıdır.
+- **Trafiğin oradan geçmez.** Sayfalar, videolar ve mesajlar doğrudan bilgisayarından siteye gider.
+- **Hesap senin.** Ortak bir sunucu yoktur. Worker rastgele bir gizli anahtarla korunur, başkası kullanamaz.
+- **Ücretsiz.** Cloudflare'in ücretsiz planı normal kullanım için yeterlidir.
 
-Worker istemiyorsan tray menüsünden **DNS: Sistem** seç. Siteler yine parçalama ile açılır, ama DNS'i engellenen siteler açılmayabilir.
+Worker kurmak istemezsen tray menüsünden **DNS: Sistem** seçebilirsin. Siteler yine parçalama ile açılır, ancak DNS ile engellenen siteler açılmayabilir.
 
 ## Kurulum
 
-1. [Sürümler sayfasından](https://github.com/icguner/SplitHello/releases/latest) `SplitHello-Setup-…exe` dosyasını indir ve çalıştır. Yönetici izni yalnızca burada, bir kez istenir.
-2. İlk açılışta bir pencere açılır: tarayıcıda Cloudflare'e giriş yap ve **izin ver**. Bunun için bilgisayarında [Node.js](https://nodejs.org) kurulu olmalı. Ücretsiz bir Cloudflare hesabı yoksa açılan sayfadan oluşturabilirsin.
-3. Hepsi bu. Saatin yanındaki SplitHello simgesi koruma durumunu gösterir. Çift tıklayınca panel açılır.
+1. [Sürümler sayfasından](https://github.com/icguner/SplitHello/releases/latest) `SplitHello-Setup-…exe` dosyasını indir ve çalıştır. Yönetici izni yalnızca bu adımda istenir.
+2. İlk açılışta bir pencere açılır. Tarayıcıda Cloudflare hesabına giriş yap ve izin ver. Bu adım için [Node.js](https://nodejs.org) kurulu olmalıdır; Cloudflare hesabın yoksa açılan sayfadan ücretsiz oluşturabilirsin.
+3. Kurulum bitti. Saatin yanındaki simge koruma durumunu gösterir, çift tıklayınca panel açılır.
 
-> Windows SmartScreen "tanınmayan uygulama" diyebilir, çünkü sürüm henüz imzalı değil. **Ek bilgi → Yine de çalıştır** ile devam edebilirsin. Kaynak kod bu repoda açık.
+Windows SmartScreen uyarı verirse **Ek bilgi → Yine de çalıştır** ile devam edebilirsin. Sürümler henüz imzalı değildir; kaynak kodun tamamı bu depodadır.
 
 ## Koruma özellikleri
 
-Paneldeki **Koruma** sayfasından açıp kapatırsın:
+Paneldeki **Koruma** sayfasından açılıp kapatılır.
 
-| Özellik | Ne engeller? |
+| Özellik | Engellenenler |
 |---|---|
-| 🚫 Reklam engelleme | Banner, video ve açılır pencere reklamları. Hafif / Normal / Pro / Pro++ seviyeleri var. |
-| 👁️ İzleyici koruması | Windows ve Office telemetrisi, web izleyicileri |
-| 💬 Rahatsız edici öğeler | Açılır pencere reklam ağları |
-| ☁️ DNS koruması | Tüm adres sorguları şifreli, kendi Worker'ın üzerinden |
-| 🌐 Gezinme güvenliği | Virüs, dolandırıcılık ve sahte alışveriş siteleri |
-| 👨‍👩‍👧 Ebeveyn denetimi | Kumar ve yetişkin içerik (varsayılan kapalı) |
+| Reklam engelleme | Banner, video ve açılır pencere reklamları. Hafif, Normal, Pro ve Pro++ seviyeleri vardır. |
+| İzleyici koruması | Windows ve Office telemetrisi, web izleyicileri |
+| Rahatsız edici öğeler | Açılır pencere reklam ağları |
+| DNS koruması | Bütün adres sorguları kendi Worker'ın üzerinden, şifreli |
+| Gezinme güvenliği | Zararlı yazılım, dolandırıcılık ve sahte alışveriş siteleri |
+| Ebeveyn denetimi | Kumar ve yetişkin içerik (varsayılan olarak kapalı) |
 
-Listeler [HaGeZi](https://github.com/hagezi/dns-blocklists) projesinden gelir ve günde en fazla bir kez güncellenir. Yanlışlıkla engellenen bir siteyi panelde ya da tray menüsünde **Serbest bırak** ile tek tıkla açabilirsin.
+Listeler [HaGeZi](https://github.com/hagezi/dns-blocklists) projesinden alınır ve günde en fazla bir kez güncellenir. Yanlışlıkla engellenen bir site panelden veya tray menüsünden **Serbest bırak** ile açılabilir.
 
 ## Performans
 
-| | Değer |
+| Ölçüm | Değer |
 |---|---|
-| Bellek | ~27 MB (bütün listeler açıkken 40 MB'ın altında) |
-| Bağlantı kurulurken eklenen süre | ~60 ms (normal site) |
-| Engelli siteyi ilk kez çözmek | Birkaç saniye, sadece bir kez |
-| Önceki (C++) sürüme göre | Yarı bellek, beşte bir thread |
+| Bellek | Yaklaşık 27 MB; bütün listeler açıkken 40 MB'ın altında |
+| Bağlantı kurulurken eklenen süre | Normal sitelerde genellikle 60 ms civarı |
+| Engelli bir siteyi ilk kez çözmek | Birkaç saniye, yalnızca bir kez |
+| Önceki sürüme göre | Yarı bellek, beşte bir iş parçacığı |
 
 ## Sık sorulan sorular
 
-**VPN mi bu?**
-Hayır. Trafiğin başka bir ülkeye ya da sunucuya gitmez, IP adresin değişmez. Sadece bağlantının engellenen kısmı değiştirilir.
+**VPN mi?**
+Hayır. Trafiğin başka bir ülkeye veya sunucuya gitmez, IP adresin değişmez. Yalnızca bağlantının engellenen kısmı değiştirilir.
 
-**Oyunları ya da Discord sesini etkiler mi?**
-Hayır. Yalnızca HTTPS (443) trafiğine bakılır; oyun ve ses trafiği hiç dokunulmadan geçer.
+**Oyunları veya sesli sohbeti etkiler mi?**
+Hayır. Yalnızca HTTPS (443) trafiğine bakılır; oyun ve ses trafiği olduğu gibi geçer.
 
 **Her engeli aşar mı?**
-DNS ve site adı (SNI) tabanlı engellerin büyük çoğunluğunu aşar. Türkiye'de en yaygın yöntemler bunlar. Doğrudan IP adresi engellenmişse **Bağlantı → Tünel yedeği** açılabilir; o zaman yalnızca açılamayan bağlantılar Worker üzerinden geçer.
+Türkiye'de en yaygın olan DNS ve site adı (SNI) tabanlı engellerin büyük çoğunluğunu aşar. Bir sitenin IP adresi doğrudan engellenmişse **Bağlantı → Tünel yedeği** açılabilir; bu durumda yalnızca açılamayan bağlantılar Worker üzerinden geçer.
 
 **Güvenli mi?**
-Kaynak kodu açık. Hiçbir veri dışarı gönderilmez; istatistikler yalnızca senin bilgisayarında tutulur. Worker'ın gizli anahtarı Windows'un şifrelemesiyle saklanır. SplitHello bir sorunla durursa trafik normal yoluna döner, internetin kesilmez.
+Kaynak kodu açıktır. Hiçbir veri dışarı gönderilmez; istatistikler yalnızca kendi bilgisayarında tutulur. Worker'ın gizli anahtarı Windows'un şifreleme altyapısıyla saklanır. SplitHello bir hata nedeniyle durursa trafik normal yoluna döner, internet kesilmez.
 
 **Çerez uyarılarını da kapatır mı?**
-Hayır. Onlar sayfanın kendi içindedir; bunun için bir tarayıcı eklentisi gerekir.
+Hayır. Çerez uyarıları sayfanın içindedir; bunlar için bir tarayıcı eklentisi gerekir.
 
-**Nasıl kaldırırım?**
-Windows Ayarlar → Uygulamalar → SplitHello → Kaldır. Ayarlarını da silmek isteyip istemediğin sorulur.
+**Nasıl kaldırılır?**
+Ayarlar → Uygulamalar → SplitHello → Kaldır. Ayarların silinip silinmeyeceği ayrıca sorulur.
 
 ## Geliştiriciler için
 
-Teknik ayrıntılar (mimari, ölçümler, komut satırı seçenekleri, derleme) [İngilizce README](README.en.md)'de. Kısaca:
+Mimari, ölçüm ayrıntıları, komut satırı seçenekleri ve derleme adımları [İngilizce README](README.en.md)'de yer alır.
 
 ```
 cargo build --release
@@ -141,4 +125,4 @@ installer\build.ps1
 
 ## Lisans
 
-MIT. WinDivert kendi lisansıyla (LGPLv3/GPLv2) gelir. HaGeZi listeleri (GPL-3.0) çalışırken indirilir, pakette yer almaz.
+MIT. WinDivert kendi lisansıyla (LGPLv3/GPLv2) dağıtılır. HaGeZi listeleri (GPL-3.0) çalışma sırasında indirilir, paketin içinde yer almaz.

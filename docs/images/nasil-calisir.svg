@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="300" viewBox="0 0 880 300" font-family="Segoe UI, -apple-system, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#8c959f"/>
+    </marker>
+  </defs>
+  <rect x="0.5" y="0.5" width="879" height="299" rx="16" fill="#f6f8fa" stroke="#d0d7de"/>
+
+  <!-- application -->
+  <rect x="30" y="115" width="150" height="70" rx="12" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="105" y="146" text-anchor="middle" font-size="16" font-weight="600" fill="#1f2328">Uygulama</text>
+  <text x="105" y="167" text-anchor="middle" font-size="12" fill="#57606a">tarayıcı, Discord, oyun</text>
+
+  <line x1="180" y1="150" x2="234" y2="150" stroke="#8c959f" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- SplitHello -->
+  <rect x="240" y="100" width="180" height="100" rx="12" fill="#1f6feb"/>
+  <text x="330" y="140" text-anchor="middle" font-size="18" font-weight="700" fill="#ffffff">SplitHello</text>
+  <text x="330" y="162" text-anchor="middle" font-size="12" fill="#dbe9ff">site adına bakar,</text>
+  <text x="330" y="179" text-anchor="middle" font-size="12" fill="#dbe9ff">kararını hatırlar</text>
+
+  <!-- branches -->
+  <path d="M420 150 C 450 150, 450 70, 474 70" fill="none" stroke="#8c959f" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="420" y1="150" x2="474" y2="150" stroke="#8c959f" stroke-width="2" marker-end="url(#arrow)"/>
+  <path d="M420 150 C 450 150, 450 230, 474 230" fill="none" stroke="#8c959f" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- outcome: normal -->
+  <rect x="480" y="42" width="240" height="56" rx="10" fill="#ffffff" stroke="#d0d7de"/>
+  <rect x="480" y="42" width="6" height="56" rx="3" fill="#8c959f"/>
+  <text x="498" y="66" font-size="14" font-weight="600" fill="#1f2328">Normal site</text>
+  <text x="498" y="85" font-size="12" fill="#57606a">Olduğu gibi gönderilir</text>
+
+  <!-- outcome: blocked site -->
+  <rect x="480" y="122" width="240" height="56" rx="10" fill="#ffffff" stroke="#d0d7de"/>
+  <rect x="480" y="122" width="6" height="56" rx="3" fill="#1f6feb"/>
+  <text x="498" y="146" font-size="14" font-weight="600" fill="#1f2328">Erişimi engellenmiş site</text>
+  <text x="498" y="165" font-size="12" fill="#57606a">Site adı parçalanır, DPI okuyamaz</text>
+
+  <!-- outcome: ad or threat -->
+  <rect x="480" y="202" width="240" height="56" rx="10" fill="#ffffff" stroke="#d0d7de"/>
+  <rect x="480" y="202" width="6" height="56" rx="3" fill="#cf222e"/>
+  <text x="498" y="226" font-size="14" font-weight="600" fill="#1f2328">Reklam veya zararlı site</text>
+  <text x="498" y="245" font-size="12" fill="#57606a">Bağlantı hiç kurulmaz</text>
+
+  <!-- destination -->
+  <path d="M720 70 C 748 70, 748 132, 764 134" fill="none" stroke="#8c959f" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="720" y1="150" x2="764" y2="150" stroke="#8c959f" stroke-width="2" marker-end="url(#arrow)"/>
+  <rect x="770" y="115" width="80" height="70" rx="12" fill="#ffffff" stroke="#d0d7de"/>
+  <text x="810" y="155" text-anchor="middle" font-size="16" font-weight="600" fill="#1f2328">Site</text>
+</svg>
