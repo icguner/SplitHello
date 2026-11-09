@@ -402,6 +402,10 @@ StartupResult setStartupEnabled(bool enabled, std::stop_token stop) {
 
 } // namespace
 
+int enableStartupTask() {
+    return setStartupEnabled(true, std::stop_token{}) == StartupResult::Ok ? 0 : 1;
+}
+
 TrayApp::TrayApp(std::vector<std::wstring> engineArguments,
                  std::wstring logDirectory,
                  std::string telemetryPath,

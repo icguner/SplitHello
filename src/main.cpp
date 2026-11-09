@@ -81,7 +81,8 @@ void printUsage(const char* exe) {
         << "  --include-process <desen>  Yalniz eslesen exe yollarini isle (tekrarlanabilir)\n"
         << "  --exclude-process <desen>  Eslesen exe yollarini atla (tekrarlanabilir)\n"
         << "  --restore-proxy      Cokme sonrasi kalan proxy yedegini geri yukle ve cik\n"
-        << "  --forget-token       Eski surumden kalan API token alanini sil ve cik\n"
+        << "  --enable-startup     'Windows ile baslat' gorevini olustur ve cik\n"
+        << "  --forget-token     Eski surumden kalan API token alanini sil ve cik\n"
         << "  --forget-strategies  Ogrenilen alan adi stratejilerini sifirla ve cik\n"
         << "  --list-strategies    DPI uyarlama profillerini listele ve cik\n"
         << "  --console            Tray yerine konsolda calistir\n"
@@ -336,6 +337,7 @@ struct Options {
     quic_strategy::Mode quicMode = quic_strategy::Mode::Allow;
     bool tunnelFallback = false;
     bool restoreProxy = false;
+    bool enableStartup = false;
     bool forgetToken = false;
     bool forgetStrategies = false;
     bool listStrategies = false;
@@ -418,6 +420,8 @@ bool parseArgs(int argc, char* argv[], Options& options, int& exitCode) {
                 return false;
             }
             options.processExclude.push_back(argv[i]);
+        } else if (arg == "--enable-startup") {
+            options.enableStartup = true;
         } else if (arg == "--restore-proxy") {
             options.restoreProxy = true;
         } else if (arg == "--forget-token") {
@@ -491,7 +495,7 @@ bool canBind(int type, uint16_t port) {
 bool shouldRunTray(const Options& options) {
     return !options.engine && !options.console && !options.verbose &&
         !options.manualProxy && !options.setup && !options.redeploy &&
-        !options.restoreProxy && !options.forgetToken &&
+        !options.restoreProxy && !options.forgetToken && !options.enableStartup &&
         !options.forgetStrategies && !options.listStrategies;
 }
 
@@ -563,6 +567,8 @@ int main(int argc, char* argv[]) {
         printStrategies();
         return 0;
     }
+
+    if (options.enableStartup) return enableStartupTask();
 
     const bool exitsWithoutInterception = options.restoreProxy || options.forgetToken ||
         options.forgetStrategies || options.redeploy;

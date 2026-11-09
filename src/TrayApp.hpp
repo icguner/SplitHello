@@ -15,6 +15,9 @@
 
 class DashboardPanel;
 
+// Registers the "Windows ile başlat" task (installer use); 0 on success.
+int enableStartupTask();
+
 class TrayApp {
 public:
     enum class EngineState {
