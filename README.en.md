@@ -124,7 +124,7 @@ Latency (v1 telemetry over 25,703 connections, TLS decision only): normal sites 
 
 ## Install
 
-Download `SplitHello-Setup-<version>.exe` from the [releases page](https://github.com/icguner/SplitHello/releases) and run it (Windows 10/11 x64). It installs to `C:\Program Files\SplitHello` and registers the **SplitHello** service; this is the only time administrator rights are asked for. The tray then starts with Windows as your normal user and starts the service, without a UAC prompt.
+Download [SplitHello-Setup.exe](https://github.com/icguner/SplitHello/releases/latest/download/SplitHello-Setup.exe) (always the latest release; older ones are on the [releases page](https://github.com/icguner/SplitHello/releases)) and run it (Windows 10/11 x64). It installs to `C:\Program Files\SplitHello` and registers the **SplitHello** service; this is the only time administrator rights are asked for. The tray then starts with Windows as your normal user and starts the service, without a UAC prompt.
 
 On first start, if no Worker is configured, the tray opens the Cloudflare setup (needs Node.js 20+ and a free Cloudflare account): approve the login in the browser, and the engine starts when it finishes. To skip the Worker, choose **DNS: Sistem (Worker'sız)** in the tray menu.
 
@@ -208,7 +208,7 @@ installer\build.ps1                # dist\SplitHello-Setup-<version>.exe
 
 `splithello.exe` needs `WinDivert.dll` and `WinDivert64.sys` beside it. The installer script needs [Inno Setup 6](https://jrsoftware.org/isinfo.php) and fetches WinDivert itself if it is missing.
 
-The workspace is split by layer: `sh-proto` (TLS, DNS, QUIC parsing and packet builders), `sh-strategy` (profiles, diagnosis, learning store), `sh-flow` (flow registries), `sh-core` (config, logging, live stats), `sh-telemetry` (SQLite history), `sh-adblock`, `sh-net` (HTTP, Worker tunnel), `sh-dns`, `sh-relay`, `sh-divert` (WinDivert loop and process scope), `sh-engine` (composition, service), `sh-setup` (Cloudflare setup), `sh-ui` (tray, panel). Parsers are fuzzed with cargo-fuzz (`fuzz-rs/`); CI runs fmt, clippy, the tests and a short fuzz pass on every push.
+The workspace is split by layer: `sh-proto` (TLS, DNS, QUIC parsing and packet builders), `sh-strategy` (profiles, diagnosis, learning store), `sh-flow` (flow registries), `sh-core` (config, logging, live stats), `sh-telemetry` (SQLite history), `sh-adblock`, `sh-net` (HTTP, Worker tunnel), `sh-dns`, `sh-relay`, `sh-divert` (WinDivert loop and process scope), `sh-engine` (composition, service), `sh-setup` (Cloudflare setup), `sh-ui` (tray, panel). Parsers are fuzzed with cargo-fuzz (`fuzz/`); CI runs fmt, clippy, the tests and a short fuzz pass on every push.
 
 ## Not done yet
 

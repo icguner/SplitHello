@@ -10,7 +10,9 @@
 Türkiye'deki erişim engellerini kendiliğinden aşan, reklam ve izleyicileri engelleyen Windows uygulaması.
 VPN değildir; trafiğin başka bir sunucudan geçmez.
 
-[İndir](https://github.com/icguner/SplitHello/releases/latest) · [Nasıl çalışır](#nasıl-çalışır) · [Sık sorulanlar](#sık-sorulan-sorular) · [English](README.en.md)
+**[SplitHello'yu indir (Windows 10/11)](https://github.com/icguner/SplitHello/releases/latest/download/SplitHello-Setup.exe)**
+
+[Tüm sürümler](https://github.com/icguner/SplitHello/releases) · [Nasıl çalışır](#nasıl-çalışır) · [Sık sorulanlar](#sık-sorulan-sorular) · [English](README.en.md)
 
 </div>
 
@@ -66,7 +68,7 @@ Worker kurmak istemezsen tray menüsünden **DNS: Sistem** seçebilirsin. Sitele
 
 ## Kurulum
 
-1. [Sürümler sayfasından](https://github.com/icguner/SplitHello/releases/latest) `SplitHello-Setup-…exe` dosyasını indir ve çalıştır. Yönetici izni yalnızca bu adımda istenir.
+1. [SplitHello-Setup.exe](https://github.com/icguner/SplitHello/releases/latest/download/SplitHello-Setup.exe) dosyasını indir ve çalıştır. Bağlantı her zaman en yeni sürümü indirir. Yönetici izni yalnızca bu adımda istenir.
 2. İlk açılışta bir pencere açılır. Tarayıcıda Cloudflare hesabına giriş yap ve izin ver. Bu adım için [Node.js](https://nodejs.org) kurulu olmalıdır; Cloudflare hesabın yoksa açılan sayfadan ücretsiz oluşturabilirsin.
 3. Kurulum bitti. Saatin yanındaki simge koruma durumunu gösterir, çift tıklayınca panel açılır.
 

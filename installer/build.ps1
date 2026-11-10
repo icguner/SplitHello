@@ -1,7 +1,8 @@
 # Builds dist\SplitHello-Setup-<version>.exe from an already built splithello.exe.
 # Needs Inno Setup 6 (winget install JRSoftware.InnoSetup).
 param(
-    [string]$Version = '2.0.0',
+    # Defaults to the workspace version in Cargo.toml.
+    [string]$Version = (Select-String -Path (Join-Path $PSScriptRoot '..\Cargo.toml') -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value,
     [string]$BuildDir = (Join-Path $PSScriptRoot '..\target\release')
 )
 $ErrorActionPreference = 'Stop'

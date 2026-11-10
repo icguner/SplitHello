@@ -1,6 +1,6 @@
 //! Pure wire-format logic: no sockets, no Windows API, no allocation on the
 //! read paths beyond what a result needs. Every parser is bounds-checked and is
-//! a fuzz target (see `fuzz-rs/`).
+//! a fuzz target (see `fuzz/`).
 #![forbid(unsafe_code)]
 
 pub mod dns;

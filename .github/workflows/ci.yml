@@ -47,10 +47,9 @@ jobs:
           cargo +nightly install cargo-fuzz --locked
 
       - name: Run each target for 20 seconds
-        working-directory: fuzz-rs
         run: |
-          cargo +nightly fuzz run fuzz_tls -- -dict=tls.dict -max_total_time=20 -timeout=2 -max_len=65536
-          cargo +nightly fuzz run fuzz_dns -- -dict=dns.dict -max_total_time=20 -timeout=2 -max_len=65536
+          cargo +nightly fuzz run fuzz_tls -- -dict=fuzz/tls.dict -max_total_time=20 -timeout=2 -max_len=65536
+          cargo +nightly fuzz run fuzz_dns -- -dict=fuzz/dns.dict -max_total_time=20 -timeout=2 -max_len=65536
           cargo +nightly fuzz run fuzz_adblock -- -max_total_time=20 -timeout=2 -max_len=65536
 
       - name: Upload crashing inputs
@@ -60,7 +59,7 @@ jobs:
           name: rust-fuzz-crashes
           if-no-files-found: ignore
           retention-days: 14
-          path: fuzz-rs/artifacts/
+          path: fuzz/artifacts/
 
   windows-release:
     name: Windows release build

@@ -2992,11 +2992,11 @@ dependencies = [
 
 [[package]]
 name = "sh-adblock"
-version = "2.0.0"
+version = "2.0.1"
 
 [[package]]
 name = "sh-core"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "base64",
  "chrono",
@@ -3008,7 +3008,7 @@ dependencies = [
 
 [[package]]
 name = "sh-divert"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "sh-core",
  "sh-flow",
@@ -3019,7 +3019,7 @@ dependencies = [
 
 [[package]]
 name = "sh-dns"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "serde_json",
  "sh-adblock",
@@ -3034,7 +3034,7 @@ dependencies = [
 
 [[package]]
 name = "sh-engine"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "sh-adblock",
  "sh-core",
@@ -3053,14 +3053,14 @@ dependencies = [
 
 [[package]]
 name = "sh-flow"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "sh-proto",
 ]
 
 [[package]]
 name = "sh-net"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "futures-util",
  "reqwest",
@@ -3075,11 +3075,11 @@ dependencies = [
 
 [[package]]
 name = "sh-proto"
-version = "2.0.0"
+version = "2.0.1"
 
 [[package]]
 name = "sh-relay"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "sh-adblock",
  "sh-core",
@@ -3096,7 +3096,7 @@ dependencies = [
 
 [[package]]
 name = "sh-setup"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "serde_json",
  "sh-core",
@@ -3108,7 +3108,7 @@ dependencies = [
 
 [[package]]
 name = "sh-strategy"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "sh-core",
  "sh-proto",
@@ -3117,7 +3117,7 @@ dependencies = [
 
 [[package]]
 name = "sh-telemetry"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "rusqlite",
  "sh-strategy",
@@ -3126,7 +3126,7 @@ dependencies = [
 
 [[package]]
 name = "sh-ui"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "eframe",
  "sh-core",
@@ -3318,7 +3318,7 @@ dependencies = [
 
 [[package]]
 name = "splithello"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "embed-resource",
  "sh-engine",

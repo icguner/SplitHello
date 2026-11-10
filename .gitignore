@@ -3,6 +3,6 @@ node_modules/
 dist/
 installer/gen/
 /target/
-fuzz-rs/target/
-fuzz-rs/corpus/
-fuzz-rs/artifacts/
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
