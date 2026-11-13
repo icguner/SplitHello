@@ -238,6 +238,43 @@ pub fn parse_client_hello(data: &[u8], out: &mut ClientHello) -> ParseStatus {
     parse_extensions(data, r.pos, body_end, out)
 }
 
+/// The hostname of a ClientHello of which `data` holds only the first bytes
+/// (a long hello continues in later packets, so `parse_client_hello` would
+/// answer `NeedMore`). The result has no hostname when the name, or anything
+/// needed to reach it, lies beyond `data`.
+pub fn client_hello_prefix(data: &[u8]) -> ClientHello {
+    let mut out = ClientHello::default();
+    if data.len() < RECORD_HEADER_SIZE + 4
+        || data[0] != RECORD_HANDSHAKE
+        || data[RECORD_HEADER_SIZE] != HANDSHAKE_CLIENT_HELLO
+    {
+        return out;
+    }
+    // Declared lengths may run past the packet; every read is bounded by it.
+    let mut r = Reader::new(data, RECORD_HEADER_SIZE + 4, data.len());
+    let _ = (|| {
+        r.skip(2 + 32)?; // client_version, random
+        let session_id = r.u8()? as usize;
+        r.skip(session_id)?;
+        let suites = r.u16()? as usize;
+        r.skip(suites)?;
+        let compression = r.u8()? as usize;
+        r.skip(compression)?;
+        r.u16()?; // extensions length
+        loop {
+            let (ext_type, ext_length) = (r.u16()?, r.u16()? as usize);
+            if ext_type == EXT_SERVER_NAME {
+                if ext_length > r.remaining() {
+                    return None;
+                }
+                return read_server_name(data, r.pos, r.pos + ext_length, &mut out);
+            }
+            r.skip(ext_length)?;
+        }
+    })();
+    out
+}
+
 /// Inspects complete TLS records from the start of `data`. Compatibility
 /// ChangeCipherSpec records are skipped; only a complete ServerHello is success.
 pub fn classify_server_response(data: &[u8]) -> ServerResponseStatus {
@@ -298,6 +335,34 @@ mod tests {
         let mut hello = ClientHello::default();
         let status = parse_client_hello(data, &mut hello);
         (status, hello)
+    }
+
+    #[test]
+    fn prefix_finds_the_hostname_exactly_when_it_is_inside_the_packet() {
+        let data = build_client_hello(&HelloOptions {
+            padding_bytes: 1500,
+            ..HelloOptions::default()
+        });
+        let (_, full) = parse(&data);
+        let name_end = full.sni_offset + full.sni_length;
+        for cut in 0..=data.len() {
+            let prefix = client_hello_prefix(&data[..cut]);
+            if cut >= name_end {
+                assert_eq!(prefix.server_name, "discord.com", "cut {cut}");
+                assert_eq!(
+                    (prefix.sni_offset, prefix.sni_length),
+                    (full.sni_offset, full.sni_length)
+                );
+            } else {
+                assert!(!prefix.has_sni(), "cut {cut}");
+            }
+        }
+        assert!(!client_hello_prefix(&[0x17, 3, 3, 0, 1, 1, 0]).has_sni());
+        let no_name = build_client_hello(&HelloOptions {
+            with_sni: false,
+            ..HelloOptions::default()
+        });
+        assert!(!client_hello_prefix(&no_name).has_sni());
     }
 
     #[test]

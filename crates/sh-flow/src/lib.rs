@@ -1,4 +1,4 @@
-//! Flow bookkeeping shared by the WinDivert packet loop and the relay.
+//! Bookkeeping for the WinDivert packet loop and the DNS proxy.
 //!
 //! Every method takes the current monotonic time in milliseconds (`now_ms`) so
 //! the expiry rules are deterministic in tests; production callers pass
@@ -12,6 +12,6 @@ mod registry;
 mod route;
 
 pub use address::PeerAddr;
-pub use policy::PolicyRegistry;
-pub use registry::{DatagramRegistry, FlowKind, FlowRegistry, Target, TcpFlowTable};
-pub use route::{DatagramRoute, PacketRoute, route_datagram, route_packet};
+pub use policy::HopRegistry;
+pub use registry::DatagramRegistry;
+pub use route::{DatagramRoute, route_datagram};

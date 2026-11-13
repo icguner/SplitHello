@@ -232,6 +232,8 @@ pub fn init(verbose: bool, log_file: Option<&Path>) {
         .with(console)
         .with(file_layer);
     let _ = tracing::subscriber::set_global_default(subscriber);
+    // The service has no stderr: without this a panic leaves no trace at all.
+    std::panic::set_hook(Box::new(|info| tracing::error!("panic: {info}")));
 }
 
 #[cfg(test)]

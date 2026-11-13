@@ -7,9 +7,11 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+sh-adblock = { path = "../sh-adblock" }
 sh-core = { path = "../sh-core" }
 sh-flow = { path = "../sh-flow" }
 sh-proto = { path = "../sh-proto" }
+sh-strategy = { path = "../sh-strategy" }
 tracing = "0.1"
 
 [target.'cfg(windows)'.dependencies.windows]

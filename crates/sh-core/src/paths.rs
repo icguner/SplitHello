@@ -44,6 +44,5 @@ pub fn in_config_dir(name: &str) -> Option<PathBuf> {
 
 pub const CONFIG_FILE: &str = "config.json";
 pub const STRATEGY_FILE: &str = "strategies.json";
-pub const TELEMETRY_FILE: &str = "telemetry.db";
 pub const LOG_FILE: &str = "splithello.log";
 pub const PROXY_BACKUP_FILE: &str = "proxy-backup.json";

@@ -203,6 +203,22 @@ impl Blocklist {
         }
     }
 
+    /// True when host or a parent domain is on the allow list.
+    pub fn allows(&self, host: &str) -> bool {
+        let sets = self.snapshot();
+        let name = lower_host(host);
+        let mut part = name.as_str();
+        loop {
+            if sets.allowed.contains(part) {
+                return true;
+            }
+            match part.find('.') {
+                Some(dot) => part = &part[dot + 1..],
+                None => return false,
+            }
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.snapshot().blocked.len()
     }
@@ -212,7 +228,7 @@ impl Blocklist {
     }
 }
 
-/// Process-wide list shared by the relay and the DNS proxy.
+/// Process-wide list shared by the packet loop and the DNS proxy.
 pub fn global() -> &'static Blocklist {
     static LIST: OnceLock<Blocklist> = OnceLock::new();
     LIST.get_or_init(Blocklist::default)

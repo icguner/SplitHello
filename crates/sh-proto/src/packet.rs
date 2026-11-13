@@ -52,20 +52,26 @@ pub struct Segment {
     pub payload: Vec<u8>,
 }
 
-pub fn is_packet_profile(profile: &str) -> bool {
-    profile.starts_with("packet-")
+/// Profile names as the command line and the configuration spell them.
+pub const PROFILES: [(&str, Mode); 6] = [
+    ("packet-autottl", Mode::FakeAutoTtl),
+    ("packet-seqovl", Mode::SequenceOverlap),
+    ("packet-reverse", Mode::ReverseOrder),
+    ("packet-ipfrag", Mode::IpFragment),
+    ("packet-fake-badseq", Mode::FakeBadSequence),
+    ("packet-fake-badsum", Mode::FakeBadChecksum),
+];
+pub const DEFAULT_PROFILE: &str = "packet-autottl";
+
+pub fn mode_for_profile(profile: &str) -> Option<Mode> {
+    PROFILES
+        .iter()
+        .find(|(name, _)| *name == profile)
+        .map(|(_, mode)| *mode)
 }
 
-pub fn policy_for_profile(profile: &str, hello: &ClientHello) -> Option<Policy> {
-    let mode = match profile {
-        "packet-reverse" => Mode::ReverseOrder,
-        "packet-fake-badseq" => Mode::FakeBadSequence,
-        "packet-fake-badsum" => Mode::FakeBadChecksum,
-        "packet-autottl" => Mode::FakeAutoTtl,
-        "packet-seqovl" => Mode::SequenceOverlap,
-        "packet-ipfrag" => Mode::IpFragment,
-        _ => return None,
-    };
+/// The cuts for `mode` on this ClientHello (which may be only its first packet).
+pub fn policy_for(mode: Mode, hello: &ClientHello) -> Policy {
     let preferred_split = if hello.has_sni() {
         hello.sni_offset + hello.sni_length / 2
     } else {
@@ -82,7 +88,7 @@ pub fn policy_for_profile(profile: &str, hello: &ClientHello) -> Option<Policy> 
         policy.sni_begin = hello.sni_offset;
         policy.sni_end = hello.sni_offset + hello.sni_length;
     }
-    Some(policy)
+    policy
 }
 
 /// A minimal TLS 1.3 ClientHello for `hostname` (the decoy in fake profiles).
@@ -329,7 +335,9 @@ mod tests {
         let mut hello = ClientHello::default();
         assert_eq!(parse_client_hello(&data, &mut hello), ParseStatus::Ok);
 
-        let policy = policy_for_profile("packet-reverse", &hello).expect("packet profile");
+        let mode = mode_for_profile("packet-reverse").expect("packet profile");
+        let policy = policy_for(mode, &hello);
+        assert_eq!(policy.mode, Mode::ReverseOrder);
         assert_eq!(policy.sni_begin, hello.sni_offset);
         assert_eq!(policy.sni_end, hello.sni_offset + hello.sni_length);
         assert!(splits_sni(&policy, policy.split_offset));
@@ -343,7 +351,8 @@ mod tests {
         ));
 
         assert!(splits_sni(&Policy::default(), 1));
-        assert!(policy_for_profile("sni-mid", &hello).is_none());
+        assert!(mode_for_profile("sni-mid").is_none());
+        assert_eq!(mode_for_profile(DEFAULT_PROFILE), Some(Mode::FakeAutoTtl));
     }
 
     #[test]

@@ -154,8 +154,9 @@ impl HttpClient {
         let mut response = match builder.send().await {
             Ok(response) => response,
             Err(error) => {
-                tracing::debug!(
-                    "HTTPS {} {} basarisiz: {error}",
+                // The reason is the only clue to an outage after the fact.
+                tracing::warn!(
+                    "HTTPS {} {} basarisiz: {error:?}",
                     request.host,
                     request.path.split('?').next().unwrap_or("")
                 );

@@ -1,24 +1,25 @@
 //! The packet loop (port of `WinDivertInterceptor`, `src/WinDivertInterceptor.cpp`).
 //!
-//! TCP/443 is reflected into the relay, UDP/53 into the DNS proxy, and the
-//! relay's private connect port is mapped back to TCP/443. Only tuples whose
-//! SYN passed through here are rewritten, so engine (re)starts leave existing
-//! connections alone. `Processor` holds all per-packet logic and is driven by
-//! tests without the driver; `Interceptor` owns the handles and the thread.
+//! Connections stay between the application and the server: of TCP/443 the
+//! driver hands over only the packet that starts a TLS ClientHello, which is
+//! re-injected transformed (a decoy first, or cut inside the hostname), and
+//! the SYN-ACK, whose TTL gives the path length. UDP/53 is reflected into the
+//! DNS proxy. Nothing else is captured, so a dead engine cannot hold traffic.
+//! `Processor` holds all per-packet logic and is driven by tests without the
+//! driver; `Interceptor` owns the handles and the thread.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use sh_core::clock::now_ms;
 use sh_core::recovery;
 use sh_flow::quic::{AdaptiveRegistry, Decision};
-use sh_flow::{
-    DatagramRegistry, DatagramRoute, FlowKind, FlowRegistry, PacketRoute, PolicyRegistry,
-    TcpFlowTable, route_datagram, route_packet,
-};
+use sh_flow::{DatagramRegistry, DatagramRoute, HopRegistry, route_datagram};
 use sh_proto::packet::{self as strategy, Mode};
+use sh_proto::tls::ClientHello;
+use sh_strategy::Learner;
 
 use crate::ffi::{self, Address, Divert};
 use crate::packet::{self, MTU_MAX, Parsed, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN, Transport};
@@ -46,24 +47,29 @@ pub enum QuicMode {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Settings {
-    pub proxy_port: u16,
+    /// A profile applied to every ClientHello; None: learn per site.
+    pub forced: Option<Mode>,
     pub dns_proxy_port: u16,
-    pub connect_port: u16,
     pub quic_mode: QuicMode,
+    /// Worker DNS: every query is reflected into the DNS proxy.
     pub capture_dns: bool,
+    /// System DNS with protection lists: queries are read on their way to
+    /// the system's resolver and only listed names are answered here.
+    pub filter_dns: bool,
+}
+
+const CLIENT_HELLO: u8 = 0x01;
+const SERVER_HELLO: u8 = 0x02;
+
+/// The first bytes of a TLS record that starts this handshake message.
+fn starts_handshake(payload: &[u8], message: u8) -> bool {
+    payload.len() > 5 && payload[0] == 0x16 && payload[5] == message
 }
 
 impl Settings {
     fn valid(&self) -> bool {
-        let (p, d, c) = (self.proxy_port, self.dns_proxy_port, self.connect_port);
-        p != 0
-            && d != 0
-            && c != 0
-            && p != c
-            && p != d
-            && d != c
-            && ![p, d, c].contains(&HTTPS_PORT)
-            && d != DNS_PORT
+        let d = self.dns_proxy_port;
+        self.forced != Some(Mode::None) && d != 0 && d != HTTPS_PORT && d != DNS_PORT
     }
 
     fn process_aware_quic_block(&self, filter: Option<&Filter>) -> bool {
@@ -83,24 +89,29 @@ impl Settings {
                 " or (udp and outbound and (udp.DstPort == {DNS_PORT} or udp.SrcPort == {}))",
                 self.dns_proxy_port
             )
+        } else if self.filter_dns {
+            format!(" or (udp and outbound and udp.DstPort == {DNS_PORT})")
         } else {
             String::new()
         };
+        // Keep in step with `starts_handshake` and `observe_server`.
         format!(
-            "!loopback and ((tcp and ((outbound and (tcp.DstPort == {HTTPS_PORT} or \
-             tcp.DstPort == {} or tcp.SrcPort == {})) or \
-             (inbound and tcp.SrcPort == {HTTPS_PORT}))){dns}{quic})",
-            self.connect_port, self.proxy_port
+            "!loopback and ((tcp and ((outbound and tcp.DstPort == {HTTPS_PORT} and \
+             tcp.PayloadLength > 5 and tcp.Payload[0] == 0x16 and tcp.Payload[5] == 0x01) or \
+             (inbound and tcp.SrcPort == {HTTPS_PORT} and (tcp.Syn or tcp.Rst or tcp.Fin or \
+             (tcp.PayloadLength > 5 and tcp.Payload[0] == 0x16 and tcp.Payload[5] == 0x02))))){dns}{quic})"
         )
     }
 }
 
-/// Shared state the relay, DNS proxy and packet loop all see.
+/// Shared state the DNS proxy and the packet loop both see.
 #[derive(Clone)]
 pub struct Registries {
-    pub flows: Arc<FlowRegistry>,
     pub datagrams: Arc<DatagramRegistry>,
-    pub policies: Arc<PolicyRegistry>,
+    pub hops: Arc<HopRegistry>,
+    pub learner: Arc<Learner>,
+    /// The current network's id: sites are learned per network.
+    pub network: Arc<dyn Fn() -> String + Send + Sync>,
     pub process_filter: Option<Arc<Filter>>,
 }
 
@@ -157,8 +168,10 @@ pub struct Processor {
     settings: Settings,
     registries: Registries,
     quic: AdaptiveRegistry,
-    // Tuples whose SYN this engine rewrote; only these keep being rewritten.
-    tcp_flows: TcpFlowTable,
+    /// Worker down: queries go on to the system's resolver, as in system DNS.
+    dns_bypass: AtomicBool,
+    hellos: AtomicU64,
+    transformed: AtomicU64,
 }
 
 impl Processor {
@@ -166,9 +179,19 @@ impl Processor {
         Self {
             settings,
             registries,
+            dns_bypass: AtomicBool::new(false),
             quic: AdaptiveRegistry::default(),
-            tcp_flows: TcpFlowTable::default(),
+            hellos: AtomicU64::new(0),
+            transformed: AtomicU64::new(0),
         }
+    }
+
+    /// (ClientHellos seen, ClientHellos really transformed) since start.
+    pub fn hello_counts(&self) -> (u64, u64) {
+        (
+            self.hellos.load(Ordering::Relaxed),
+            self.transformed.load(Ordering::Relaxed),
+        )
     }
 
     fn filter(&self) -> Option<&Filter> {
@@ -218,139 +241,118 @@ impl Processor {
         out: &mut Batch,
         now: u64,
     ) {
-        let s = &self.settings;
-        let (sp, dp) = (
-            packet::source_port(data, p),
-            packet::destination_port(data, p),
-        );
-        let flags = packet::tcp_flags(data, p);
-        let (fin, rst) = (flags & TCP_FIN != 0, flags & TCP_RST != 0);
-        let syn = flags & TCP_SYN != 0 && flags & TCP_ACK == 0;
-        let outbound = address.outbound();
-        let route = route_packet(outbound, sp, dp, HTTPS_PORT, s.proxy_port, s.connect_port);
-        let source = packet::address(data, p, false);
-        let destination = packet::address(data, p, true);
-
-        // The port alone never decides: a packet is rewritten only when it
-        // belongs to a tuple whose SYN passed through here (and, for client
-        // flows, the process rules). Connections that predate the engine,
-        // processes a rule leaves alone and the relay's own server-side
-        // replies are forwarded untouched.
-        let owned = match route {
-            PacketRoute::ReflectClientToProxy => {
-                let filter = self.filter();
-                if syn {
-                    let bypass = filter.is_some_and(|f| {
-                        !f.should_intercept(&Self::endpoint(data, p, true), true, true, now)
-                    });
-                    if bypass {
-                        self.tcp_flows.remove(FlowKind::Client, destination, sp);
-                    } else {
-                        self.tcp_flows.add(FlowKind::Client, destination, sp, now);
-                    }
-                    !bypass
-                } else {
-                    let owned =
-                        self.tcp_flows
-                            .track(FlowKind::Client, destination, sp, fin, rst, now);
-                    if owned
-                        && rst
-                        && let Some(f) = filter
-                    {
-                        f.forget(&Self::endpoint(data, p, true));
-                    }
-                    owned
-                }
-            }
-            PacketRoute::ReflectProxyToClient => {
-                self.tcp_flows
-                    .track(FlowKind::Client, destination, dp, fin, rst, now)
-            }
-            PacketRoute::RedirectProxyToTarget => {
-                // shortcut: any local program dialing the private connect port
-                // is mapped to :443 (a high private port); upgrade to an
-                // owner-PID check on the SYN if that ever collides.
-                if syn {
-                    self.tcp_flows.add(FlowKind::Upstream, destination, sp, now);
-                } else {
-                    self.tcp_flows
-                        .track(FlowKind::Upstream, destination, sp, fin, rst, now);
-                }
-                true
-            }
-            PacketRoute::RedirectTargetToProxy => {
-                self.tcp_flows
-                    .track(FlowKind::Upstream, source, dp, fin, rst, now)
-            }
-            PacketRoute::Pass => false,
-        };
-
-        if !owned {
+        if !address.outbound() {
+            self.observe_server(data, p, now);
             out.push(data, address);
             return;
         }
-        match route {
-            PacketRoute::ReflectClientToProxy => {
-                if syn {
-                    self.registries
-                        .flows
-                        .observe(destination, sp, HTTPS_PORT, s.connect_port, now);
-                }
-                packet::set_destination_port(data, p, s.proxy_port);
-                packet::swap_addresses(data, p);
-                address.set_outbound(false);
-            }
-            PacketRoute::ReflectProxyToClient => {
-                packet::set_source_port(data, p, HTTPS_PORT);
-                packet::swap_addresses(data, p);
-                address.set_outbound(false);
-            }
-            PacketRoute::RedirectProxyToTarget => {
-                packet::set_destination_port(data, p, HTTPS_PORT);
-            }
-            PacketRoute::RedirectTargetToProxy => {
-                // Only the SYN-ACK carries a clean TTL sample of the path.
-                if flags & TCP_SYN != 0 && flags & TCP_ACK != 0 {
-                    self.registries
-                        .policies
-                        .observe_hop(source, dp, packet::ttl(data, p), now);
-                }
-                packet::set_source_port(data, p, s.connect_port);
-            }
-            PacketRoute::Pass => {}
+
+        // The filter already selects these; anything else is forwarded as it
+        // came, as are the processes a rule leaves alone.
+        let wanted = packet::destination_port(data, p) == HTTPS_PORT
+            && starts_handshake(&data[p.payload_offset..], CLIENT_HELLO)
+            && self.filter().is_none_or(|f| {
+                f.should_intercept(&Self::endpoint(data, p, true), true, true, now)
+            });
+        if !wanted {
+            out.push(data, address);
+            return;
         }
+        self.hellos.fetch_add(1, Ordering::Relaxed);
+        // A long hello spans packets and only its first is here: the hostname
+        // is known only when it sits in this one.
+        let hello = sh_proto::tls::client_hello_prefix(&data[p.payload_offset..]);
+        // shortcut: a name that sits in a later packet of a long hello is not
+        // seen here (the DNS proxy still refuses it in Worker DNS mode); hold
+        // the first packet for the second if that gap matters.
+        if hello.has_sni() && sh_adblock::global().blocks(&hello.server_name) {
+            sh_adblock::record_blocked(&hello.server_name);
+            tracing::debug!("Reklam/izleyici engellendi: {}", hello.server_name);
+            // Nothing reaches the ad host, and the application fails fast.
+            if let Some((to_server, to_client)) = packet::build_resets(data, p) {
+                address.set_checksums_valid();
+                out.push(&to_server, address);
+                address.set_outbound(false);
+                out.push(&to_client, address);
+            }
+            return;
+        }
+        let mode = self.settings.forced.unwrap_or_else(|| {
+            self.registries.learner.on_hello(
+                &(self.registries.network)(),
+                packet::address(data, p, true),
+                packet::source_port(data, p),
+                hello.has_sni().then_some(hello.server_name.as_str()),
+                now,
+            )
+        });
+        if mode == Mode::None {
+            out.push(data, address);
+            return;
+        }
+        // Variants are copies of this packet and are injected as they are (a
+        // deliberately wrong checksum included), so its own must be final.
         packet::fix_checksums(data, p);
         address.set_checksums_valid();
-
-        let payload = &data[p.payload_offset..];
-        let appended = route == PacketRoute::RedirectProxyToTarget
-            && payload.len() >= 2
-            && sh_proto::tls::looks_like_tls_record(payload)
-            && self.apply_strategy(data, p, address, destination, sp, out, now);
-        if !appended {
+        let (replaced, applied) = self.apply_strategy(data, p, address, mode, &hello, out, now);
+        if applied {
+            self.transformed.fetch_add(1, Ordering::Relaxed);
+        }
+        if !replaced {
             out.push(data, address);
         }
     }
 
-    /// Applies the armed packet profile to an outgoing ClientHello. Returns
-    /// true when the packet was replaced by its transformed form in `out`.
+    /// Inbound packets are only read: the SYN-ACK's TTL gives the path
+    /// length, and what follows a hello (a ServerHello, or a reset or close
+    /// before one) is the learner's verdict.
+    fn observe_server(&self, data: &[u8], p: &Parsed, now: u64) {
+        let flags = packet::tcp_flags(data, p);
+        let server = packet::address(data, p, false);
+        let client_port = packet::destination_port(data, p);
+        if flags & TCP_SYN != 0 {
+            if flags & TCP_ACK != 0 {
+                self.registries
+                    .hops
+                    .observe(server, client_port, packet::ttl(data, p), now);
+            }
+        } else if self.settings.forced.is_some() {
+            // A fixed profile learns nothing.
+        } else if starts_handshake(&data[p.payload_offset..], SERVER_HELLO) {
+            self.registries
+                .learner
+                .on_server_hello(server, client_port, now);
+        } else if flags & (TCP_RST | TCP_FIN) != 0 {
+            self.registries.learner.on_close(server, client_port, now);
+        }
+    }
+
+    /// Transforms an outgoing ClientHello packet. Returns (the packet was
+    /// replaced in `out`, the wire really changed). A retransmission is the
+    /// same packet again and gets the same treatment.
     #[allow(clippy::too_many_arguments)]
     fn apply_strategy(
         &self,
         data: &[u8],
         p: &Parsed,
         address: Address,
-        target: sh_flow::PeerAddr,
-        source_port: u16,
+        mode: Mode,
+        hello: &ClientHello,
         out: &mut Batch,
         now: u64,
-    ) -> bool {
-        let policies = &self.registries.policies;
-        let sequence = packet::tcp_sequence(data, p);
-        let Some(policy) = policies.take(target, source_port, Some(sequence), now) else {
-            return false;
-        };
+    ) -> (bool, bool) {
+        let target = packet::address(data, p, true);
         let payload = &data[p.payload_offset..];
+        let mut policy = strategy::policy_for(mode, hello);
+        if policy.mode == Mode::FakeAutoTtl {
+            let source_port = packet::source_port(data, p);
+            match self.registries.hops.fake_ttl(target, source_port, now) {
+                Some(ttl) => policy.fake_ttl = ttl,
+                // No path sample, or a server too close for a decoy to die on
+                // the way: send one the server discards by its sequence number.
+                None => policy.mode = Mode::FakeBadSequence,
+            }
+        }
         let (appended, applied) = match policy.mode {
             Mode::None => (false, false),
             Mode::IpFragment if !p.ipv6 => {
@@ -432,10 +434,7 @@ impl Processor {
                 }
             }
         };
-        if applied {
-            policies.note_applied(target, source_port, now);
-        }
-        appended
+        (appended, applied)
     }
 
     fn process_udp(
@@ -461,6 +460,20 @@ impl Processor {
             });
         if bypass {
             out.push(data, *address);
+            return;
+        }
+        if outbound && dp == DNS_PORT && (!s.capture_dns || self.dns_bypass.load(Ordering::Relaxed))
+        {
+            // The name never resolves, so nothing is ever sent to the host,
+            // over TCP or QUIC, whichever packet would have carried its name.
+            match Self::blocked_dns_reply(data, p) {
+                Some(reply) => {
+                    address.set_outbound(false);
+                    address.set_checksums_valid();
+                    out.push(&reply, *address);
+                }
+                None => out.push(data, *address),
+            }
             return;
         }
 
@@ -529,12 +542,34 @@ impl Processor {
         }
     }
 
+    /// The reply to a DNS query for a name on a protection list, addressed
+    /// back to the application as if the resolver had sent it. None for
+    /// every other query, which then goes on to the resolver untouched.
+    fn blocked_dns_reply(data: &[u8], p: &Parsed) -> Option<Vec<u8>> {
+        let mut query = sh_proto::dns::Query::default();
+        if !sh_proto::dns::parse_query(&data[p.payload_offset..], &mut query)
+            || !sh_adblock::global().blocks(&query.name)
+        {
+            return None;
+        }
+        sh_adblock::record_blocked(&query.name);
+        let (client_port, server_port) = (
+            packet::source_port(data, p),
+            packet::destination_port(data, p),
+        );
+        let answer = sh_proto::dns::build_blocked(&query);
+        let mut reply = packet::build_variant(data, p, &answer, 0, 0, false)?;
+        packet::swap_addresses(&mut reply, p);
+        packet::set_source_port(&mut reply, p, server_port);
+        packet::set_destination_port(&mut reply, p, client_port);
+        packet::fix_checksums(&mut reply, p);
+        Some(reply)
+    }
+
     fn clear(&self) {
-        self.tcp_flows.clear();
         self.quic.clear();
-        self.registries.flows.clear();
         self.registries.datagrams.clear();
-        self.registries.policies.clear();
+        self.registries.hops.clear();
         if let Some(filter) = &self.registries.process_filter {
             filter.clear();
         }
@@ -605,20 +640,34 @@ impl Interceptor {
             );
             std::thread::Builder::new()
                 .name("windivert".into())
-                .spawn(move || run(&handle, &processor, &running, &fatal))
+                .spawn(move || {
+                    let looped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run(&handle, &processor, &running, &fatal)
+                    }));
+                    // A dead loop with an open handle captures packets nobody
+                    // reinjects: report it so the engine fails open.
+                    if looped.is_err() {
+                        fatal.store(u32::MAX, Ordering::SeqCst);
+                        running.store(false, Ordering::SeqCst);
+                    }
+                })
                 .map_err(|e| format!("WinDivert thread baslatilamadi: {e}"))?
         };
 
+        let what = match settings.forced {
+            Some(mode) => format!("sabit profil {mode:?}"),
+            None => "site basina ogrenme".to_owned(),
+        };
         if settings.capture_dns {
             tracing::info!(
-                "WinDivert aktif: TCP/443 -> localhost:{}, DNS/53 -> localhost:{}",
-                settings.proxy_port,
+                "WinDivert aktif: TLS ClientHello paketleri ({}), DNS/53 -> localhost:{}",
+                what,
                 settings.dns_proxy_port
             );
         } else {
             tracing::info!(
-                "WinDivert aktif: TCP/443 -> localhost:{}, DNS sistemde kalir",
-                settings.proxy_port
+                "WinDivert aktif: TLS ClientHello paketleri ({}), DNS sistemde kalir",
+                what
             );
         }
         match settings.quic_mode {
@@ -645,6 +694,16 @@ impl Interceptor {
 
     pub fn running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
+    }
+
+    /// (ClientHellos seen, ClientHellos really transformed) since start.
+    pub fn hello_counts(&self) -> (u64, u64) {
+        self.processor.hello_counts()
+    }
+
+    /// On: DNS queries are no longer reflected into the DNS proxy.
+    pub fn set_dns_bypass(&self, on: bool) {
+        self.processor.dns_bypass.store(on, Ordering::Relaxed);
     }
 
     /// Win32 error that stopped the loop (0 while healthy).
@@ -834,25 +893,28 @@ mod tests {
     use super::*;
     use crate::packet::tests::build;
     use sh_flow::PeerAddr;
-    use sh_proto::packet::Policy;
 
-    const PROXY: u16 = 18080;
     const DNS_PROXY: u16 = 18053;
-    const CONNECT: u16 = 65534;
+    /// The protection list is process-wide: tests that fill it take turns.
+    static LIST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    const CLIENT: (&str, u16) = ("10.0.0.5", 40000);
+    const SERVER: (&str, u16) = ("1.2.3.4", 443);
 
-    fn processor(quic_mode: QuicMode) -> Processor {
+    /// `forced` None: the learner decides per site.
+    fn processor(forced: Option<Mode>, quic_mode: QuicMode) -> Processor {
         Processor::new(
             Settings {
-                proxy_port: PROXY,
+                forced,
                 dns_proxy_port: DNS_PROXY,
-                connect_port: CONNECT,
                 quic_mode,
                 capture_dns: true,
+                filter_dns: false,
             },
             Registries {
-                flows: Arc::default(),
                 datagrams: Arc::default(),
-                policies: Arc::default(),
+                hops: Arc::default(),
+                learner: Arc::new(Learner::new("")),
+                network: Arc::new(|| "test".into()),
                 process_filter: None,
             },
         )
@@ -864,227 +926,349 @@ mod tests {
         address
     }
 
+    fn inbound() -> Address {
+        let mut address = Address::default();
+        address.set_outbound(false);
+        address
+    }
+
     fn run_one(p: &Processor, mut packet: Vec<u8>, address: Address) -> Batch {
         let mut out = Batch::default();
         p.process(&mut packet, address, &mut out, 1000);
         out
     }
 
-    fn ports_and_addresses(data: &[u8]) -> (u16, u16, PeerAddr, PeerAddr) {
-        let p = packet::parse(data).unwrap();
-        (
-            packet::source_port(data, &p),
-            packet::destination_port(data, &p),
-            packet::address(data, &p, false),
-            packet::address(data, &p, true),
-        )
+    fn hello() -> Vec<u8> {
+        sh_proto::testing::build_client_hello(&sh_proto::testing::HelloOptions::default())
+    }
+
+    fn from_client(port: u16, payload: &[u8]) -> Vec<u8> {
+        build(false, true, (CLIENT.0, port), SERVER, TCP_ACK, payload)
+    }
+
+    fn from_server(port: u16, flags: u8, payload: &[u8]) -> Vec<u8> {
+        build(false, true, SERVER, (CLIENT.0, port), flags, payload)
+    }
+
+    /// The server's SYN-ACK as it arrives after `hops` routers.
+    fn syn_ack(port: u16, hops: u8) -> Vec<u8> {
+        let mut packet = from_server(port, TCP_SYN | TCP_ACK, b"");
+        packet[8] = 64 - hops;
+        packet
+    }
+
+    fn payload_of(data: &[u8]) -> &[u8] {
+        &data[packet::parse(data).unwrap().payload_offset..]
     }
 
     /// `cargo test --release -p sh-divert -- --ignored --nocapture per_packet`
     #[test]
     #[ignore]
     fn per_packet_cost() {
-        let p = processor(QuicMode::Allow);
-        // An owned upstream flow: SYN seen, then 1400-byte data both ways.
-        let syn = build(
-            false,
-            true,
-            ("10.0.0.5", 40000),
-            ("1.2.3.4", CONNECT),
-            TCP_SYN,
-            b"",
-        );
-        run_one(&p, syn, outbound());
-        let payload = vec![0x17u8; 1400];
-        let up = build(
-            false,
-            true,
-            ("10.0.0.5", 40000),
-            ("1.2.3.4", CONNECT),
-            TCP_ACK,
-            &payload,
-        );
-        let down = build(
-            false,
-            true,
-            ("1.2.3.4", 443),
-            ("10.0.0.5", 40000),
-            TCP_ACK,
-            &payload,
-        );
-        let foreign = build(
-            false,
-            true,
-            ("10.0.0.5", 41000),
-            ("5.6.7.8", 443),
-            TCP_ACK,
-            &payload,
-        );
-        let mut inbound = Address::default();
-        inbound.set_outbound(false);
+        let p = processor(Some(Mode::FakeAutoTtl), QuicMode::Allow);
+        let hello = from_client(CLIENT.1, &hello());
+        let handshake = syn_ack(CLIENT.1, 8);
         let mut out = Batch::default();
         let rounds = 200_000;
         let started = std::time::Instant::now();
         for _ in 0..rounds {
             out.clear();
-            for (packet, address) in [(&up, outbound()), (&down, inbound), (&foreign, outbound())] {
+            for (packet, address) in [(&handshake, inbound()), (&hello, outbound())] {
                 let mut data = packet.clone();
                 p.process(&mut data, address, &mut out, 1000);
             }
         }
-        let per = started.elapsed().as_nanos() / (rounds * 3);
-        println!("per packet: {per} ns (owned rewrite + checksum, and pass-through)");
+        let per = started.elapsed().as_nanos() / (rounds * 2);
+        println!("per packet: {per} ns (SYN-ACK sample, and hello with decoy)");
     }
 
     #[test]
-    fn filter_text_matches_the_cpp_engine() {
+    fn filter_captures_only_handshake_packets() {
         let settings = Settings {
-            proxy_port: 1080,
+            forced: None,
             dns_proxy_port: 5353,
-            connect_port: 65534,
             quic_mode: QuicMode::Allow,
             capture_dns: true,
+            filter_dns: false,
         };
         assert_eq!(
             settings.filter(None),
-            "!loopback and ((tcp and ((outbound and (tcp.DstPort == 443 or tcp.DstPort == 65534 \
-             or tcp.SrcPort == 1080)) or (inbound and tcp.SrcPort == 443))) or (udp and outbound \
-             and (udp.DstPort == 53 or udp.SrcPort == 5353)))"
+            "!loopback and ((tcp and ((outbound and tcp.DstPort == 443 and tcp.PayloadLength > 5 \
+             and tcp.Payload[0] == 0x16 and tcp.Payload[5] == 0x01) or (inbound and tcp.SrcPort \
+             == 443 and (tcp.Syn or tcp.Rst or tcp.Fin or (tcp.PayloadLength > 5 and \
+             tcp.Payload[0] == 0x16 and tcp.Payload[5] == 0x02))))) or (udp and outbound and \
+             (udp.DstPort == 53 or udp.SrcPort == 5353)))"
         );
+        assert!(settings.valid());
         assert!(
             !Settings {
-                proxy_port: 443,
+                dns_proxy_port: 443,
                 ..settings
             }
             .valid()
         );
-        assert!(settings.valid());
+        assert!(
+            !Settings {
+                forced: Some(Mode::None),
+                ..settings
+            }
+            .valid()
+        );
     }
 
     #[test]
-    fn syn_is_reflected_and_announced_and_unknown_flows_pass() {
-        let p = processor(QuicMode::Allow);
-        // A mid-flow packet of a connection that predates the engine.
-        let old = build(
-            false,
-            true,
-            ("10.0.0.5", 50001),
-            ("1.2.3.4", 443),
-            TCP_ACK,
-            b"",
-        );
-        let out = run_one(&p, old.clone(), outbound());
-        assert_eq!(out.packet(0), &old[..]);
-
-        let syn = build(
-            false,
-            true,
-            ("10.0.0.5", 50000),
-            ("1.2.3.4", 443),
-            TCP_SYN,
-            b"",
-        );
-        let out = run_one(&p, syn, outbound());
-        let (sp, dp, src, dst) = ports_and_addresses(out.packet(0));
-        assert_eq!((sp, dp), (50000, PROXY));
-        assert_eq!(src, PeerAddr::parse("1.2.3.4").unwrap());
-        assert_eq!(dst, PeerAddr::parse("10.0.0.5").unwrap());
-        assert!(!out.addresses[0].outbound());
-        let target = p.registries.flows.claim(src, 50000, 1000).unwrap();
-        assert_eq!(target.address, PeerAddr::parse("1.2.3.4").unwrap());
-        assert_eq!(target.connect_port, CONNECT);
-
-        // The relay's answer goes back looking like it came from :443.
-        let reply = build(
-            false,
-            true,
-            ("10.0.0.5", PROXY),
-            ("1.2.3.4", 50000),
-            TCP_SYN | TCP_ACK,
-            b"",
-        );
-        let out = run_one(&p, reply, outbound());
-        let (sp, dp, src, dst) = ports_and_addresses(out.packet(0));
-        assert_eq!((sp, dp), (443, 50000));
-        assert_eq!(src, PeerAddr::parse("1.2.3.4").unwrap());
-        assert_eq!(dst, PeerAddr::parse("10.0.0.5").unwrap());
-    }
-
-    #[test]
-    fn connect_port_maps_to_443_and_back() {
-        let p = processor(QuicMode::Allow);
-        let syn = build(
-            true,
-            true,
-            ("2001:db8::5", 40000),
-            ("2001:db8::9", CONNECT),
-            TCP_SYN,
-            b"",
-        );
-        let out = run_one(&p, syn, outbound());
-        assert_eq!(ports_and_addresses(out.packet(0)).1, 443);
-
-        let mut inbound = Address::default();
-        inbound.set_outbound(false);
-        let syn_ack = build(
-            true,
-            true,
-            ("2001:db8::9", 443),
-            ("2001:db8::5", 40000),
-            TCP_SYN | TCP_ACK,
-            b"",
-        );
-        let out = run_one(&p, syn_ack, inbound);
-        assert_eq!(ports_and_addresses(out.packet(0)).0, CONNECT);
-    }
-
-    #[test]
-    fn armed_fake_profile_sends_a_fake_before_the_real_hello() {
-        let p = processor(QuicMode::Allow);
-        let target = PeerAddr::parse("1.2.3.4").unwrap();
-        let syn = build(
-            false,
-            true,
-            ("10.0.0.5", 40000),
-            ("1.2.3.4", CONNECT),
-            TCP_SYN,
-            b"",
-        );
-        run_one(&p, syn, outbound());
-        let policy = Policy {
-            mode: Mode::FakeBadSequence,
-            ..Policy::default()
-        };
-        p.registries.policies.arm(target, 40000, policy, 1000);
-        let hello =
-            sh_proto::testing::build_client_hello(&sh_proto::testing::HelloOptions::default());
-        let data = build(
-            false,
-            true,
-            ("10.0.0.5", 40000),
-            ("1.2.3.4", CONNECT),
-            TCP_ACK,
-            &hello,
-        );
-        let out = run_one(&p, data, outbound());
-        assert_eq!(out.addresses.len(), 2);
-        let fake = packet::parse(out.packet(0)).unwrap();
+    fn decoy_goes_first_and_expires_before_the_server() {
+        let p = processor(Some(Mode::FakeAutoTtl), QuicMode::Allow);
+        let handshake = syn_ack(CLIENT.1, 8);
         assert_eq!(
-            packet::tcp_sequence(out.packet(0), &fake),
-            1000u32.wrapping_sub(10000)
+            run_one(&p, handshake.clone(), inbound()).packet(0),
+            &handshake[..]
         );
-        assert_eq!(&out.packet(1)[fake.payload_offset..], &hello[..]);
-        assert!(p.registries.policies.consume_applied(target, 40000, 1000));
+
+        let hello = hello();
+        let data = from_client(CLIENT.1, &hello);
+        // Twice: a retransmitted hello gets the same treatment.
+        for _ in 0..2 {
+            let out = run_one(&p, data.clone(), outbound());
+            assert_eq!(out.addresses.len(), 2);
+            let decoy = out.packet(0);
+            let parsed = packet::parse(decoy).unwrap();
+            assert_eq!(packet::ttl(decoy, &parsed), 6);
+            assert_eq!(packet::tcp_sequence(decoy, &parsed), 1000);
+            assert_ne!(payload_of(decoy), &hello[..]);
+            assert!(starts_handshake(payload_of(decoy), CLIENT_HELLO));
+            // The real hello follows untouched, with the stack's own TTL.
+            assert_eq!(payload_of(out.packet(1)), &hello[..]);
+            assert_eq!(out.packet(1)[8], 64);
+        }
+        assert_eq!(p.hello_counts(), (2, 2));
+    }
+
+    #[test]
+    fn without_a_path_sample_the_decoy_is_out_of_window() {
+        let p = processor(Some(Mode::FakeAutoTtl), QuicMode::Allow);
+        // Three hops away: no router left for a decoy to expire at.
+        run_one(&p, syn_ack(CLIENT.1, 3), inbound());
+        let hello = hello();
+        for port in [CLIENT.1, 40001] {
+            let out = run_one(&p, from_client(port, &hello), outbound());
+            assert_eq!(out.addresses.len(), 2);
+            let decoy = packet::parse(out.packet(0)).unwrap();
+            assert_eq!(
+                packet::tcp_sequence(out.packet(0), &decoy),
+                1000u32.wrapping_sub(10000)
+            );
+            assert_eq!(out.packet(0)[8], 64);
+            assert_eq!(payload_of(out.packet(1)), &hello[..]);
+        }
+    }
+
+    #[test]
+    fn split_profile_replaces_the_hello_with_two_segments() {
+        let p = processor(Some(Mode::SequenceOverlap), QuicMode::Allow);
+        let hello = hello();
+        let out = run_one(&p, from_client(CLIENT.1, &hello), outbound());
+        assert_eq!(out.addresses.len(), 2);
+        // The tail is sent first; the head completes the stream from byte 0.
+        let head = packet::parse(out.packet(1)).unwrap();
+        assert_eq!(packet::tcp_sequence(out.packet(1), &head), 1000);
+        let head = payload_of(out.packet(1));
+        assert!(!head.is_empty() && head.len() < hello.len());
+        assert_eq!(head, &hello[..head.len()]);
+        assert!(payload_of(out.packet(0)).ends_with(&hello[head.len()..]));
+        assert_eq!(p.hello_counts(), (1, 1));
+    }
+
+    #[test]
+    fn a_site_is_left_alone_until_its_hello_is_torn_down() {
+        let p = processor(None, QuicMode::Allow);
+        let hello = hello();
+        let server_hello = [0x16, 3, 3, 0, 0x30, 0x02, 0, 0, 0x2C];
+
+        // An open site: answered, so never touched, however often.
+        for port in [40000, 40001] {
+            run_one(&p, syn_ack(port, 8), inbound());
+            let data = from_client(port, &hello);
+            let out = run_one(&p, data.clone(), outbound());
+            assert_eq!(out.addresses.len(), 1);
+            assert_eq!(out.packet(0), &data[..]);
+            let answer = from_server(port, TCP_ACK, &server_hello);
+            assert_eq!(
+                run_one(&p, answer.clone(), inbound()).packet(0),
+                &answer[..]
+            );
+            // The close of a finished handshake says nothing.
+            run_one(&p, from_server(port, TCP_ACK | TCP_FIN, b""), inbound());
+        }
+        assert_eq!(p.hello_counts(), (2, 0));
+
+        // The DPI box resets the next hello: the reset passes, the site is marked.
+        run_one(&p, syn_ack(40002, 8), inbound());
+        assert_eq!(
+            run_one(&p, from_client(40002, &hello), outbound())
+                .addresses
+                .len(),
+            1
+        );
+        let reset = from_server(40002, TCP_RST, b"");
+        assert_eq!(run_one(&p, reset.clone(), inbound()).packet(0), &reset[..]);
+
+        // Its next connection gets the decoy, and the answer makes it stick.
+        run_one(&p, syn_ack(40003, 8), inbound());
+        let out = run_one(&p, from_client(40003, &hello), outbound());
+        assert_eq!(out.addresses.len(), 2);
+        assert_eq!(out.packet(0)[8], 6);
+        assert!(p.registries.learner.is_empty());
+        run_one(&p, from_server(40003, TCP_ACK, &server_hello), inbound());
+        assert_eq!(
+            p.registries.learner.learned(),
+            vec![("test|discord.com".to_owned(), "packet-autottl")]
+        );
+        assert_eq!(p.hello_counts(), (4, 1));
+    }
+
+    #[test]
+    fn a_blocked_ad_host_is_reset_on_both_sides_and_never_contacted() {
+        let _turn = LIST.lock().unwrap_or_else(|p| p.into_inner());
+        sh_adblock::global().replace(sh_adblock::parse_domains("ads.packet-test.example\n"));
+        let p = processor(None, QuicMode::Allow);
+        let hello = sh_proto::testing::build_client_hello(&sh_proto::testing::HelloOptions {
+            server_name: "x.ads.packet-test.example".into(),
+            ..Default::default()
+        });
+        let out = run_one(&p, from_client(CLIENT.1, &hello), outbound());
+        sh_adblock::global().replace(sh_adblock::DomainSet::new());
+
+        assert_eq!(out.addresses.len(), 2);
+        let reset = TCP_RST | TCP_ACK;
+        let (to_server, to_client) = (out.packet(0), out.packet(1));
+        let parsed = packet::parse(to_server).unwrap();
+        assert!(out.addresses[0].outbound() && !out.addresses[1].outbound());
+        assert!(payload_of(to_server).is_empty() && payload_of(to_client).is_empty());
+        assert_eq!(packet::tcp_flags(to_server, &parsed), reset);
+        assert_eq!(packet::tcp_flags(to_client, &parsed), reset);
+        assert_eq!(packet::tcp_sequence(to_server, &parsed), 1000);
+        assert_eq!(packet::destination_port(to_server, &parsed), 443);
+        // In the server's name: its sequence is what the client acknowledged
+        // (0 in these packets), and it acknowledges the hello it never got.
+        assert_eq!(packet::source_port(to_client, &parsed), 443);
+        assert_eq!(packet::destination_port(to_client, &parsed), CLIENT.1);
+        assert_eq!(
+            packet::address(to_client, &parsed, false),
+            PeerAddr::parse(SERVER.0).unwrap()
+        );
+        assert_eq!(packet::tcp_sequence(to_client, &parsed), 0);
+        let at = parsed.transport_offset + 8;
+        assert_eq!(
+            u32::from_be_bytes(to_client[at..at + 4].try_into().unwrap()),
+            1000 + hello.len() as u32
+        );
+        assert_eq!(p.hello_counts(), (1, 0));
+    }
+
+    #[test]
+    fn everything_else_passes_as_it_came() {
+        let p = processor(Some(Mode::FakeAutoTtl), QuicMode::Allow);
+        let hello = hello();
+        for (packet, address) in [
+            // Application data and a TLS 1.2 key exchange on an open connection.
+            (from_client(CLIENT.1, &[0x17; 64]), outbound()),
+            (from_client(CLIENT.1, &[0x16, 3, 3, 0, 1, 16]), outbound()),
+            // A hello to another port, and one coming in.
+            (
+                build(false, true, CLIENT, ("1.2.3.4", 8443), TCP_ACK, &hello),
+                outbound(),
+            ),
+            (from_server(CLIENT.1, TCP_ACK, &hello), inbound()),
+            (from_server(CLIENT.1, TCP_RST, b""), inbound()),
+        ] {
+            let out = run_one(&p, packet.clone(), address);
+            assert_eq!(out.addresses.len(), 1);
+            assert_eq!(out.packet(0), &packet[..]);
+        }
+        assert_eq!(p.hello_counts(), (0, 0));
+    }
+
+    #[test]
+    fn dns_bypass_lets_queries_reach_the_system_resolver() {
+        use sh_proto::testing::dns_query;
+        let _turn = LIST.lock().unwrap_or_else(|p| p.into_inner());
+        let p = processor(None, QuicMode::Allow);
+        assert!(p.settings.capture_dns);
+        let query = dns_query("www.dns-test.example", sh_proto::dns::TYPE_A).build();
+        let packet = build(
+            false,
+            false,
+            ("10.0.0.5", 5555),
+            ("192.168.1.1", 53),
+            0,
+            &query,
+        );
+
+        let reflected = run_one(&p, packet.clone(), outbound());
+        assert!(!reflected.addresses[0].outbound());
+
+        p.dns_bypass.store(true, Ordering::Relaxed);
+        let passed = run_one(&p, packet.clone(), outbound());
+        assert_eq!(passed.packet(0), &packet[..]);
+        assert!(passed.addresses[0].outbound());
+    }
+
+    #[test]
+    fn system_dns_answers_only_listed_names_itself() {
+        use sh_proto::testing::dns_query;
+        let _turn = LIST.lock().unwrap_or_else(|p| p.into_inner());
+        sh_adblock::global().replace(sh_adblock::parse_domains("ads.dns-test.example\n"));
+        let mut p = processor(None, QuicMode::Allow);
+        p.settings.capture_dns = false;
+        p.settings.filter_dns = true;
+        assert!(
+            p.settings
+                .filter(None)
+                .ends_with(" or (udp and outbound and udp.DstPort == 53))")
+        );
+        let resolver = ("192.168.1.1", 53);
+        let ask = |name: &str| {
+            let query = dns_query(name, sh_proto::dns::TYPE_A).id(0x7777).build();
+            let packet = build(false, false, ("10.0.0.5", 5555), resolver, 0, &query);
+            (run_one(&p, packet.clone(), outbound()), packet)
+        };
+        let (blocked, _) = ask("x.ads.dns-test.example");
+        let (passed, original) = ask("www.dns-test.example");
+        sh_adblock::global().replace(sh_adblock::DomainSet::new());
+
+        // Everything else goes to the resolver as it came.
+        assert_eq!(passed.addresses.len(), 1);
+        assert_eq!(passed.packet(0), &original[..]);
+        assert!(passed.addresses[0].outbound());
+
+        // The listed name is answered in the resolver's name with 0.0.0.0.
+        assert_eq!(blocked.addresses.len(), 1);
+        assert!(!blocked.addresses[0].outbound());
+        let reply = blocked.packet(0);
+        let parsed = packet::parse(reply).unwrap();
+        assert_eq!(packet::source_port(reply, &parsed), 53);
+        assert_eq!(packet::destination_port(reply, &parsed), 5555);
+        assert_eq!(
+            packet::address(reply, &parsed, false),
+            PeerAddr::parse(resolver.0).unwrap()
+        );
+        let answer = payload_of(reply);
+        assert_eq!(&answer[..2], &[0x77, 0x77]);
+        assert_eq!(sh_proto::dns::inspect_response(answer).unwrap().answers, 1);
+        assert_eq!(&answer[answer.len() - 4..], &[0, 0, 0, 0]);
     }
 
     #[test]
     fn dns_is_reflected_and_quic_block_drops() {
-        let p = processor(QuicMode::Block);
+        let p = processor(None, QuicMode::Block);
         let query = build(false, false, ("10.0.0.5", 5555), ("8.8.8.8", 53), 0, b"q");
         let out = run_one(&p, query, outbound());
-        let (sp, dp, src, _) = ports_and_addresses(out.packet(0));
-        assert_eq!((sp, dp), (5555, DNS_PROXY));
-        assert!(p.registries.datagrams.claim(src, 5555, 1000));
+        let parsed = packet::parse(out.packet(0)).unwrap();
+        assert_eq!(packet::source_port(out.packet(0), &parsed), 5555);
+        assert_eq!(packet::destination_port(out.packet(0), &parsed), DNS_PROXY);
+        let server: PeerAddr = packet::address(out.packet(0), &parsed, false);
+        assert!(p.registries.datagrams.claim(server, 5555, 1000));
 
         let quic = build(false, false, ("10.0.0.5", 5556), ("8.8.8.8", 443), 0, b"x");
         assert!(run_one(&p, quic, outbound()).addresses.is_empty());

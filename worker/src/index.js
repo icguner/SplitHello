@@ -1,4 +1,4 @@
-﻿// SplitHello Worker - single source of truth.
+// SplitHello Worker - single source of truth.
 //
 // This exact file is embedded into the client binary at build time
 // (see cmake/EmbedWorker.cmake) and is what `--setup` / `--redeploy` upload.
@@ -39,6 +39,7 @@ const HOSTNAME_PATTERN =
 
 const MIN_TTL = 60;
 const MAX_TTL = 3600;
+const MAX_CNAMES = 16;
 
 // Fallback limiter for deployments where the ratelimit binding is unavailable.
 // Per-isolate, so it is a backstop rather than a guarantee. Sized like the
@@ -175,7 +176,7 @@ function isPublicAddress(ip, family) {
 async function queryDoh(hostname, recordType) {
   const url = 'https://1.1.1.1/dns-query?name=' + encodeURIComponent(hostname) +
     '&type=' + recordType;
-  const failed = { addresses: [], ttl: 0, status: 2, errored: true };
+  const failed = { addresses: [], ttl: 0, status: 2, errored: true, cnames: [] };
 
   try {
     const response = await fetch(url, { headers: { Accept: 'application/dns-json' } });
@@ -187,7 +188,7 @@ async function queryDoh(hostname, recordType) {
     const status = Number.isInteger(payload.Status) ? payload.Status : 0;
     if (status === 2) return failed;
     if (!Array.isArray(payload.Answer)) {
-      return { addresses: [], ttl: 0, status, errored: false };
+      return { addresses: [], ttl: 0, status, errored: false, cnames: [] };
     }
 
     const wanted = recordType === 'AAAA' ? 28 : 1;
@@ -201,7 +202,14 @@ async function queryDoh(hostname, recordType) {
     const ttls = answers.map((entry) => entry.TTL).filter((ttl) => Number.isInteger(ttl));
     const ttl = ttls.length > 0 ? Math.min.apply(null, ttls) : 0;
 
-    return { addresses, ttl, status, errored: false };
+    // The names the answer was reached through: a tracker hidden behind a
+    // first-party alias (CNAME cloaking) shows up here, so the client can
+    // check them against its lists.
+    const cnames = payload.Answer
+      .filter((entry) => entry.type === 5 && typeof entry.data === 'string')
+      .map((entry) => entry.data.replace(/\.$/, '').toLowerCase());
+
+    return { addresses, ttl, status, errored: false, cnames };
   } catch (e) {
     return failed;
   }
@@ -228,6 +236,7 @@ async function resolveHost(hostname) {
     rcode: rcode,
     partial: v4.errored !== v6.errored,
     failed: failed,
+    cnames: Array.from(new Set(v4.cnames.concat(v6.cnames))).slice(0, MAX_CNAMES),
   };
 }
 
@@ -251,6 +260,7 @@ async function handleResolve(url) {
     rcode: result.rcode,
   };
   if (result.partial) body.partial = true;
+  if (result.cnames.length > 0) body.cnames = result.cnames;
   return jsonResponse(body);
 }
 

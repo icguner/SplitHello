@@ -298,11 +298,11 @@ mod tests {
     #[ignore]
     fn driver_library_compiles_filters_and_refuses_unelevated_open() {
         let settings = crate::Settings {
-            proxy_port: 1080,
+            forced: None,
             dns_proxy_port: 1053,
-            connect_port: 65534,
             quic_mode: crate::QuicMode::Adaptive,
             capture_dns: true,
+            filter_dns: false,
         };
         compile_filter(&settings.filter(None)).unwrap();
         assert!(compile_filter("tcp.DstPort == ").is_err());

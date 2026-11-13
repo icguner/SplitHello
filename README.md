@@ -17,8 +17,7 @@ VPN değildir; trafiğin başka bir sunucudan geçmez.
 </div>
 
 <p align="center">
-  <img src="docs/images/panel-durum.png" width="49%" alt="Panel: Durum">
-  <img src="docs/images/panel-koruma.png" width="49%" alt="Panel: Koruma">
+  <img src="docs/images/panel-koruma.png" width="49%" alt="Panel: Reklam Engelleme">
 </p>
 
 ## Öne çıkanlar
@@ -36,24 +35,28 @@ VPN değildir; trafiğin başka bir sunucudan geçmez.
 
 | Engel | Ne olur? | SplitHello ne yapar? |
 |---|---|---|
-| **DNS engeli** | Site adresini sorduğunda sağlayıcı yanlış adres döner, site açılmaz. | Sorguyu şifreleyip kendi Cloudflare Worker'ına sorar ve gerçek adresi alır. |
-| **DPI (SNI) engeli** | Bağlanırken gönderilen site adını sağlayıcının cihazı okur ve bağlantıyı keser. | Site adını parçalara böler. Cihaz adı okuyamaz, site normal açılır. |
+| **DNS engeli** | Site adresini sorduğunda sağlayıcı yanlış adres döner, site açılmaz. | Sorguyu şifreleyip seçtiğin DNS sağlayıcısına sorar ve gerçek adresi alır. |
+| **DPI (SNI) engeli** | Bağlanırken gönderilen site adını sağlayıcının cihazı okur ve bağlantıyı keser. | Asıl bağlantıdan hemen önce, cihaza ulaşan ama siteye varmadan sönen sahte bir site adı gönderir. Cihaz onu okur, gerçek adı engellemez. |
 
 ## Nasıl çalışır?
 
 <p align="center">
-  <img src="docs/images/nasil-calisir.svg" width="100%" alt="SplitHello bağlantıları üç yola ayırır: normal siteler olduğu gibi gider, engelli sitelerde site adı parçalanır, reklam ve zararlı siteler engellenir.">
+  <img src="docs/images/nasil-calisir.svg" width="100%" alt="SplitHello bağlantıları üç yola ayırır: normal siteler olduğu gibi gider, engelli sitelerde site adı gizlenir, reklam ve zararlı siteler engellenir.">
 </p>
 
-1. Her bağlantı önce **hiç değiştirilmeden** denenir. Çalışıyorsa SplitHello karışmaz.
-2. Bağlantı kesiliyorsa site adı farklı yöntemlerle parçalanarak tekrar denenir.
-3. Çalışan yöntem o ağ ve o site için kaydedilir; site bir dahaki sefere ilk denemede açılır.
+1. Her bağlantı önce **hiç değiştirilmeden** geçer. Çalışıyorsa SplitHello karışmaz.
+2. Sağlayıcı bağlantıyı keserse site engelli sayılır; o siteye sonraki bağlantıda sahte site adı yöntemi uygulanır.
+3. Çalışan yöntem o ağ ve o site için kaydedilir; site bundan sonra ilk denemede açılır.
 
-Yanlış bir şey öğrenmemek için engel iki ayrı denemede görülmeden kayıt yapılmaz. Kayıtlar yarım saatte bir yeniden kontrol edilir.
+Bağlantılar uygulaman ile site arasında kalır: SplitHello araya girmez, yalnızca bağlantının ilk paketine dokunur. Engelli bir siteye ilk giriş bu yüzden bir kez başarısız olabilir; sayfayı yenilemek yeterlidir.
 
-## Worker nedir?
+## Şifreli DNS
 
-Worker, kendi ücretsiz Cloudflare hesabında çalışan küçük bir programdır. Yalnızca site adreslerini (DNS) sormak için kullanılır.
+Site adresleri şifreli olarak (DoH) seçtiğin sağlayıcıya sorulur: Cloudflare, Google, AdGuard veya DNS.SB. Paneldeki **DNS** sayfasından seçilir; kurulum gerekmez. Seçtiğin sağlayıcı cevap vermezse sırayla diğerleri denenir. Hiçbiri cevap vermezse sorgular geçici olarak sistemin kendi DNS'ine bırakılır ve sağlayıcılar geri gelince şifreli DNS kendiliğinden devam eder.
+
+### Yedek Worker (isteğe bağlı)
+
+Bu sağlayıcıların hepsine erişimin engellendiği ağlar için kendi ücretsiz Cloudflare hesabında küçük bir program (Worker) kurabilirsin. Yalnızca diğer sağlayıcılar cevap vermediğinde kullanılır.
 
 <p align="center">
   <img src="docs/images/worker.svg" width="100%" alt="Adres sorguları şifreli HTTPS ile kendi Worker'ına gider; sayfa trafiği ise Worker'a uğramadan doğrudan siteye gider.">
@@ -64,26 +67,27 @@ Worker, kendi ücretsiz Cloudflare hesabında çalışan küçük bir programdı
 - **Hesap senin.** Ortak bir sunucu yoktur. Worker rastgele bir gizli anahtarla korunur, başkası kullanamaz.
 - **Ücretsiz.** Cloudflare'in ücretsiz planı normal kullanım için yeterlidir.
 
-Worker kurmak istemezsen tray menüsünden **DNS: Sistem** seçebilirsin. Siteler yine parçalama ile açılır, ancak DNS ile engellenen siteler açılmayabilir.
+Worker, DNS sayfasındaki **Kurulumu başlat** ile kurulur. Tarayıcıda Cloudflare hesabına giriş yapıp izin vermen yeterlidir; bu adım için [Node.js](https://nodejs.org) kurulu olmalıdır.
+
+Şifreli DNS'i tray menüsünden veya DNS sayfasından kapatabilirsin. Site adı engeli yine aşılır, ancak DNS ile engellenen siteler açılmayabilir.
 
 ## Kurulum
 
 1. [SplitHello-Setup.exe](https://github.com/icguner/SplitHello/releases/latest/download/SplitHello-Setup.exe) dosyasını indir ve çalıştır. Bağlantı her zaman en yeni sürümü indirir. Yönetici izni yalnızca bu adımda istenir.
-2. İlk açılışta bir pencere açılır. Tarayıcıda Cloudflare hesabına giriş yap ve izin ver. Bu adım için [Node.js](https://nodejs.org) kurulu olmalıdır; Cloudflare hesabın yoksa açılan sayfadan ücretsiz oluşturabilirsin.
-3. Kurulum bitti. Saatin yanındaki simge koruma durumunu gösterir, çift tıklayınca panel açılır.
+2. Kurulum bitti. Saatin yanındaki simge koruma durumunu gösterir, çift tıklayınca panel açılır.
 
 Windows SmartScreen uyarı verirse **Ek bilgi → Yine de çalıştır** ile devam edebilirsin. Sürümler henüz imzalı değildir; kaynak kodun tamamı bu depodadır.
 
 ## Koruma özellikleri
 
-Paneldeki **Koruma** sayfasından açılıp kapatılır.
+Paneldeki **Reklam Engelleme** ve **DNS** sayfalarından açılıp kapatılır.
 
 | Özellik | Engellenenler |
 |---|---|
 | Reklam engelleme | Banner, video ve açılır pencere reklamları. Hafif, Normal, Pro ve Pro++ seviyeleri vardır. |
 | İzleyici koruması | Windows ve Office telemetrisi, web izleyicileri |
 | Rahatsız edici öğeler | Açılır pencere reklam ağları |
-| DNS koruması | Bütün adres sorguları kendi Worker'ın üzerinden, şifreli |
+| Şifreli DNS | Bütün adres sorguları seçtiğin sağlayıcıya şifreli gider |
 | Gezinme güvenliği | Zararlı yazılım, dolandırıcılık ve sahte alışveriş siteleri |
 | Ebeveyn denetimi | Kumar ve yetişkin içerik (varsayılan olarak kapalı) |
 
@@ -94,8 +98,8 @@ Listeler [HaGeZi](https://github.com/hagezi/dns-blocklists) projesinden alınır
 | Ölçüm | Değer |
 |---|---|
 | Bellek | Yaklaşık 27 MB; bütün listeler açıkken 40 MB'ın altında |
-| Bağlantı kurulurken eklenen süre | Normal sitelerde genellikle 60 ms civarı |
-| Engelli bir siteyi ilk kez çözmek | Birkaç saniye, yalnızca bir kez |
+| Bağlantıya eklenen gecikme | Yok; bağlantılar SplitHello'nun içinden geçmez |
+| Engelli bir siteyi ilk kez açmak | İlk bağlantı bir kez başarısız olur, sonrakiler doğrudan açılır |
 | Önceki sürüme göre | Yarı bellek, beşte bir iş parçacığı |
 
 ## Sık sorulan sorular
@@ -107,10 +111,10 @@ Hayır. Trafiğin başka bir ülkeye veya sunucuya gitmez, IP adresin değişmez
 Hayır. Yalnızca HTTPS (443) trafiğine bakılır; oyun ve ses trafiği olduğu gibi geçer.
 
 **Her engeli aşar mı?**
-Türkiye'de en yaygın olan DNS ve site adı (SNI) tabanlı engellerin büyük çoğunluğunu aşar. Bir sitenin IP adresi doğrudan engellenmişse **Bağlantı → Tünel yedeği** açılabilir; bu durumda yalnızca açılamayan bağlantılar Worker üzerinden geçer.
+Türkiye'de en yaygın olan DNS ve site adı (SNI) tabanlı engellerin büyük çoğunluğunu aşar. Bir sitenin IP adresi doğrudan engellenmişse SplitHello onu açamaz.
 
 **Güvenli mi?**
-Kaynak kodu açıktır. Hiçbir veri dışarı gönderilmez; istatistikler yalnızca kendi bilgisayarında tutulur. Worker'ın gizli anahtarı Windows'un şifreleme altyapısıyla saklanır. SplitHello bir hata nedeniyle durursa trafik normal yoluna döner, internet kesilmez.
+Kaynak kodu açıktır. SplitHello'nun kendi sunucusu yoktur ve hiçbir veri toplamaz. Şifreli DNS açıkken sorduğun site adları, her DNS hizmetinde olduğu gibi, seçtiğin sağlayıcıya gider. Öğrenilen siteler yalnızca kendi bilgisayarında tutulur. Worker'ın gizli anahtarı Windows'un şifreleme altyapısıyla saklanır. SplitHello bir hata nedeniyle durursa trafik normal yoluna döner, internet kesilmez.
 
 **Çerez uyarılarını da kapatır mı?**
 Hayır. Çerez uyarıları sayfanın içindedir; bunlar için bir tarayıcı eklentisi gerekir.

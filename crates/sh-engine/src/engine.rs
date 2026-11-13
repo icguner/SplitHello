@@ -1,19 +1,17 @@
 //! Engine run (port of the run path of `main`, `src/main.cpp`).
 //!
-//! Transparent mode (default): relay listener, then the DNS proxy, then
-//! WinDivert; the ready event is set only after all three are up. Stopping
-//! closes interception first, so a failing piece always fails open. Manual
-//! mode: SOCKS5 / HTTP CONNECT on 127.0.0.1, no WinDivert, no elevation.
+//! The DNS proxy (encrypted DNS mode) starts first, then WinDivert; the ready
+//! event is set only after both are up. Stopping closes interception first,
+//! so a failing piece always fails open.
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sh_core::config::{Config, DnsMode};
 use sh_divert::{Interceptor, Registries, Settings};
-use sh_flow::{DatagramRegistry, FlowRegistry, PolicyRegistry};
+use sh_flow::{DatagramRegistry, HopRegistry};
 use sh_net::http::HttpClient;
-use sh_relay::{Listener, ListenerMode, RelayContext};
 use tokio::sync::watch;
 
 use crate::adblock_updater::{self, Route, UpdaterFiles};
@@ -21,16 +19,15 @@ use crate::options::{Options, QuicMode};
 use crate::win;
 
 pub const EXIT_FAIL_OPEN: i32 = 2;
-pub const EXIT_RELAY_PORT_IN_USE: i32 = 10;
 pub const EXIT_DNS_PORT_IN_USE: i32 = 11;
 pub const EXIT_WINDIVERT_OPEN_FAILED: i32 = 12;
 pub const EXIT_INVALID_PROCESS_RULES: i32 = 13;
-pub const EXIT_SETUP_REQUIRED: i32 = 14;
 pub const EXIT_MONITOR_UNAVAILABLE: i32 = 15;
 pub const EXIT_CONFIG_UNREADABLE: i32 = 16;
-
-const PREFERRED_CONNECT_PORT: u16 = 65534;
-const ALTERNATE_CONNECT_PORT: u16 = 65533;
+const HEALTH_REPORT_INTERVAL: Duration = Duration::from_secs(60);
+const PROBE_FIRST: Duration = Duration::from_secs(15);
+const PROBE_MAX: Duration = Duration::from_secs(300);
+const HTTPS_PORT: u16 = 443;
 
 pub fn run(options: &Options) -> i32 {
     let Some(dir) = crate::config_dir() else {
@@ -40,8 +37,7 @@ pub fn run(options: &Options) -> i32 {
     win::install_console_handler();
     sh_core::logging::init(options.verbose, Some(&dir.join(sh_core::paths::LOG_FILE)));
 
-    let transparent = !options.manual_proxy;
-    if transparent && !win::is_elevated() {
+    if !win::is_elevated() {
         tracing::info!("WinDivert icin yonetici izni isteniyor");
         return win::relaunch_elevated(true).unwrap_or_else(|| {
             tracing::error!("Yonetici olarak yeniden baslatma reddedildi veya basarisiz oldu");
@@ -85,20 +81,6 @@ pub fn run(options: &Options) -> i32 {
 
     if options.action == crate::options::Action::Setup && !sh_setup::run_setup(&mut config, &dir) {
         return 1;
-    }
-    if options.worker_url.is_empty()
-        && config.worker_url.is_empty()
-        && config.dns_mode == DnsMode::Worker
-    {
-        if options.engine || options.action == crate::options::Action::Service {
-            // The hidden engine has no console; never block it on setup.
-            tracing::error!("Worker yapilandirmasi yok; once splithello.exe --setup calistirin");
-            return EXIT_SETUP_REQUIRED;
-        }
-        println!("Yapilandirma bulunamadi. Setup baslatiliyor...");
-        if !sh_setup::run_setup(&mut config, &dir) {
-            return 1;
-        }
     }
 
     // A desktop relay is I/O-bound: a few workers carry a thousand
@@ -146,26 +128,18 @@ async fn wait_until(mut ready: impl FnMut() -> bool) -> bool {
 }
 
 async fn serve(options: &Options, mut config: Config, dir: PathBuf) -> i32 {
-    let transparent = !options.manual_proxy;
     let worker_url = if options.worker_url.is_empty() {
         config.worker_url.clone()
     } else {
         options.worker_url.clone()
     };
+    // Encrypted DNS: public DoH resolvers first, the Worker (optional) last.
     let use_worker_dns = config.dns_mode == DnsMode::Worker;
-    if worker_url.is_empty() && use_worker_dns {
-        tracing::error!("Worker yapilandirmasi yok; once splithello.exe --setup calistirin");
-        return EXIT_SETUP_REQUIRED;
-    }
-    if use_worker_dns && config.shared_secret.is_empty() {
+    if use_worker_dns && !worker_url.is_empty() && config.shared_secret.is_empty() {
         tracing::warn!(
             "Worker gizli anahtari yok. Worker istekleri guvenli bicimde reddeder; kullanmak icin '--redeploy' calistirin."
         );
     }
-    if let Some(delay) = options.split_delay_ms {
-        config.split_delay_ms = delay;
-    }
-    config.tunnel_fallback |= options.tunnel_fallback;
 
     // An include list that is present but entirely unusable must not turn into
     // "no include rules" (= intercept every process).
@@ -195,132 +169,58 @@ async fn serve(options: &Options, mut config: Config, dir: PathBuf) -> i32 {
         );
     }
 
-    let flows = Arc::new(FlowRegistry::default());
-    let datagrams = Arc::new(DatagramRegistry::default());
-    let policies = Arc::new(PolicyRegistry::default());
-    let rules = sh_divert::rules::Rules::new(&config.process_include, &config.process_exclude);
-    let process_filter = Arc::new(sh_divert::process::Filter::new(rules));
-
-    let candidates: Vec<u16> = if transparent && !options.port_explicit {
-        vec![options.port, 18080, 28080, 38080, 48080]
+    // `--strategy` fixes one profile for every site and turns learning off.
+    let forced = if options.forced_strategy.is_empty() {
+        None
     } else {
-        vec![options.port]
+        let Some(mode) = sh_proto::packet::mode_for_profile(&options.forced_strategy) else {
+            tracing::error!("Bilinmeyen paket profili: {}", options.forced_strategy);
+            return 1;
+        };
+        Some(mode)
     };
-    // The listener needs the context, and the context the connect port, which
-    // depends on the relay port: pick the connect port per candidate.
-    let connect_port_for = |port: u16| {
-        if port == PREFERRED_CONNECT_PORT {
-            ALTERNATE_CONNECT_PORT
-        } else {
-            PREFERRED_CONNECT_PORT
-        }
-    };
-
-    let http = Arc::new(HttpClient::default());
-    let strategies = Arc::new(sh_strategy::Store::new(
+    let learner = Arc::new(sh_strategy::Learner::new(
         dir.join(sh_core::paths::STRATEGY_FILE),
     ));
-    strategies.load();
-    let telemetry = Arc::new(sh_telemetry::Store::new(
-        dir.join(sh_core::paths::TELEMETRY_FILE),
-    ));
-    if !telemetry.start() {
-        tracing::warn!("Yerel telemetri baslatilamadi; ag motoru istatistiksiz devam ediyor");
-    }
-    let live_stats = (!options.live_stats.is_empty())
-        .then(|| sh_core::live_stats::Publisher::new(&options.live_stats))
-        .flatten();
-    if !options.live_stats.is_empty() && live_stats.is_none() {
-        tracing::warn!("Canli tray istatistik kanali acilamadi");
-    }
-    if !options.forced_strategy.is_empty() {
-        tracing::info!(
-            "Profil zorlandi: '{}' (otomatik secim devre disi)",
-            options.forced_strategy
-        );
-    }
+    learner.load();
 
-    let mut resolver = None;
-    let bound = first_bound(&candidates, |port| {
-        let connect_port = if transparent {
-            connect_port_for(port)
-        } else {
-            0
-        };
-        let port_resolver = use_worker_dns.then(|| {
-            Arc::new(sh_dns::Resolver::new(
-                &worker_url,
-                config.shared_secret.clone(),
-                connect_port,
-                http.clone(),
-                None,
-            ))
-        });
-        let context = Arc::new(RelayContext {
-            resolver: port_resolver.clone(),
-            strategies: strategies.clone(),
-            packet_policies: transparent.then(|| policies.clone()),
-            telemetry: Some(telemetry.clone()),
-            live_stats: live_stats.clone(),
-            // The network can change while the engine runs (Wi-Fi roaming,
-            // VPN): the relay asks per decision instead of using the start value.
-            network_id: Arc::new(sh_core::network_identity::current_cached),
-            split_delay_ms: config.split_delay_ms,
-            probe_timeout: Duration::from_millis(u64::from(config.probe_timeout_ms)),
-            tunnel: (use_worker_dns && config.tunnel_fallback).then(|| sh_relay::TunnelSettings {
-                worker_host: sh_net::http::host_from_url(&worker_url),
-                shared_secret: config.shared_secret.clone(),
-                connect_port: if transparent { connect_port } else { 443 },
-            }),
-            idle_timeout: Duration::from_secs(10 * 60),
-            handshake_timeout: Duration::from_secs(10),
-            forced_profile: options.forced_strategy.clone(),
-        });
-        let mode = if transparent {
-            ListenerMode::Transparent(flows.clone())
-        } else {
-            ListenerMode::Manual
-        };
-        let listener = Listener::bind(port, mode, context)?;
-        resolver = port_resolver;
-        Ok(listener)
+    let datagrams = Arc::new(DatagramRegistry::default());
+    let rules = sh_divert::rules::Rules::new(&config.process_include, &config.process_exclude);
+    let process_filter = Arc::new(sh_divert::process::Filter::new(rules));
+    let http = Arc::new(HttpClient::default());
+    // The engine's own HTTPS (Worker, list updates) dials addresses it
+    // resolved itself: asking the system resolver would loop back into the
+    // DNS proxy. Its ClientHello leaves through the packet loop like any other.
+    let resolver = use_worker_dns.then(|| {
+        Arc::new(sh_dns::Resolver::new(
+            &worker_url,
+            config.shared_secret.clone(),
+            HTTPS_PORT,
+            http.clone(),
+            sh_core::config::dns_provider_index(&config.dns_provider),
+            None,
+        ))
     });
-    let Some((port, listener)) = bound else {
-        tracing::error!(
-            "Relay portu acilamadi (port {} kullanimda olabilir)",
-            options.port
-        );
-        telemetry.stop();
-        return EXIT_RELAY_PORT_IN_USE;
-    };
-    if port != options.port {
-        tracing::warn!(
-            "Port {} kullanilamiyor (Windows ayirmis olabilir); {port} kullaniliyor",
-            options.port
-        );
-    }
-    let connect_port = connect_port_for(port);
 
     tracing::info!("SplitHello baslatiliyor");
     tracing::info!(
         "DNS modu: {}",
-        if use_worker_dns {
-            "Worker"
-        } else {
-            "sistem (Worker yok)"
-        }
+        resolver.as_ref().map_or("sistem".into(), |r| format!(
+            "sifreli ({})",
+            r.upstream_names().join(", ")
+        ))
     );
-    if use_worker_dns {
+    if use_worker_dns && !worker_url.is_empty() {
         tracing::info!("Worker: {worker_url}");
     }
     tracing::info!(
-        "Ag profili: {}",
-        sh_core::network_identity::current_cached()
-    );
-    tracing::info!(
-        "Relay portu: {port} | split-delay: {} ms | ogrenilen alan adi: {}",
-        config.split_delay_ms,
-        strategies.len()
+        "Ag profili: {} | {}",
+        sh_core::network_identity::current_cached(),
+        if forced.is_some() {
+            format!("sabit profil: {}", options.forced_strategy)
+        } else {
+            format!("ogrenilen site: {}", learner.len())
+        }
     );
     if process_filter.enabled() {
         tracing::info!(
@@ -340,54 +240,21 @@ async fn serve(options: &Options, mut config: Config, dir: PathBuf) -> i32 {
             },
             config.ad_block_lists.clone(),
             config.ad_block_allow.clone(),
-            // The updater's own HTTPS dials the connect port, so the packet
-            // loop does not reflect it back into this engine.
             Route {
                 http: http.clone(),
                 resolver: resolver.clone(),
-                connect_port: if transparent { connect_port } else { 0 },
+                connect_port: HTTPS_PORT,
             },
             shutdown.clone(),
         ))
     });
-    let relay = tokio::spawn(listener.clone().run(shutdown.clone()));
-    let running = Running {
-        stop,
-        relay,
-        updater,
-        telemetry,
-    };
-
-    if !transparent {
-        tracing::info!(
-            "SplitHello (Rust) manuel proxy modunda: 127.0.0.1:{port} (SOCKS5 + HTTP CONNECT)"
-        );
-        tracing::warn!(
-            "Manuel proxy modu: yalniz SOCKS5/HTTP CONNECT kullanan uygulamalar yakalanir"
-        );
-        while !win::shutdown_requested() && !running.relay.is_finished() {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        tracing::info!("Durduruluyor...");
-        return running.finish(0).await;
-    }
-
-    // WinDivert must never reflect into a listener that has not started.
-    if !wait_until(|| listener.running() || running.relay.is_finished()).await
-        || !listener.running()
-    {
-        tracing::error!("Transparent relay baslatilamadi (port {port} kullanimda olabilir)");
-        return running.finish(EXIT_RELAY_PORT_IN_USE).await;
-    }
+    let running = Running { stop, updater };
 
     let mut dns_proxy = None;
     let mut dns_port = 1053;
-    if let Some(resolver) = resolver.as_ref().filter(|_| use_worker_dns) {
-        let dns_candidates: Vec<u16> = [1053, 1054, 15353, 25353, 35353]
-            .into_iter()
-            .filter(|&candidate| candidate != port)
-            .collect();
-        let Some((bound_port, socket)) = first_bound(&dns_candidates, sh_dns::DnsProxy::bind)
+    if let Some(resolver) = &resolver {
+        let Some((bound_port, socket)) =
+            first_bound(&[1053, 1054, 15353, 25353, 35353], sh_dns::DnsProxy::bind)
         else {
             tracing::error!("Transparent DNS relay baslatilamadi (port 1053 kullanimda olabilir)");
             return running.finish(EXIT_DNS_PORT_IN_USE).await;
@@ -403,21 +270,23 @@ async fn serve(options: &Options, mut config: Config, dir: PathBuf) -> i32 {
     }
 
     let settings = Settings {
-        proxy_port: port,
+        forced,
         dns_proxy_port: dns_port,
-        connect_port,
         quic_mode: match options.quic_mode {
             QuicMode::Allow => sh_divert::QuicMode::Allow,
             QuicMode::Adaptive => sh_divert::QuicMode::Adaptive,
             QuicMode::Block => sh_divert::QuicMode::Block,
         },
         capture_dns: use_worker_dns,
+        filter_dns: config.ad_block && !use_worker_dns,
     };
     let registries = Registries {
-        flows: flows.clone(),
-        datagrams: datagrams.clone(),
-        policies: policies.clone(),
-        process_filter: Some(process_filter.clone()),
+        datagrams,
+        hops: Arc::new(HopRegistry::default()),
+        learner: learner.clone(),
+        // The network can change while the engine runs (Wi-Fi roaming, VPN).
+        network: Arc::new(sh_core::network_identity::current_cached),
+        process_filter: Some(process_filter),
     };
     let interceptor = match Interceptor::start(settings, registries) {
         Ok(interceptor) => interceptor,
@@ -428,28 +297,60 @@ async fn serve(options: &Options, mut config: Config, dir: PathBuf) -> i32 {
     };
     win::signal_ready_event(&options.ready_event);
 
-    // Observe the packet loop, the relay and the DNS reader: any failure
-    // releases interception.
-    let dns_healthy = || {
-        dns_proxy.as_ref().is_none_or(|(proxy, _)| proxy.running())
-            && resolver.as_ref().is_none_or(|r| !r.worker_unavailable())
-    };
-    while !win::shutdown_requested()
-        && !running.relay.is_finished()
-        && interceptor.running()
-        && dns_healthy()
-    {
+    // Observe the packet loop and the DNS reader: any failure releases
+    // interception.
+    let dns_healthy = || dns_proxy.as_ref().is_none_or(|(proxy, _)| proxy.running());
+    let mut reported = interceptor.hello_counts();
+    let mut next_report = Instant::now() + HEALTH_REPORT_INTERVAL;
+    // While encrypted DNS is out: (next probe, the wait that led to it).
+    let mut probe: Option<(Instant, Duration)> = None;
+    while !win::shutdown_requested() && interceptor.running() && dns_healthy() {
         tokio::time::sleep(Duration::from_millis(50)).await;
+        learner.save_if_dirty();
+        // An outage of every encrypted upstream must not take name resolution
+        // down with it, and must not end protection for good either: queries
+        // go to the system's resolver until one answers a probe.
+        if let Some(resolver) = &resolver {
+            match probe {
+                None if resolver.worker_unavailable() => {
+                    tracing::error!(
+                        "Sifreli DNS sunuculari erisilemiyor; DNS sistem cozucusune birakildi, yanit verince geri alinacak"
+                    );
+                    interceptor.set_dns_bypass(true);
+                    probe = Some((Instant::now() + PROBE_FIRST, PROBE_FIRST));
+                }
+                Some((at, wait)) if Instant::now() >= at => {
+                    if resolver.probe().await {
+                        tracing::info!(
+                            "Sifreli DNS sunuculari yeniden erisilebilir; DNS korumasi geri acildi"
+                        );
+                        interceptor.set_dns_bypass(false);
+                        probe = None;
+                    } else {
+                        let wait = (wait * 2).min(PROBE_MAX);
+                        probe = Some((Instant::now() + wait, wait));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if Instant::now() >= next_report {
+            next_report = Instant::now() + HEALTH_REPORT_INTERVAL;
+            let current = interceptor.hello_counts();
+            let (seen, transformed) = (current.0 - reported.0, current.1 - reported.1);
+            reported = current;
+            // Quiet minutes stay out of the log.
+            if seen != 0 {
+                tracing::info!(
+                    "Saglik (60 sn): ClientHello gorulen={seen} degistirilen={transformed}"
+                );
+            }
+        }
     }
 
     let requested = win::shutdown_requested();
     let fatal = interceptor.fatal_error_code();
-    let code = if !requested && resolver.as_ref().is_some_and(|r| r.worker_unavailable()) {
-        tracing::error!(
-            "Worker erisilemiyor; trafik yakalama kapatiliyor. Tray otomatik yeniden baslatmayacak"
-        );
-        sh_core::recovery::WORKER_UNAVAILABLE_EXIT_CODE
-    } else if !requested && !dns_healthy() {
+    let code = if !requested && !dns_healthy() {
         tracing::error!("DNS alicisi durdu; trafik yakalama kapatiliyor");
         EXIT_FAIL_OPEN
     } else if fatal != 0 {
@@ -457,18 +358,13 @@ async fn serve(options: &Options, mut config: Config, dir: PathBuf) -> i32 {
             "Ag motoru fail-open ile kapandi: WinDivert hata={fatal}; tray yeniden baslatabilir"
         );
         EXIT_FAIL_OPEN
-    } else if running.relay.is_finished() && interceptor.running() {
-        tracing::error!(
-            "Transparent relay beklenmedik sekilde durdu; WinDivert fail-open kapatiliyor"
-        );
-        EXIT_FAIL_OPEN
     } else {
         0
     };
 
-    // Interception goes first, so nothing is reflected into a closing listener.
     tokio::task::block_in_place(|| interceptor.stop());
     drop(interceptor);
+    learner.save_if_dirty();
     let code = running.finish(code).await;
     if let Some((_, task)) = dns_proxy {
         let _ = task.await;
@@ -479,19 +375,15 @@ async fn serve(options: &Options, mut config: Config, dir: PathBuf) -> i32 {
 /// What every exit path must stop and await.
 struct Running {
     stop: watch::Sender<bool>,
-    relay: tokio::task::JoinHandle<()>,
     updater: Option<tokio::task::JoinHandle<()>>,
-    telemetry: Arc<sh_telemetry::Store>,
 }
 
 impl Running {
     async fn finish(self, code: i32) -> i32 {
         let _ = self.stop.send(true);
-        let _ = self.relay.await;
         if let Some(updater) = self.updater {
             let _ = updater.await;
         }
-        self.telemetry.stop();
         code
     }
 }

@@ -42,7 +42,7 @@ static RELOAD: AtomicBool = AtomicBool::new(false);
 
 /// Same rule as the tray: restarting cannot fix these.
 fn needs_user_action(code: u32) -> bool {
-    matches!(code, 12 | 13 | 14 | 16) || code == recovery::WORKER_UNAVAILABLE_EXIT_CODE as u32
+    matches!(code, 12 | 13 | 16)
 }
 
 fn report(state: SERVICE_STATUS_CURRENT_STATE, exit_code: u32, wait_hint_ms: u32) {
@@ -136,7 +136,6 @@ fn supervise() -> u32 {
         RELOAD.store(false, Ordering::SeqCst);
         let options = Options {
             action: Action::Service,
-            live_stats: sh_core::live_stats::SERVICE_MAPPING.into(),
             ..Options::default()
         };
         let engine = std::thread::spawn(move || crate::engine::run(&options));

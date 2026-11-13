@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use sh_core::config::DNS_PROVIDERS;
 use sh_core::recovery::WorkerHealth;
 use sh_net::http::{Fetch, Request, Response, host_from_url};
 use sh_net::is_ip_literal;
@@ -15,6 +16,7 @@ use tokio::sync::Notify;
 /// an address that has since moved.
 const MIN_TTL_SECONDS: u32 = 60;
 const MAX_TTL_SECONDS: u32 = 3600;
+const MAX_CNAMES: usize = 16;
 const NEGATIVE_CACHE_SECONDS: u32 = 30;
 /// Failures and half-answers: long enough to absorb the A/AAAA pair and an
 /// app's immediate retry, short enough not to delay recovery.
@@ -31,9 +33,12 @@ const MIN_REQUEST_TIMEOUT_MS: u64 = 500;
 /// they are refreshed out of band and served stale rather than ever failing.
 const BOOTSTRAP_TTL_MS: u64 = 10 * 60 * 1000;
 const BOOTSTRAP_RETRY_MS: u64 = 30 * 1000;
-const BOOTSTRAP_TIMEOUT: Duration = Duration::from_millis(2000);
-/// Reached by IP literal, so no DNS (and no captured UDP/53) is involved.
-const BOOTSTRAP_DOH_HOST: &str = "1.1.1.1";
+/// Short enough that the next upstream still fits in the proxy's 8 s budget.
+const DIRECT_TIMEOUT: Duration = Duration::from_millis(2000);
+/// Upstream index of the Worker: always asked last, after `DNS_PROVIDERS`.
+const WORKER: usize = DNS_PROVIDERS.len();
+/// A failed upstream is skipped this long so later queries do not pay its timeout.
+const UPSTREAM_COOLDOWN_MS: u64 = 60 * 1000;
 const NEVER_EXPIRES: u64 = u64::MAX;
 
 /// Monotonic milliseconds; injectable for tests.
@@ -51,10 +56,13 @@ pub struct DnsResult {
     pub v6: Vec<String>,
     pub ttl_seconds: u32,
     pub allow_wire_fallback: bool,
-    /// RCODE the Worker reported for an empty answer (3 = NXDOMAIN).
+    /// RCODE the upstream reported for an empty answer (3 = NXDOMAIN).
     pub rcode: u8,
     /// The lookup failed or only half succeeded: cached for seconds, not a TTL.
     pub transient: bool,
+    /// Names the answer was reached through (CNAME chain); empty from a
+    /// Worker deployed before it reported them.
+    pub cnames: Vec<String>,
 }
 
 impl DnsResult {
@@ -113,6 +121,19 @@ pub struct Resolver {
     health: WorkerHealth,
     bootstrap_next_ms: AtomicU64,
     bootstrap_busy: AtomicBool,
+    /// Index into `DNS_PROVIDERS` asked first.
+    preferred: usize,
+    /// Per upstream index: clock time until which it is skipped.
+    cooldown_until: [AtomicU64; WORKER + 1],
+}
+
+/// Transport error, timeout or 5xx: the upstream is down, not the name.
+fn is_failure(status: i32) -> bool {
+    !(0..500).contains(&status)
+}
+
+fn upstream_name(index: usize) -> &'static str {
+    DNS_PROVIDERS.get(index).map_or("Worker", |p| p.name)
 }
 
 fn lowercase(value: &str) -> String {
@@ -195,14 +216,16 @@ fn string_array(body: &Value, key: &str) -> Vec<String> {
 }
 
 impl Resolver {
-    /// `worker_url` empty: no Worker (system DNS mode). Bootstraps the Worker
-    /// host's addresses with the system resolver; call this before packet
-    /// interception starts.
+    /// `worker_url` empty: no Worker, the public resolvers only. `preferred`
+    /// indexes `DNS_PROVIDERS` (out of range: the first). Bootstraps the
+    /// Worker host's addresses with the system resolver; call this before
+    /// packet interception starts.
     pub fn new(
         worker_url: &str,
         shared_secret: String,
         connect_port: u16,
         fetcher: Arc<dyn Fetch>,
+        preferred: usize,
         clock: Option<Clock>,
     ) -> Self {
         let worker_host = host_from_url(worker_url);
@@ -219,11 +242,13 @@ impl Resolver {
             health: WorkerHealth::default(),
             bootstrap_next_ms: AtomicU64::new(0),
             bootstrap_busy: AtomicBool::new(false),
+            preferred: if preferred < WORKER { preferred } else { 0 },
+            cooldown_until: Default::default(),
         };
         if resolver.worker_host.is_empty() {
             if !worker_url.is_empty() {
                 tracing::warn!(
-                    "DNS: Worker URL cozumlenemedi ({worker_url}), sistem DNS kullanilacak"
+                    "DNS: Worker URL cozumlenemedi ({worker_url}), Worker kullanilmayacak"
                 );
             }
             return resolver;
@@ -281,6 +306,12 @@ impl Resolver {
         self.health.unavailable()
     }
 
+    /// One uncached lookup through the upstream chain; true once one answers.
+    pub async fn probe(&self) -> bool {
+        self.query("example.com", 0).await;
+        !self.health.unavailable()
+    }
+
     pub fn cache_len(&self) -> usize {
         self.lock().cache.len()
     }
@@ -325,55 +356,102 @@ impl Resolver {
         (!out.is_empty()).then_some(out)
     }
 
-    /// Resolves the Worker host through Cloudflare's JSON DoH reached by IP
-    /// literal: getaddrinfo cannot be used once interception is active (its
-    /// query would be answered from the very cache being refreshed). No secret
-    /// is sent: this request goes to 1.1.1.1, not to the Worker.
-    async fn lookup_via_doh_by_address(&self) -> Option<DnsResult> {
-        let name = lowercase(&self.worker_host);
-        if !is_resolvable_host(&name) {
-            return None;
+    /// One record type from a public JSON DoH resolver: the body, or the HTTP
+    /// status when it gave no usable answer (a SERVFAIL body counts as 200).
+    /// No secret is sent: only the Worker gets it.
+    async fn doh_json(
+        &self,
+        index: usize,
+        name: &str,
+        record_type: &str,
+        timeout: Duration,
+    ) -> Result<Value, i32> {
+        let provider = &DNS_PROVIDERS[index];
+        let mut request = Request::get(
+            provider.host,
+            format!("{}?name={name}&type={record_type}", provider.json_path),
+        )
+        .header("Accept", "application/dns-json");
+        request.timeout = timeout;
+        let response = self.fetcher.fetch(request).await;
+        if !response.ok() {
+            return Err(response.status);
         }
-        let mut out = DnsResult {
-            ttl_seconds: (BOOTSTRAP_TTL_MS / 1000) as u32,
+        match serde_json::from_slice::<Value>(&response.body) {
+            Ok(body)
+                if body.get("Status").and_then(Value::as_i64)
+                    != Some(i64::from(dns::RCODE_SERV_FAIL)) =>
+            {
+                Ok(body)
+            }
+            _ => Err(response.status),
+        }
+    }
+
+    /// A and AAAA from one public resolver, merged the way the Worker's
+    /// `/resolve` does. Err(true): the resolver is down.
+    async fn query_direct(
+        &self,
+        index: usize,
+        host: &str,
+        deadline_ms: u64,
+    ) -> Result<DnsResult, bool> {
+        let timeout = self.request_timeout(deadline_ms).min(DIRECT_TIMEOUT);
+        let (v4, v6) = tokio::join!(
+            self.doh_json(index, host, "A", timeout),
+            self.doh_json(index, host, "AAAA", timeout)
+        );
+        if let (Err(a), Err(b)) = (&v4, &v6) {
+            return Err(is_failure(*a) && is_failure(*b));
+        }
+        let mut result = DnsResult {
+            transient: v4.is_err() != v6.is_err(),
             ..DnsResult::default()
         };
-        for record_type in ["A", "AAAA"] {
-            let mut request = Request::get(
-                BOOTSTRAP_DOH_HOST,
-                format!("/dns-query?name={name}&type={record_type}"),
-            )
-            .header("Accept", "application/dns-json");
-            request.timeout = BOOTSTRAP_TIMEOUT;
-            let response = self.fetcher.fetch(request).await;
-            if !response.ok() {
-                continue;
-            }
-            let Ok(body) = serde_json::from_slice::<Value>(&response.body) else {
-                continue;
-            };
-            let answers = body
+        let mut ttl: Option<i64> = None;
+        for (body, wanted) in [(&v4, 1), (&v6, 28)] {
+            let Ok(body) = body else { continue };
+            for answer in body
                 .get("Answer")
                 .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            for data in answers
-                .iter()
-                .filter_map(|a| a.get("data").and_then(Value::as_str))
+                .into_iter()
+                .flatten()
             {
-                // CNAME targets and the like are skipped.
+                let data = answer.get("data").and_then(Value::as_str).unwrap_or("");
+                let kind = answer.get("type").and_then(Value::as_i64);
+                if kind == Some(5) && !data.is_empty() {
+                    push_unique(&mut result.cnames, lowercase(data));
+                    continue;
+                }
+                // Never trust the endpoint to return something connectable.
                 match data.parse::<IpAddr>() {
-                    Ok(IpAddr::V4(_)) if record_type == "A" => {
-                        push_unique(&mut out.v4, data.to_owned())
+                    Ok(IpAddr::V4(_)) if kind == Some(1) && wanted == 1 => {
+                        push_unique(&mut result.v4, data.to_owned())
                     }
-                    Ok(IpAddr::V6(_)) if record_type == "AAAA" => {
-                        push_unique(&mut out.v6, data.to_owned())
+                    Ok(IpAddr::V6(_)) if kind == Some(28) && wanted == 28 => {
+                        push_unique(&mut result.v6, data.to_owned())
                     }
-                    _ => {}
+                    _ => continue,
+                }
+                if let Some(seconds) = answer.get("TTL").and_then(Value::as_i64).filter(|t| *t > 0)
+                {
+                    ttl = Some(ttl.map_or(seconds, |t| t.min(seconds)));
                 }
             }
         }
-        (!out.is_empty()).then_some(out)
+        result.cnames.truncate(MAX_CNAMES);
+        if result.is_empty() {
+            // A family that errored says nothing about the name.
+            let answered = v4.as_ref().or(v6.as_ref()).ok();
+            let status = answered
+                .and_then(|b| b.get("Status"))
+                .and_then(Value::as_i64);
+            result.rcode = status.unwrap_or(0).clamp(0, 15) as u8;
+        }
+        result.ttl_seconds =
+            ttl.unwrap_or(i64::from(MIN_TTL_SECONDS))
+                .clamp(i64::from(MIN_TTL_SECONDS), i64::from(MAX_TTL_SECONDS)) as u32;
+        Ok(result)
     }
 
     fn has_bootstrap(&self) -> bool {
@@ -394,7 +472,16 @@ impl Resolver {
         if self.bootstrap_busy.swap(true, Ordering::SeqCst) {
             return;
         }
-        let refreshed = match self.lookup_via_doh_by_address().await {
+        // The public resolvers only: getaddrinfo cannot be used once
+        // interception is active (its query would be answered from the very
+        // cache being refreshed), and the Worker cannot be asked about itself.
+        let name = lowercase(&self.worker_host);
+        let fresh = if is_resolvable_host(&name) {
+            Box::pin(self.query_upstreams(&name, 0, false)).await.ok()
+        } else {
+            None
+        };
+        let refreshed = match fresh.filter(|fresh| !fresh.is_empty()) {
             Some(fresh) => {
                 tracing::debug!(
                     "DNS bootstrap yenilendi: {} A, {} AAAA",
@@ -402,9 +489,14 @@ impl Resolver {
                     fresh.v6.len()
                 );
                 self.lock().cache.insert(
-                    lowercase(&self.worker_host),
+                    name,
                     Entry {
-                        result: fresh,
+                        result: DnsResult {
+                            v4: fresh.v4,
+                            v6: fresh.v6,
+                            ttl_seconds: (BOOTSTRAP_TTL_MS / 1000) as u32,
+                            ..DnsResult::default()
+                        },
                         expires_ms: NEVER_EXPIRES,
                     },
                 );
@@ -425,8 +517,8 @@ impl Resolver {
     }
 
     /// Gate before every Worker call: refreshes the bootstrap, and refuses when
-    /// there is nothing to connect to (offline: not counted against the
-    /// Worker's health), a 429 back-off runs, or the deadline has passed.
+    /// there is nothing to connect to (not counted as a Worker failure), a 429
+    /// back-off runs, or the deadline has passed.
     async fn prepare_worker_call(&self, deadline_ms: u64) -> bool {
         if deadline_ms != 0 && self.now() >= deadline_ms {
             return false;
@@ -451,58 +543,168 @@ impl Resolver {
         request
     }
 
-    fn observe(&self, response: &Response) {
-        self.health
-            .observe(response.status, self.now(), response.retry_after_seconds);
+    /// The preferred provider, the others in table order, then the Worker
+    /// (`with_worker` and one is configured).
+    fn upstream_chain(&self, with_worker: bool) -> Vec<usize> {
+        std::iter::once(self.preferred)
+            .chain((0..WORKER).filter(|&i| i != self.preferred))
+            .chain((with_worker && !self.worker_host.is_empty()).then_some(WORKER))
+            .collect()
     }
 
-    async fn query(&self, host: &str, deadline_ms: u64) -> DnsResult {
-        let mut result = DnsResult::default();
-        if self.worker_host.is_empty() {
-            return result;
-        }
-        // '_' (service labels) and anything outside [a-z0-9.-] is not a
-        // /resolve host; the raw wire path handles any name.
-        if !is_resolvable_host(host) {
-            result.allow_wire_fallback = true;
-            return result;
-        }
-        if !self.prepare_worker_call(deadline_ms).await {
-            result.transient = true;
-            return result;
-        }
-        let response = self
-            .fetcher
-            .fetch(self.worker_request("GET", format!("/resolve?host={host}"), deadline_ms))
-            .await;
-        self.observe(&response);
+    /// Upstream names in the order they are asked (for the start-up log).
+    pub fn upstream_names(&self) -> Vec<&'static str> {
+        self.upstream_chain(true)
+            .into_iter()
+            .map(upstream_name)
+            .collect()
+    }
 
+    /// `upstream_chain` without those cooling down (all of them when every
+    /// one is).
+    fn upstream_order(&self, with_worker: bool) -> Vec<usize> {
+        let chain = self.upstream_chain(with_worker);
+        let now = self.now();
+        let ready: Vec<usize> = chain
+            .iter()
+            .copied()
+            .filter(|&i| self.cooldown_until[i].load(Ordering::Relaxed) <= now)
+            .collect();
+        if ready.is_empty() { chain } else { ready }
+    }
+
+    /// An answer ends an upstream's cool-down; a failure starts or extends it.
+    fn note(&self, index: usize, failed: bool) {
+        if !failed {
+            self.cooldown_until[index].store(0, Ordering::Relaxed);
+            return;
+        }
+        let now = self.now();
+        if self.cooldown_until[index].swap(now + UPSTREAM_COOLDOWN_MS, Ordering::Relaxed) <= now {
+            tracing::warn!(
+                "DNS: {} yanit vermiyor; {} sn atlanacak",
+                upstream_name(index),
+                UPSTREAM_COOLDOWN_MS / 1000
+            );
+        }
+    }
+
+    /// The Worker's refusals: 429 starts the back-off (alive, not a failure),
+    /// 401/403 is a failure. None: not a refusal.
+    fn worker_refusal(&self, response: &Response) -> Option<bool> {
         match response.status {
+            429 => {
+                self.health
+                    .observe(429, self.now(), response.retry_after_seconds);
+                tracing::warn!("DNS: Worker rate limit (HTTP 429)");
+                Some(false)
+            }
             401 | 403 => {
                 tracing::error!(
                     "DNS: Worker kimlik dogrulamasi reddetti (HTTP {}). --redeploy ile worker'i guncelleyin.",
                     response.status
                 );
-                result.transient = true;
-                return result;
+                Some(true)
             }
-            429 => {
-                tracing::warn!("DNS: Worker rate limit (HTTP 429)");
-                result.transient = true;
-                return result;
+            _ => None,
+        }
+    }
+
+    /// Health counts lookups, not attempts: one answer from any upstream is a
+    /// success, a lookup where every tried upstream failed is one failure.
+    fn observe_lookup(&self, answered: bool, failed: bool) {
+        if answered {
+            self.health.observe(200, self.now(), 0);
+        } else if failed {
+            self.health.observe(-1, self.now(), 0);
+        }
+    }
+
+    /// Asks the public resolvers, then the Worker (`with_worker`), until one
+    /// answers. Err(true): one failed and none answered.
+    async fn query_upstreams(
+        &self,
+        host: &str,
+        deadline_ms: u64,
+        with_worker: bool,
+    ) -> Result<DnsResult, bool> {
+        let mut failed = false;
+        for index in self.upstream_order(with_worker) {
+            if deadline_ms != 0 && self.now() >= deadline_ms {
+                break;
             }
-            // Workers deployed before the rcode field answered 404 for NXDOMAIN,
-            // SERVFAIL and empty answers alike: ask the wire path.
-            404 => {
-                result.allow_wire_fallback = true;
-                return result;
+            let attempt = if index == WORKER {
+                self.query_worker(host, deadline_ms).await
+            } else {
+                self.query_direct(index, host, deadline_ms).await
+            };
+            match attempt {
+                Ok(result) => {
+                    self.note(index, false);
+                    return Ok(result);
+                }
+                Err(true) => {
+                    self.note(index, true);
+                    failed = true;
+                }
+                Err(false) => {}
             }
-            _ if !response.ok() => {
-                tracing::warn!("DNS: /resolve HTTP {} ({host})", response.status);
-                result.transient = true;
-                return result;
+        }
+        Err(failed)
+    }
+
+    async fn query(&self, host: &str, deadline_ms: u64) -> DnsResult {
+        // '_' (service labels) and anything outside [a-z0-9.-] does not go
+        // into a URL; the raw wire path handles any name.
+        if !is_resolvable_host(host) {
+            return DnsResult {
+                allow_wire_fallback: true,
+                ..DnsResult::default()
+            };
+        }
+        let answer = self.query_upstreams(host, deadline_ms, true).await;
+        self.observe_lookup(answer.is_ok(), matches!(answer, Err(true)));
+        let Ok(mut result) = answer else {
+            return DnsResult {
+                transient: true,
+                ..DnsResult::default()
+            };
+        };
+        if result.transient {
+            result.ttl_seconds = result.ttl_seconds.min(TRANSIENT_CACHE_SECONDS);
+        }
+        if result.is_empty() && !result.allow_wire_fallback {
+            match result.rcode {
+                dns::RCODE_NX_DOMAIN => tracing::debug!("DNS: {host} NXDOMAIN"),
+                dns::RCODE_NO_ERROR => tracing::debug!("DNS: {host} icin adres yok (NODATA)"),
+                rcode => tracing::warn!("DNS: {host} icin adres yok (rcode {rcode})"),
             }
-            _ => {}
+        }
+        result
+    }
+
+    /// The Worker's `/resolve`. Err(true): the Worker failed.
+    async fn query_worker(&self, host: &str, deadline_ms: u64) -> Result<DnsResult, bool> {
+        let mut result = DnsResult::default();
+        if !self.prepare_worker_call(deadline_ms).await {
+            return Err(false);
+        }
+        let response = self
+            .fetcher
+            .fetch(self.worker_request("GET", format!("/resolve?host={host}"), deadline_ms))
+            .await;
+        if let Some(failed) = self.worker_refusal(&response) {
+            return Err(failed);
+        }
+        // Workers deployed before the rcode field answered 404 for NXDOMAIN,
+        // SERVFAIL and empty answers alike: ask the wire path.
+        if response.status == 404 {
+            result.allow_wire_fallback = true;
+            return Ok(result);
+        }
+        if !response.ok() {
+            tracing::debug!("DNS: Worker /resolve HTTP {} ({host})", response.status);
+            return Err(is_failure(response.status));
         }
 
         let body = serde_json::from_slice::<Value>(&response.body).unwrap_or(Value::Null);
@@ -518,6 +720,8 @@ impl Resolver {
                 result.v4.push(legacy.to_owned());
             }
         }
+        result.cnames = string_array(&body, "cnames");
+        result.cnames.truncate(MAX_CNAMES);
         // Never trust the endpoint to return something connectable.
         result.v4.retain(|a| is_ip_literal(a));
         result.v6.retain(|a| is_ip_literal(a));
@@ -536,21 +740,10 @@ impl Resolver {
             .unwrap_or(i64::from(MIN_TTL_SECONDS));
         result.ttl_seconds =
             ttl.clamp(i64::from(MIN_TTL_SECONDS), i64::from(MAX_TTL_SECONDS)) as u32;
-        if result.transient {
-            result.ttl_seconds = result.ttl_seconds.min(TRANSIENT_CACHE_SECONDS);
-        }
-        if result.is_empty() {
-            match result.rcode {
-                dns::RCODE_NX_DOMAIN => tracing::debug!("DNS: {host} NXDOMAIN"),
-                dns::RCODE_NO_ERROR => tracing::debug!("DNS: {host} icin adres yok (NODATA)"),
-                rcode => tracing::warn!("DNS: {host} icin adres yok (rcode {rcode})"),
-            }
-        }
-        result
+        Ok(result)
     }
 
-    /// Cached lookup. An empty result means the Worker could not answer; the
-    /// caller falls back to the system resolver. `deadline_ms` (clock scale,
+    /// Cached lookup. An empty transient result means no upstream answered. `deadline_ms` (clock scale,
     /// 0 = none) bounds the network time.
     pub async fn resolve(&self, host: &str, deadline_ms: u64) -> DnsResult {
         let key = lowercase(host);
@@ -568,7 +761,7 @@ impl Resolver {
         }
 
         // A and AAAA for the same name usually arrive together: only one caller
-        // asks the Worker while the others wait for its shared result.
+        // asks upstream while the others wait for its shared result.
         loop {
             let notified = self.ready.notified();
             let mut notified = std::pin::pin!(notified);
@@ -631,11 +824,12 @@ impl Resolver {
         result
     }
 
-    /// Authenticated DoH wire relay; the exact response is preserved so every
-    /// record type works. Cached for its TTL; the reply carries the query's ID.
+    /// DoH wire relay through the same upstream chain; the exact response is
+    /// preserved so every record type works. Cached for its TTL; the reply
+    /// carries the query's ID.
     pub async fn query_wire(&self, message: &[u8], deadline_ms: u64) -> Vec<u8> {
         let mut parsed = Query::default();
-        if !dns::parse_query(message, &mut parsed) || self.worker_host.is_empty() {
+        if !dns::parse_query(message, &mut parsed) {
             return Vec::new();
         }
         // A lookup of the Worker host itself is answered from the bootstrap
@@ -675,39 +869,30 @@ impl Resolver {
             }
         }
 
-        if !self.prepare_worker_call(deadline_ms).await {
-            return Vec::new();
+        let mut failed = false;
+        let mut reply = None;
+        for index in self.upstream_order(true) {
+            if deadline_ms != 0 && self.now() >= deadline_ms {
+                break;
+            }
+            match self
+                .query_wire_at(index, message, &parsed, deadline_ms)
+                .await
+            {
+                Ok(answer) => {
+                    self.note(index, false);
+                    reply = Some(answer);
+                    break;
+                }
+                Err(true) => {
+                    self.note(index, true);
+                    failed = true;
+                }
+                Err(false) => {}
+            }
         }
-        let mut request = self.worker_request("POST", "/dns-query".into(), deadline_ms);
-        request
-            .headers
-            .push(("Accept".into(), "application/dns-message".into()));
-        request
-            .headers
-            .push(("Content-Type".into(), "application/dns-message".into()));
-        request.body = message.to_vec();
-        let response = self.fetcher.fetch(request).await;
-        self.observe(&response);
-        if response.status == 401 || response.status == 403 {
-            tracing::error!(
-                "DNS wire: Worker kimlik dogrulamasi reddetti (HTTP {})",
-                response.status
-            );
-            return Vec::new();
-        }
-        if !response.ok() || response.body.len() < 12 || response.body.len() > 65535 {
-            tracing::warn!("DNS wire: Worker HTTP {}", response.status);
-            return Vec::new();
-        }
-        let mut answer = response.body;
-        // The relay must answer *this* question; never pass anything else on.
-        let Some(info) = dns::inspect_response(&answer)
-            .filter(|i| i.response && dns::echoes_question(&answer, &parsed))
-        else {
-            tracing::warn!(
-                "DNS wire: Worker gecersiz veya eslesmeyen cevap dondurdu ({})",
-                parsed.name
-            );
+        self.observe_lookup(reply.is_some(), failed);
+        let Some((mut answer, info)) = reply else {
             return Vec::new();
         };
         dns::set_id(&mut answer, parsed.id);
@@ -741,11 +926,67 @@ impl Resolver {
         }
         answer
     }
+
+    /// One wire query at upstream `index`. Err(true): the upstream failed.
+    async fn query_wire_at(
+        &self,
+        index: usize,
+        message: &[u8],
+        parsed: &Query,
+        deadline_ms: u64,
+    ) -> Result<(Vec<u8>, dns::ResponseInfo), bool> {
+        let mut request = if index == WORKER {
+            if !self.prepare_worker_call(deadline_ms).await {
+                return Err(false);
+            }
+            self.worker_request("POST", "/dns-query".into(), deadline_ms)
+        } else {
+            let mut request = Request::get(DNS_PROVIDERS[index].host, "/dns-query");
+            request.method = "POST";
+            request.timeout = self.request_timeout(deadline_ms).min(DIRECT_TIMEOUT);
+            request
+        };
+        request
+            .headers
+            .push(("Accept".into(), "application/dns-message".into()));
+        request
+            .headers
+            .push(("Content-Type".into(), "application/dns-message".into()));
+        request.body = message.to_vec();
+        let response = self.fetcher.fetch(request).await;
+        if index == WORKER
+            && let Some(failed) = self.worker_refusal(&response)
+        {
+            return Err(failed);
+        }
+        if !response.ok() || response.body.len() < 12 || response.body.len() > 65535 {
+            tracing::debug!(
+                "DNS wire: {} HTTP {}",
+                upstream_name(index),
+                response.status
+            );
+            return Err(is_failure(response.status));
+        }
+        let answer = response.body;
+        // The relay must answer *this* question; never pass anything else on.
+        let Some(info) = dns::inspect_response(&answer)
+            .filter(|i| i.response && dns::echoes_question(&answer, parsed))
+        else {
+            tracing::warn!(
+                "DNS wire: {} gecersiz veya eslesmeyen cevap dondurdu ({})",
+                upstream_name(index),
+                parsed.name
+            );
+            return Err(true);
+        };
+        Ok((answer, info))
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use sh_core::config::dns_provider_index;
     use sh_net::http::FetchFuture;
     use sh_proto::testing::dns_query;
     use std::sync::atomic::AtomicI32;
@@ -783,16 +1024,38 @@ pub(crate) mod tests {
         ok(dns::build_response(&query, addresses, ttl, failed, rcode))
     }
 
-    /// Fake Worker: no network, a hand-driven clock.
+    /// A JSON DoH answer: `v4` for type=A, NODATA for type=AAAA.
+    pub fn doh(request: &Request, v4: &str) -> Response {
+        if request.path.contains("type=AAAA") {
+            return ok(r#"{"Status":0}"#);
+        }
+        ok(format!(
+            r#"{{"Status":0,"Answer":[{{"name":"x","type":1,"TTL":120,"data":"{v4}"}}]}}"#
+        ))
+    }
+
+    pub fn is_direct(request: &Request) -> bool {
+        DNS_PROVIDERS.iter().any(|p| request.host == p.host)
+    }
+
+    fn carries_secret(request: &Request) -> bool {
+        request
+            .headers
+            .iter()
+            .any(|(name, _)| name == "Authorization")
+    }
+
+    /// Fake upstreams: the public resolvers (`direct`, failing by default) and
+    /// the Worker. No network, a hand-driven clock.
     pub struct FakeWorker {
         pub seen: Mutex<Vec<Request>>,
         pub resolve_calls: AtomicI32,
         pub wire_calls: AtomicI32,
-        pub bootstrap_calls: AtomicI32,
+        pub direct_calls: AtomicI32,
         pub clock: Arc<AtomicU64>,
         pub resolve: Mutex<Handler>,
         pub wire: Mutex<Handler>,
-        pub bootstrap: Mutex<Handler>,
+        pub direct: Mutex<Handler>,
         pub delay: Mutex<Duration>,
     }
 
@@ -802,7 +1065,7 @@ pub(crate) mod tests {
                 seen: Mutex::default(),
                 resolve_calls: AtomicI32::new(0),
                 wire_calls: AtomicI32::new(0),
-                bootstrap_calls: AtomicI32::new(0),
+                direct_calls: AtomicI32::new(0),
                 clock: Arc::new(AtomicU64::new(1_000_000)),
                 resolve: Mutex::new(Box::new(|_| {
                     ok(r#"{"host":"x","a":["203.0.113.5"],"aaaa":[],"ttl":300,"rcode":0}"#)
@@ -810,7 +1073,7 @@ pub(crate) mod tests {
                 wire: Mutex::new(Box::new(|r| {
                     upstream_answer(r, &["203.0.113.9"], 120, false, 0)
                 })),
-                bootstrap: Mutex::new(Box::new(|_| status(-1, 0))),
+                direct: Mutex::new(Box::new(|_| status(-1, 0))),
                 delay: Mutex::new(Duration::ZERO),
             })
         }
@@ -847,9 +1110,9 @@ pub(crate) mod tests {
                     tokio::time::sleep(delay).await;
                 }
                 self.seen.lock().unwrap().push(request.clone());
-                if request.host == "1.1.1.1" {
-                    self.bootstrap_calls.fetch_add(1, Ordering::SeqCst);
-                    return (self.bootstrap.lock().unwrap())(&request);
+                if is_direct(&request) {
+                    self.direct_calls.fetch_add(1, Ordering::SeqCst);
+                    return (self.direct.lock().unwrap())(&request);
                 }
                 if request.path == "/dns-query" {
                     self.wire_calls.fetch_add(1, Ordering::SeqCst);
@@ -871,6 +1134,7 @@ pub(crate) mod tests {
             "secret".into(),
             0,
             worker.clone(),
+            0,
             Some(worker.clock()),
         )
     }
@@ -969,6 +1233,8 @@ pub(crate) mod tests {
     async fn backs_off_on_rate_limit_without_counting_it_as_failure() {
         let worker = FakeWorker::new();
         FakeWorker::set(&worker.resolve, |_| status(429, 10));
+        // Public resolvers alive but without an answer: only the 429 is in play.
+        FakeWorker::set(&worker.direct, |_| status(400, 0));
         let resolver = resolver(&worker);
         assert!(resolver.resolve("a.example", 0).await.transient);
         assert_eq!(worker.calls().0, 1);
@@ -1133,51 +1399,270 @@ pub(crate) mod tests {
             "secret".into(),
             0,
             worker.clone(),
+            0,
             Some(worker.clock()),
         );
         // A network that rewrites NXDOMAIN makes the start-up lookup succeed.
         if !resolver.resolve(host, 0).await.is_empty() {
             return;
         }
-        // Offline: no connection attempt to the Worker, and not a health failure.
+        // Offline: no connection attempt to the Worker, and no outage yet.
         let offline = resolver.resolve("first.example", 0).await;
         assert!(offline.is_empty() && offline.transient);
         assert_eq!(worker.calls().0, 0);
-        let attempts = worker.bootstrap_calls.load(Ordering::SeqCst);
+        let attempts = worker.direct_calls.load(Ordering::SeqCst);
         assert!(attempts >= 1);
         resolver.resolve("second.example", 0).await;
-        assert_eq!(worker.bootstrap_calls.load(Ordering::SeqCst), attempts); // rate limited
+        assert_eq!(worker.direct_calls.load(Ordering::SeqCst), attempts); // rate limited
         assert!(!resolver.worker_unavailable());
 
         // Network is back: the next call after the retry interval goes through.
-        FakeWorker::set(&worker.bootstrap, |request| {
-            if request.path.contains("type=AAAA") {
-                return ok(r#"{"Status":0}"#);
+        FakeWorker::set(&worker.direct, |request| {
+            if request
+                .path
+                .contains("name=splithello-bootstrap-test.invalid&")
+            {
+                doh(request, "203.0.113.77")
+            } else {
+                status(-1, 0)
             }
-            ok(
-                r#"{"Status":0,"Answer":[{"name":"splithello-bootstrap-test.invalid","type":1,"TTL":60,"data":"203.0.113.77"}]}"#,
-            )
         });
         worker.advance(31_000);
         assert!(!resolver.resolve("third.example", 0).await.is_empty());
         assert_eq!(worker.calls().0, 1);
         let bootstrap = resolver.resolve(host, 0).await;
         assert_eq!(bootstrap.v4, ["203.0.113.77"]);
-        // The secret goes to the Worker only, never to the bootstrap resolver.
-        for request in worker
+        let seen = worker.seen.lock().unwrap();
+        assert!(!seen.iter().any(|r| is_direct(r) && carries_secret(r)));
+    }
+
+    #[tokio::test]
+    async fn a_public_resolver_answers_without_the_worker() {
+        let worker = FakeWorker::new();
+        FakeWorker::set(&worker.direct, |r| doh(r, "198.51.100.1"));
+        let resolver = resolver(&worker);
+        let result = resolver.resolve("site.example", 0).await;
+        assert_eq!(result.v4, ["198.51.100.1"]);
+        assert!(result.v6.is_empty() && !result.transient);
+        assert_eq!(result.ttl_seconds, 120);
+        assert_eq!(worker.calls(), (0, 0));
+        let seen = worker.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2); // A and AAAA, Cloudflare only
+        for request in seen.iter() {
+            assert_eq!(request.host, "1.1.1.1");
+            assert!(
+                request
+                    .path
+                    .starts_with("/dns-query?name=site.example&type=")
+            );
+            assert!(
+                request
+                    .headers
+                    .contains(&("Accept".into(), "application/dns-json".into()))
+            );
+            assert!(!carries_secret(request));
+        }
+    }
+
+    #[tokio::test]
+    async fn fails_over_to_google_and_skips_a_failed_upstream_for_a_while() {
+        let worker = FakeWorker::new();
+        FakeWorker::set(&worker.direct, |r| {
+            if r.host == "8.8.8.8" && r.path.starts_with("/resolve?name=") {
+                doh(r, "198.51.100.2")
+            } else {
+                status(503, 0)
+            }
+        });
+        let resolver = resolver(&worker);
+        let cloudflare_calls = || {
+            worker
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.host == "1.1.1.1")
+                .count()
+        };
+        assert_eq!(
+            resolver.resolve("one.example", 0).await.v4,
+            ["198.51.100.2"]
+        );
+        assert_eq!(cloudflare_calls(), 2);
+        worker.advance(10_000);
+        assert_eq!(
+            resolver.resolve("two.example", 0).await.v4,
+            ["198.51.100.2"]
+        );
+        assert_eq!(cloudflare_calls(), 2); // cooling down: not asked again
+        worker.advance(UPSTREAM_COOLDOWN_MS);
+        resolver.resolve("three.example", 0).await;
+        assert_eq!(cloudflare_calls(), 4);
+        assert_eq!(worker.calls(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn asks_the_chosen_provider_first_and_falls_back_in_table_order() {
+        let worker = FakeWorker::new();
+        FakeWorker::set(&worker.direct, |r| {
+            if r.host == "94.140.14.14" {
+                status(-1, 0)
+            } else {
+                doh(r, "198.51.100.5")
+            }
+        });
+        let resolver = Resolver::new(
+            WORKER_URL,
+            "secret".into(),
+            0,
+            worker.clone(),
+            dns_provider_index("adguard"),
+            Some(worker.clock()),
+        );
+        assert_eq!(
+            resolver.upstream_names(),
+            ["AdGuard", "Cloudflare", "Google", "DNS.SB", "Worker"]
+        );
+        assert_eq!(
+            resolver.resolve("pick.example", 0).await.v4,
+            ["198.51.100.5"]
+        );
+        let hosts: Vec<String> = worker
             .seen
             .lock()
             .unwrap()
             .iter()
-            .filter(|r| r.host == "1.1.1.1")
-        {
-            assert!(
-                !request
-                    .headers
-                    .iter()
-                    .any(|(name, _)| name == "Authorization")
-            );
+            .map(|r| r.host.clone())
+            .collect();
+        assert_eq!(
+            hosts,
+            ["94.140.14.14", "94.140.14.14", "1.1.1.1", "1.1.1.1"]
+        );
+        assert_eq!(worker.calls(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn only_the_worker_gets_the_secret_when_it_is_the_last_resort() {
+        let worker = FakeWorker::new();
+        let resolver = resolver(&worker);
+        assert_eq!(
+            resolver.resolve("last.example", 0).await.v4,
+            ["203.0.113.5"]
+        );
+        worker.advance(UPSTREAM_COOLDOWN_MS + 1);
+        assert!(
+            !resolver
+                .query_wire(&dns_query("last.example", 16).build(), 0)
+                .await
+                .is_empty()
+        );
+        assert_eq!(worker.calls(), (1, 1));
+        let seen = worker.seen.lock().unwrap();
+        // Every public resolver was asked first, over JSON and over wire.
+        for host in DNS_PROVIDERS.map(|p| p.host) {
+            assert!(seen.iter().any(|r| r.host == host && r.method == "GET"));
+            assert!(seen.iter().any(|r| r.host == host && r.method == "POST"));
         }
+        assert!(
+            seen.iter()
+                .filter(|r| carries_secret(r))
+                .all(|r| r.host == "localhost")
+        );
+        assert_eq!(seen.iter().filter(|r| carries_secret(r)).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn parses_cnames_rcode_and_half_answers_from_doh_json() {
+        let worker = FakeWorker::new();
+        FakeWorker::set(&worker.direct, |r| {
+            let name = r.path.split(['=', '&']).nth(1).unwrap_or("");
+            match (name, r.path.contains("type=AAAA")) {
+                ("cloaked.example", false) => ok(
+                    r#"{"Status":0,"Answer":[{"type":5,"TTL":300,"data":"Edge.Tracker.Example."},{"type":1,"TTL":90,"data":"203.0.113.8"},{"type":1,"TTL":10,"data":"not-an-ip"}]}"#,
+                ),
+                ("cloaked.example", true) => ok(
+                    r#"{"Status":0,"Answer":[{"type":5,"TTL":300,"data":"edge.tracker.example."}]}"#,
+                ),
+                ("gone.example", _) => ok(r#"{"Status":3}"#),
+                // AdGuard's shape: a null Answer next to the status.
+                ("adguard-gone.example", _) => ok(
+                    r#"{"Question":[{"name":"adguard-gone.example.","type":1}],"Answer":null,"Extra":null,"TC":false,"Status":3}"#,
+                ),
+                ("half.example", false) => doh(r, "203.0.113.9"),
+                _ => status(-1, 0),
+            }
+        });
+        let resolver = resolver(&worker);
+        let cloaked = resolver.resolve("cloaked.example", 0).await;
+        assert_eq!(cloaked.v4, ["203.0.113.8"]);
+        assert_eq!(cloaked.cnames, ["edge.tracker.example"]);
+        assert_eq!(cloaked.ttl_seconds, 90);
+        assert!(!cloaked.transient);
+        let gone = resolver.resolve("gone.example", 0).await;
+        assert!(gone.is_empty() && !gone.transient && !gone.allow_wire_fallback);
+        assert_eq!(gone.rcode, dns::RCODE_NX_DOMAIN);
+        let adguard_gone = resolver.resolve("adguard-gone.example", 0).await;
+        assert!(adguard_gone.is_empty() && !adguard_gone.transient);
+        assert_eq!(adguard_gone.rcode, dns::RCODE_NX_DOMAIN);
+        let half = resolver.resolve("half.example", 0).await;
+        assert_eq!(half.v4, ["203.0.113.9"]);
+        assert!(half.transient && half.ttl_seconds <= TRANSIENT_CACHE_SECONDS);
+        assert_eq!(worker.calls(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn resolves_with_no_worker_configured() {
+        let worker = FakeWorker::new();
+        FakeWorker::set(&worker.direct, |r| {
+            if r.method == "POST" {
+                upstream_answer(r, &["203.0.113.10"], 120, false, 0)
+            } else {
+                doh(r, "198.51.100.3")
+            }
+        });
+        let resolver = Resolver::new(
+            "",
+            String::new(),
+            0,
+            worker.clone(),
+            0,
+            Some(worker.clock()),
+        );
+        assert_eq!(
+            resolver.resolve("plain.example", 0).await.v4,
+            ["198.51.100.3"]
+        );
+        assert!(
+            !resolver
+                .query_wire(&dns_query("plain.example", 16).build(), 0)
+                .await
+                .is_empty()
+        );
+        FakeWorker::set(&worker.direct, |_| status(-1, 0));
+        assert!(resolver.resolve("down.example", 0).await.transient);
+        assert_eq!(worker.calls(), (0, 0));
+        assert!(worker.seen.lock().unwrap().iter().all(is_direct));
+    }
+
+    #[tokio::test]
+    async fn latches_when_nothing_answers_and_recovers_on_an_answer() {
+        let worker = FakeWorker::new();
+        FakeWorker::set(&worker.resolve, |_| status(-1, 0));
+        let resolver = resolver(&worker);
+        for i in 0..6 {
+            assert!(
+                resolver
+                    .resolve(&format!("x{i}.example"), 0)
+                    .await
+                    .transient
+            );
+            worker.advance(4_000);
+        }
+        assert!(resolver.worker_unavailable());
+        assert!(!resolver.probe().await);
+        FakeWorker::set(&worker.direct, |r| doh(r, "198.51.100.4"));
+        assert!(resolver.probe().await);
+        assert!(!resolver.worker_unavailable());
     }
 
     #[test]

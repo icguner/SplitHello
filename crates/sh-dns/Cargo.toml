@@ -1,6 +1,6 @@
 [package]
 name = "sh-dns"
-description = "DNS through the Cloudflare Worker (cached /resolve and wire DoH) and the transparent DNS proxy"
+description = "Encrypted DNS (public DoH resolvers, optional Cloudflare Worker) and the transparent DNS proxy"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

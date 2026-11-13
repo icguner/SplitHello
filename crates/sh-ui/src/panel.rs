@@ -1,17 +1,13 @@
 //! The panel (successor of `DashboardPanel`): an egui window in its own
-//! process, opened by the tray with `--panel --live-stats <name>`. It reads
-//! the engine's live-stats mapping, the telemetry database and the files in
-//! the config folder; settings it saves are applied by asking the tray to
+//! process, opened by the tray with `--panel`. It reads the files in the
+//! config folder; settings it saves are applied by asking the tray to
 //! restart the engine. The look lives in `theme`.
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, RichText};
-use sh_core::config::{Config, DnsMode};
-use sh_core::live_stats::Snapshot;
-use sh_telemetry::DashboardData;
+use sh_core::config::{Config, DNS_PROVIDERS, DnsMode, dns_provider_index};
 
 use crate::theme::{self, icon, palette};
 
@@ -41,10 +37,9 @@ const DOH: &str = "doh";
 const SECURITY: [&str; 2] = ["tif", "fake"];
 const GAMBLING: &str = "gambling";
 const ADULT: &str = "nsfw";
-const TELEMETRY_DAYS: u32 = 7;
 const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 
-pub fn run(live_stats_name: &str) -> i32 {
+pub fn run() -> i32 {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("SplitHello")
@@ -52,13 +47,12 @@ pub fn run(live_stats_name: &str) -> i32 {
             .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
-    let name = live_stats_name.to_string();
     let result = eframe::run_native(
         "SplitHello",
         options,
-        Box::new(move |cc| {
+        Box::new(|cc| {
             theme::install(&cc.egui_ctx);
-            Ok(Box::new(Panel::new(name)))
+            Ok(Box::new(Panel::new()))
         }),
     );
     match result {
@@ -72,11 +66,10 @@ pub fn run(live_stats_name: &str) -> i32 {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
-    Status,
-    Protection,
-    Connection,
+    Dpi,
+    AdBlock,
+    Dns,
     Processes,
-    Diagnostics,
     Log,
 }
 
@@ -95,7 +88,7 @@ struct Settings {
     adult: bool,
     other_lists: Vec<String>,
     dns_worker: bool,
-    tunnel_fallback: bool,
+    dns_provider: usize, // index into DNS_PROVIDERS
     allow: Vec<String>,
     include: Vec<String>,
     exclude: Vec<String>,
@@ -128,7 +121,7 @@ impl Settings {
                 .cloned()
                 .collect(),
             dns_worker: config.dns_mode == DnsMode::Worker,
-            tunnel_fallback: config.tunnel_fallback,
+            dns_provider: dns_provider_index(&config.dns_provider),
             allow: config.ad_block_allow.clone(),
             include: config.process_include.clone(),
             exclude: config.process_exclude.clone(),
@@ -165,12 +158,13 @@ impl Settings {
         if config.ad_block {
             config.ad_block_lists = lists;
         }
+        // DnsMode::Worker means "encrypted DNS on"; the Worker is only a fallback now.
         config.dns_mode = if self.dns_worker {
             DnsMode::Worker
         } else {
             DnsMode::System
         };
-        config.tunnel_fallback = self.tunnel_fallback;
+        config.dns_provider = DNS_PROVIDERS[self.dns_provider].id.into();
         config.ad_block_allow = self.allow.clone();
         config.process_include = self.include.clone();
         config.process_exclude = self.exclude.clone();
@@ -178,18 +172,12 @@ impl Settings {
 }
 
 struct Panel {
-    /// The setup console this panel started, and whether to switch DNS to
-    /// the Worker once it succeeds.
-    setup: Option<(std::process::Child, bool)>,
+    /// The setup console this panel started.
+    setup: Option<std::process::Child>,
     worker_url: String,
-    worker_name: String,
-    learned_sites: Option<usize>,
+    learned: Vec<(String, &'static str)>, // (site, profile)
     page: Page,
     dir: Option<PathBuf>,
-    live_name: String,
-    profile_names: Vec<&'static str>,
-    live: Snapshot,
-    live_at: Option<Instant>,
     settings: Settings,
     saved: Settings,
     // Add-field contents, kept out of Settings so typing is not "unsaved".
@@ -200,25 +188,17 @@ struct Panel {
     recent: Vec<(String, String)>,
     total_blocked: String,
     files_at: Option<Instant>,
-    telemetry: Arc<Mutex<Option<DashboardData>>>,
-    telemetry_loading: Arc<Mutex<bool>>,
-    search: String,
     log: String,
 }
 
 impl Panel {
-    fn new(live_name: String) -> Self {
+    fn new() -> Self {
         let mut panel = Self {
             setup: None,
             worker_url: String::new(),
-            worker_name: String::new(),
-            learned_sites: None,
-            page: Page::Status,
+            learned: Vec::new(),
+            page: Page::Dpi,
             dir: sh_core::paths::config_dir(),
-            live_name,
-            profile_names: sh_strategy::PROFILES.iter().map(|p| p.name).collect(),
-            live: Snapshot::default(),
-            live_at: None,
             settings: Settings::default(),
             saved: Settings::default(),
             allow_draft: String::new(),
@@ -228,12 +208,10 @@ impl Panel {
             recent: Vec::new(),
             total_blocked: "0".into(),
             files_at: None,
-            telemetry: Arc::default(),
-            telemetry_loading: Arc::default(),
-            search: String::new(),
             log: String::new(),
         };
         panel.load_settings();
+        panel.learned = panel.dir.as_deref().map(learned_sites).unwrap_or_default();
         panel
     }
 
@@ -251,11 +229,10 @@ impl Panel {
         self.saved = Settings::from_config(&config);
         self.settings = self.saved.clone();
         self.worker_url = config.worker_url;
-        self.worker_name = config.worker_name;
     }
 
     /// Opens `splithello.exe --setup-only` (or `--redeploy`) in its own console.
-    fn launch_setup(&mut self, redeploy: bool, enable_worker: bool) {
+    fn launch_setup(&mut self, redeploy: bool) {
         use std::os::windows::process::CommandExt;
         if self.setup.is_some() {
             return;
@@ -271,25 +248,23 @@ impl Panel {
                 .spawn()
         });
         match spawned {
-            Ok(child) => self.setup = Some((child, enable_worker)),
+            Ok(child) => self.setup = Some(child),
             Err(error) => self.status = Some((format!("Kurulum açılamadı: {error}"), false)),
         }
     }
 
     fn poll_setup(&mut self) {
-        let Some((child, enable_worker)) = &mut self.setup else {
+        let Some(child) = &mut self.setup else {
             return;
         };
         let Ok(Some(status)) = child.try_wait() else {
             return;
         };
-        let enable_worker = *enable_worker;
         self.setup = None;
-        let Some(mut config) = self.load_config() else {
+        let Some(config) = self.load_config() else {
             return;
         };
         self.worker_url = config.worker_url.clone();
-        self.worker_name = config.worker_name.clone();
         if !status.success() || config.worker_url.is_empty() {
             self.status = Some((
                 "Kurulum tamamlanamadı; ayrıntı için kurulum penceresine veya kayıtlara bakın."
@@ -297,14 +272,6 @@ impl Panel {
                 false,
             ));
             return;
-        }
-        if enable_worker {
-            config.dns_mode = DnsMode::Worker;
-            if let Some(dir) = &self.dir {
-                let _ = config.save_to(dir);
-            }
-            self.saved.dns_worker = true;
-            self.settings.dns_worker = true;
         }
         crate::tray::notify_tray_restart();
         self.status = Some(("Worker hazır; ağ motoru yeniden başlıyor.".into(), true));
@@ -317,14 +284,6 @@ impl Panel {
             self.status = Some(("Yapılandırma okunamadı; kaydedilmedi.".into(), false));
             return;
         };
-        if self.settings.dns_worker && config.worker_url.is_empty() {
-            // Worker DNS without a Worker would stop the engine (exit 14).
-            self.status = Some((
-                "Şifreli DNS için önce Worker kurulumu gerekli.".into(),
-                false,
-            ));
-            return;
-        }
         self.settings.apply(&mut config);
         if let Err(error) = config.save_to(&dir) {
             self.status = Some((format!("Kaydedilemedi: {error}"), false));
@@ -342,16 +301,6 @@ impl Panel {
             )
         });
         self.load_settings();
-    }
-
-    fn refresh_live(&mut self) {
-        if self
-            .live_at
-            .is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
-        {
-            self.live = sh_core::live_stats::read(&self.live_name, &self.profile_names);
-            self.live_at = Some(Instant::now());
-        }
     }
 
     fn refresh_files(&mut self, force: bool) {
@@ -384,35 +333,6 @@ impl Panel {
         }
     }
 
-    fn refresh_telemetry(&self, ctx: &egui::Context) {
-        let Some(dir) = &self.dir else {
-            return;
-        };
-        {
-            let mut loading = self
-                .telemetry_loading
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if *loading {
-                return;
-            }
-            *loading = true;
-        }
-        let path = dir.join(sh_core::paths::TELEMETRY_FILE);
-        let (slot, loading, ctx) = (
-            self.telemetry.clone(),
-            self.telemetry_loading.clone(),
-            ctx.clone(),
-        );
-        // The query can take a moment on a large database; keep the UI live.
-        std::thread::spawn(move || {
-            let data = sh_telemetry::snapshot(&path, TELEMETRY_DAYS);
-            *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(data);
-            *loading.lock().unwrap_or_else(|p| p.into_inner()) = false;
-            ctx.request_repaint();
-        });
-    }
-
     fn allow_host(&mut self, host: &str) {
         use std::io::Write;
         let written = self.dir.as_ref().is_some_and(|dir| {
@@ -434,8 +354,26 @@ impl Panel {
     }
 }
 
+/// The sites the engine learned a profile for, as (site, profile). The same
+/// site on two networks shows once per profile.
+fn learned_sites(dir: &Path) -> Vec<(String, &'static str)> {
+    let learner = sh_strategy::Learner::new(dir.join(sh_core::paths::STRATEGY_FILE));
+    learner.load();
+    let mut sites: Vec<_> = learner
+        .learned()
+        .into_iter()
+        .map(|(key, profile)| match key.split_once('|') {
+            Some((_, site)) => (site.to_owned(), profile),
+            None => (key, profile),
+        })
+        .collect();
+    sites.sort();
+    sites.dedup();
+    sites
+}
+
 /// The last `limit` bytes of a text file, starting at a line boundary.
-fn tail(path: &std::path::Path, limit: usize) -> String {
+fn tail(path: &Path, limit: usize) -> String {
     use std::io::{Read, Seek, SeekFrom};
     // Reads only the tail, not the whole (up to 512 KiB) file.
     let Ok(mut file) = std::fs::File::open(path) else {
@@ -462,7 +400,6 @@ fn refresh_button(ui: &mut egui::Ui) -> bool {
 
 impl eframe::App for Panel {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.refresh_live();
         self.refresh_files(false);
         self.poll_setup();
         ui.ctx().request_repaint_after(Duration::from_secs(1));
@@ -480,12 +417,7 @@ impl eframe::App for Panel {
             .show(ui, |ui| self.sidebar(ui));
 
         let dirty = self.settings != self.saved;
-        if dirty
-            && matches!(
-                self.page,
-                Page::Protection | Page::Connection | Page::Processes
-            )
-        {
+        if dirty && matches!(self.page, Page::AdBlock | Page::Dns | Page::Processes) {
             egui::Panel::bottom("save")
                 .show_separator_line(false)
                 .frame(
@@ -528,11 +460,10 @@ impl eframe::App for Panel {
                                 ui.set_max_width(width);
                                 self.status_banner(ui);
                                 match self.page {
-                                    Page::Status => self.status_page(ui),
-                                    Page::Protection => self.protection_page(ui),
-                                    Page::Connection => self.connection_page(ui),
+                                    Page::Dpi => self.dpi_page(ui),
+                                    Page::AdBlock => self.ad_block_page(ui),
+                                    Page::Dns => self.dns_page(ui),
                                     Page::Processes => self.process_page(ui),
-                                    Page::Diagnostics => self.diagnostics_page(ui),
                                     Page::Log => self.log_page(ui),
                                 }
                             });
@@ -556,11 +487,10 @@ impl Panel {
         ui.add_space(22.0);
         ui.spacing_mut().item_spacing.y = 4.0;
         for (page, glyph, label) in [
-            (Page::Status, icon::STATUS, "Durum"),
-            (Page::Protection, icon::SHIELD, "Koruma"),
-            (Page::Connection, icon::LINK, "Bağlantı"),
+            (Page::Dpi, icon::LINK, "DPI"),
+            (Page::AdBlock, icon::BLOCKED, "Reklam Engelleme"),
+            (Page::Dns, icon::GLOBE, "DNS"),
             (Page::Processes, icon::APPS, "Uygulamalar"),
-            (Page::Diagnostics, icon::CHART, "Teşhis"),
             (Page::Log, icon::DOCUMENT, "Kayıtlar"),
         ] {
             if theme::nav_item(ui, glyph, label, self.page == page).clicked() && self.page != page {
@@ -569,33 +499,11 @@ impl Panel {
                 if page == Page::Log {
                     self.refresh_files(true);
                 }
-                if page == Page::Diagnostics {
-                    self.refresh_telemetry(ui.ctx());
-                }
-                if page == Page::Connection {
-                    self.learned_sites = self.dir.as_ref().map(|dir| {
-                        let store =
-                            sh_strategy::Store::new(dir.join(sh_core::paths::STRATEGY_FILE));
-                        store.load();
-                        store.len()
-                    });
+                if page == Page::Dpi {
+                    self.learned = self.dir.as_deref().map(learned_sites).unwrap_or_default();
                 }
             }
         }
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            let (dot, text) = if self.live.online {
-                (p.green, "Koruma aktif")
-            } else {
-                (p.secondary, "Motor kapalı")
-            };
-            ui.horizontal(|ui| {
-                ui.add_space(8.0);
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                ui.painter().circle_filled(rect.center(), 5.0, dot);
-                ui.label(RichText::new(text).size(13.5).color(p.secondary));
-            });
-        });
     }
 
     fn status_banner(&mut self, ui: &mut egui::Ui) {
@@ -622,138 +530,13 @@ impl Panel {
         ui.add_space(12.0);
     }
 
-    fn status_page(&mut self, ui: &mut egui::Ui) {
-        let p = palette(ui);
-        let live = self.live.clone();
-        theme::page_title(
-            ui,
-            "Durum",
-            "Ağ motorunun şu anki durumu ve bu oturumdaki kararlar.",
-        );
-
-        theme::card(ui, |ui| {
-            ui.horizontal(|ui| {
-                let color = if live.online { p.green } else { p.secondary };
-                let (rect, _) =
-                    ui.allocate_exact_size(egui::vec2(56.0, 56.0), egui::Sense::hover());
-                ui.painter()
-                    .circle_filled(rect.center(), 28.0, color.gamma_multiply(0.16));
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    icon::SHIELD,
-                    theme::icons(26.0),
-                    color,
-                );
-                ui.add_space(8.0);
-                ui.vertical(|ui| {
-                    ui.add_space(4.0);
-                    let title = if live.online {
-                        "Koruma aktif"
-                    } else {
-                        "Koruma kapalı"
-                    };
-                    ui.label(RichText::new(title).font(theme::semibold(24.0)));
-                    theme::secondary(
-                        ui,
-                        if live.online {
-                            "HTTPS trafiği izleniyor; DPI müdahalesi otomatik olarak aşılıyor."
-                        } else {
-                            "Canlı veri yok. Motoru tray menüsünden başlatın."
-                        },
-                    );
-                });
-            });
-        });
-        ui.add_space(14.0);
-        theme::metrics(
-            ui,
-            &[
-                ("Aktif bağlantı", live.active_flows.to_string(), None),
-                ("Karar bekleyen", live.pending_flows.to_string(), None),
-                ("Oturum kararı", live.decisions.to_string(), None),
-                (
-                    "Engellenen reklam",
-                    self.total_blocked.clone(),
-                    Some(p.orange),
-                ),
-            ],
-        );
-        ui.add_space(4.0);
-        theme::metrics(
-            ui,
-            &[
-                (
-                    "Doğrudan geçti",
-                    live.successful_decisions.to_string(),
-                    None,
-                ),
-                (
-                    "DPI aşıldı",
-                    live.bypassed_decisions.to_string(),
-                    Some(p.green),
-                ),
-                (
-                    "Çözülemedi",
-                    live.unresolved_decisions.to_string(),
-                    Some(p.red),
-                ),
-            ],
-        );
-        ui.add_space(14.0);
-
-        theme::card(ui, |ui| {
-            theme::card_title(ui, "Profiller");
-            theme::secondary(ui, "Bu oturumda kullanılan atlatma profilleri.");
-            ui.add_space(8.0);
-            let used: Vec<_> = live
-                .profiles
-                .iter()
-                .filter(|pr| pr.active > 0 || pr.decisions > 0)
-                .collect();
-            if used.is_empty() {
-                theme::secondary(ui, "Henüz profil kullanılmadı.");
-                return;
-            }
-            let most = used.iter().map(|pr| pr.decisions).max().unwrap_or(1).max(1);
-            for profile in used {
-                ui.horizontal(|ui| {
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(170.0, 22.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.set_min_width(170.0);
-                            ui.label(&profile.name);
-                        },
-                    );
-                    let width = (ui.available_width() - 150.0).max(40.0);
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(width, 8.0), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 4.0, p.field);
-                    let mut filled = rect;
-                    filled.set_width(rect.width() * profile.decisions as f32 / most as f32);
-                    ui.painter().rect_filled(filled, 4.0, p.blue);
-                    ui.label(
-                        RichText::new(format!(
-                            "{} karar · {} aktif",
-                            profile.decisions, profile.active
-                        ))
-                        .size(13.0)
-                        .color(p.secondary),
-                    );
-                });
-            }
-        });
-    }
-
-    fn protection_page(&mut self, ui: &mut egui::Ui) {
+    fn ad_block_page(&mut self, ui: &mut egui::Ui) {
         let p = palette(ui);
         theme::page_title(
             ui,
-            "Koruma",
+            "Reklam Engelleme",
             "Tüm uygulamalarda DNS ve TLS düzeyinde çalışır; tarayıcı eklentisi gerekmez.",
         );
-        let mut want_worker = false;
         theme::card(ui, |ui| {
             let s = &mut self.settings;
             theme::feature_row(
@@ -791,32 +574,6 @@ impl Panel {
                 "Açılır pencere reklam ağlarını engeller. Sayfa içi çerez bildirimleri DNS düzeyinde engellenemez.",
             );
             ui.separator();
-            let was_worker = s.dns_worker;
-            theme::feature_row(
-                ui,
-                icon::CLOUD,
-                &mut s.dns_worker,
-                "DNS koruması",
-                "Sorgular şifreli olarak kendi Cloudflare Worker'ınızda çözülür; ISS'nin DNS engelleri aşılır.",
-            );
-            if s.dns_worker && !was_worker && self.worker_url.is_empty() {
-                s.dns_worker = false;
-                want_worker = true;
-            }
-            if s.dns_worker {
-                ui.horizontal(|ui| {
-                    ui.add_space(42.0);
-                    ui.vertical(|ui| {
-                        theme::switch_row(
-                            ui,
-                            &mut s.doh,
-                            "Uygulamaların kendi DNS'ini kapat",
-                            "Tarayıcıların gizli DoH sunucularını engeller; tüm sorgular korumadan geçer.",
-                        );
-                    });
-                });
-            }
-            ui.separator();
             theme::feature_row(
                 ui,
                 icon::GLOBE,
@@ -825,13 +582,6 @@ impl Panel {
                 "Kötü amaçlı, oltalama ve sahte alışveriş sitelerine bağlantıyı keser.",
             );
         });
-        if want_worker {
-            self.status = Some((
-                "DNS koruması için Cloudflare Worker kuruluyor; açılan pencerede tarayıcıdan izin verin.".into(),
-                true,
-            ));
-            self.launch_setup(false, true);
-        }
         ui.add_space(14.0);
         theme::card(ui, |ui| {
             theme::card_title(ui, "Ebeveyn denetimi");
@@ -911,12 +661,12 @@ impl Panel {
         }
     }
 
-    fn connection_page(&mut self, ui: &mut egui::Ui) {
+    fn dpi_page(&mut self, ui: &mut egui::Ui) {
         let p = palette(ui);
         theme::page_title(
             ui,
-            "Bağlantı",
-            "Sansürlü sitelere erişim: otomatik DPI atlatma ve kendi Cloudflare Worker'ınız.",
+            "DPI",
+            "Sansürlü sitelere erişim. Engellenen siteler kendiliğinden öğrenilir.",
         );
         theme::card(ui, |ui| {
             ui.horizontal(|ui| {
@@ -942,36 +692,107 @@ impl Panel {
             });
         });
         ui.add_space(14.0);
-        theme::metrics(
+
+        theme::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                theme::card_title(ui, "Öğrenilmiş siteler");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    theme::secondary(ui, format!("Toplam {}", self.learned.len()));
+                });
+            });
+            if self.learned.is_empty() {
+                theme::secondary(ui, "Henüz öğrenilmiş site yok.");
+            }
+            for (index, (site, profile)) in self.learned.iter().enumerate() {
+                if index > 0 {
+                    ui.separator();
+                }
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(site).size(15.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        theme::secondary(ui, *profile);
+                    });
+                });
+            }
+        });
+    }
+
+    fn dns_page(&mut self, ui: &mut egui::Ui) {
+        let p = palette(ui);
+        theme::page_title(
             ui,
-            &[
-                (
-                    "Öğrenilmiş site",
-                    self.learned_sites.map_or("—".into(), |n| n.to_string()),
-                    None,
-                ),
-                (
-                    "Bu oturumda aşılan",
-                    self.live.bypassed_decisions.to_string(),
-                    Some(p.green),
-                ),
-                (
-                    "Çözülemeyen",
-                    self.live.unresolved_decisions.to_string(),
-                    Some(p.red),
-                ),
-            ],
+            "DNS",
+            "Alan adı sorguları şifreli çözülür; ISS'nin sahte yanıtları devre dışı kalır.",
         );
+        theme::card(ui, |ui| {
+            let s = &mut self.settings;
+            theme::feature_row(
+                ui,
+                icon::CLOUD,
+                &mut s.dns_worker,
+                "Şifreli DNS",
+                "Sorgular şifreli olarak seçtiğiniz sağlayıcıya gider; ona ulaşılamazsa diğerleri, \
+                 en son kendi Worker'ınız denenir. ISS'nin DNS engelleri aşılır.",
+            );
+            if s.dns_worker {
+                ui.horizontal(|ui| {
+                    ui.add_space(42.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            let title = ui
+                                .vertical(|ui| {
+                                    ui.set_width((ui.available_width() - 170.0).max(120.0));
+                                    let title =
+                                        ui.label(RichText::new("DNS sağlayıcısı").size(15.5));
+                                    theme::secondary(
+                                        ui,
+                                        "Önce bu sağlayıcıya sorulur. AdGuard reklam ve izleyicileri kendisi de engeller.",
+                                    );
+                                    title.id
+                                })
+                                .inner;
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    egui::ComboBox::from_id_salt("dns_provider")
+                                        .selected_text(DNS_PROVIDERS[s.dns_provider].name)
+                                        .show_ui(ui, |ui| {
+                                            for (index, provider) in
+                                                DNS_PROVIDERS.iter().enumerate()
+                                            {
+                                                ui.selectable_value(
+                                                    &mut s.dns_provider,
+                                                    index,
+                                                    provider.name,
+                                                );
+                                            }
+                                        })
+                                        .response
+                                        .labelled_by(title);
+                                },
+                            );
+                        });
+                        ui.add_space(10.0);
+                        theme::switch_row(
+                            ui,
+                            &mut s.doh,
+                            "Uygulamaların kendi DNS'ini kapat",
+                            "Tarayıcıların gizli DoH sunucularını engeller; tüm sorgular korumadan geçer.",
+                        );
+                    });
+                });
+            }
+        });
         ui.add_space(14.0);
 
         let mut action = None;
         theme::card(ui, |ui| {
-            theme::card_title(ui, "Cloudflare Worker");
+            theme::card_title(ui, "Yedek Worker (isteğe bağlı)");
             theme::secondary(
                 ui,
-                "Ücretsiz Cloudflare hesabınızda çalışan kişisel sunucu. Türkiye'de ISS DNS'i engelli \
-                 sitelere sahte yanıt verdiği için şifreli DNS bunun üzerinden çözülür; hiçbir profil \
-                 işe yaramazsa trafik onun üzerinden tünellenebilir.",
+                "Ücretsiz Cloudflare hesabınızda çalışan kişisel sunucu. Yalnızca hiçbir DNS \
+                 sağlayıcısına ulaşılamayan ağlarda şifreli DNS'i devralır.",
             );
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -1002,31 +823,14 @@ impl Panel {
                     if theme::primary_button(ui, label).clicked() {
                         action = Some(false);
                     }
-                    if !self.worker_name.is_empty() && ui.button("Worker'ı güncelle").clicked() {
+                    if installed && ui.button("Worker'ı güncelle").clicked() {
                         action = Some(true);
                     }
                 });
             });
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_enabled_ui(!self.worker_url.is_empty(), |ui| {
-                theme::switch_row(
-                    ui,
-                    &mut self.settings.dns_worker,
-                    "Şifreli DNS",
-                    "Tüm DNS sorguları Worker üzerinden şifreli çözülür (Koruma › DNS koruması ile aynı).",
-                );
-                ui.separator();
-                theme::switch_row(
-                    ui,
-                    &mut self.settings.tunnel_fallback,
-                    "Tünel yedeği",
-                    "Hiçbir atlatma yöntemi işe yaramazsa bağlantı Worker üzerinden tünellenir.",
-                );
-            });
         });
         if let Some(redeploy) = action {
-            self.launch_setup(redeploy, !redeploy && self.worker_url.is_empty());
+            self.launch_setup(redeploy);
         }
     }
 
@@ -1073,185 +877,6 @@ impl Panel {
         if rules.include_list_invalid() {
             ui.label(RichText::new("Bu liste geçersiz: motor başlamaz.").color(p.red));
         }
-    }
-
-    fn diagnostics_page(&mut self, ui: &mut egui::Ui) {
-        let p = palette(ui);
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.set_width(ui.available_width() - 60.0);
-                theme::page_title(
-                    ui,
-                    "Teşhis",
-                    &format!("Son {TELEMETRY_DAYS} günde verilen kararlar ve müdahale kanıtları."),
-                );
-            });
-            if *self
-                .telemetry_loading
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-            {
-                ui.spinner();
-            } else if refresh_button(ui) {
-                self.refresh_telemetry(ui.ctx());
-            }
-        });
-        let snapshot = self
-            .telemetry
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let Some(data) = snapshot else {
-            theme::card(ui, |ui| theme::secondary(ui, "Veriler yükleniyor…"));
-            return;
-        };
-        if !data.ready {
-            theme::card(ui, |ui| {
-                ui.label(
-                    RichText::new(format!("Telemetri okunamadı: {}", data.error)).color(p.red),
-                );
-            });
-            return;
-        }
-        theme::metrics(
-            ui,
-            &[
-                ("Toplam karar", data.total.to_string(), None),
-                ("Dokunulmadı", data.normal.to_string(), None),
-                ("DPI aşıldı", data.bypassed.to_string(), Some(p.green)),
-                ("Çözülemedi", data.unresolved.to_string(), Some(p.red)),
-            ],
-        );
-        ui.add_space(4.0);
-        theme::metrics(
-            ui,
-            &[
-                ("Medyan süre", format!("{} ms", data.latency.p50), None),
-                (
-                    "Yavaş (p90)",
-                    format!("{} ms", data.latency.p90),
-                    Some(p.orange),
-                ),
-                (
-                    "Kuyruk (p99)",
-                    format!("{} ms", data.latency.p99),
-                    Some(p.red),
-                ),
-            ],
-        );
-        ui.add_space(14.0);
-
-        theme::card(ui, |ui| {
-            theme::card_title(ui, "Müdahale görülen alan adları");
-            ui.add_space(6.0);
-            let widths = [0.55, 0.15, 0.15, 0.15];
-            let header =
-                ["Alan adı", "Toplam", "Aşıldı", "Çözülemedi"].map(|h| (h.to_string(), None));
-            theme::table_row(ui, &header, &widths, true);
-            if data.top_hosts.is_empty() {
-                theme::secondary(ui, "Kayıt yok.");
-            }
-            for host in &data.top_hosts {
-                theme::table_row(
-                    ui,
-                    &[
-                        (host.host.clone(), None),
-                        (host.total.to_string(), None),
-                        (host.bypassed.to_string(), Some(p.green)),
-                        (
-                            host.unresolved.to_string(),
-                            (host.unresolved > 0).then_some(p.red),
-                        ),
-                    ],
-                    &widths,
-                    false,
-                );
-            }
-        });
-        ui.add_space(14.0);
-
-        ui.columns(2, |columns| {
-            theme::card(&mut columns[0], |ui| {
-                theme::card_title(ui, "Profiller");
-                ui.add_space(6.0);
-                let widths = [0.46, 0.18, 0.18, 0.18];
-                let header = ["Profil", "Karar", "ms", "Deneme"].map(|h| (h.to_string(), None));
-                theme::table_row(ui, &header, &widths, true);
-                for profile in &data.profiles {
-                    theme::table_row(
-                        ui,
-                        &[
-                            (profile.name.clone(), None),
-                            (profile.count.to_string(), None),
-                            (format!("{:.0}", profile.average_latency_ms), None),
-                            (format!("{:.1}", profile.average_attempts), None),
-                        ],
-                        &widths,
-                        false,
-                    );
-                }
-            });
-            theme::card(&mut columns[1], |ui| {
-                theme::card_title(ui, "Teşhis dağılımı");
-                ui.add_space(6.0);
-                let total: i64 = data.diagnoses.iter().map(|d| d.count).sum::<i64>().max(1);
-                for item in &data.diagnoses {
-                    ui.horizontal(|ui| {
-                        ui.label(&item.key);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{}  ·  %{}",
-                                    item.count,
-                                    item.count * 100 / total
-                                ))
-                                .color(p.secondary),
-                            );
-                        });
-                    });
-                }
-            });
-        });
-        ui.add_space(14.0);
-
-        theme::card(ui, |ui| {
-            ui.horizontal(|ui| {
-                theme::card_title(ui, "Son kararlar");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.search)
-                            .hint_text("Alan adı ara")
-                            .desired_width(240.0)
-                            .margin(egui::Margin::symmetric(10, 6)),
-                    );
-                });
-            });
-            ui.add_space(6.0);
-            let needle = self.search.to_ascii_lowercase();
-            let widths = [0.4, 0.25, 0.15, 0.1, 0.1];
-            let header =
-                ["Alan adı", "Teşhis", "Profil", "Deneme", "ms"].map(|h| (h.to_string(), None));
-            theme::table_row(ui, &header, &widths, true);
-            for event in data
-                .recent
-                .iter()
-                .filter(|e| e.host.contains(&needle))
-                .take(150)
-            {
-                theme::table_row(
-                    ui,
-                    &[
-                        (event.host.clone(), None),
-                        (event.diagnosis.clone(), (!event.success).then_some(p.red)),
-                        (event.winner.clone(), None),
-                        (event.attempt_count.to_string(), None),
-                        (event.total_elapsed_ms.to_string(), None),
-                    ],
-                    &widths,
-                    false,
-                );
-            }
-        });
     }
 
     fn log_page(&mut self, ui: &mut egui::Ui) {
@@ -1318,6 +943,25 @@ mod tests {
         off.apply(&mut config);
         assert!(!config.ad_block);
         assert!(!Settings::from_config(&config).ads);
+    }
+
+    #[test]
+    fn learned_sites_drop_the_network_and_repeats() {
+        let dir = std::env::temp_dir().join(format!("sh-ui-learned-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(sh_core::paths::STRATEGY_FILE),
+            r#"{"version":3,"domains":{"home|b.test":"packet-seqovl","home|a.test":"packet-autottl","cafe|a.test":"packet-autottl"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            learned_sites(&dir),
+            [
+                ("a.test".to_owned(), "packet-autottl"),
+                ("b.test".to_owned(), "packet-seqovl")
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

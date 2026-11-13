@@ -44,16 +44,10 @@ pub async fn build_reply(resolver: &Resolver, data: &[u8], deadline_ms: u64) -> 
     }
 
     // The Worker's own bootstrap names are never filtered, whatever the list says.
-    if !resolver.is_bootstrap_host(&query.name) && sh_adblock::global().blocks(&query.name) {
+    let bootstrap = resolver.is_bootstrap_host(&query.name);
+    if !bootstrap && sh_adblock::global().blocks(&query.name) {
         sh_adblock::record_blocked(&query.name);
-        // A sinkhole address makes connect() fail at once; NXDOMAIN would send
-        // some apps to another resolver. Other types get NOERROR/NODATA.
-        let sink: &[&str] = match query.qtype {
-            dns::TYPE_A => &["0.0.0.0"],
-            dns::TYPE_AAAA => &["::"],
-            _ => &[],
-        };
-        return dns::build_response(&query, sink, 30, false, 0);
+        return dns::build_blocked(&query);
     }
 
     let mut response = Vec::new();
@@ -61,6 +55,17 @@ pub async fn build_reply(resolver: &Resolver, data: &[u8], deadline_ms: u64) -> 
         // /resolve returns both families at once and warms the cache the relay
         // uses, restoring Happy Eyeballs without a second lookup per connection.
         let resolved = resolver.resolve(&query.name, deadline_ms).await;
+        // A tracker hidden behind a first-party alias (CNAME cloaking) is given
+        // away by the names the answer was reached through. Allow-listing the
+        // site itself lets it through.
+        let list = sh_adblock::global();
+        if !bootstrap
+            && !list.allows(&query.name)
+            && resolved.cnames.iter().any(|name| list.blocks(name))
+        {
+            sh_adblock::record_blocked(&query.name);
+            return dns::build_blocked(&query);
+        }
         let addresses = if query.qtype == dns::TYPE_A {
             &resolved.v4
         } else {
@@ -246,6 +251,38 @@ mod tests {
         message.extend((payload as u16).to_be_bytes());
         message.extend(std::iter::repeat_n(b'x', payload));
         ok(message)
+    }
+
+    #[tokio::test]
+    async fn a_tracker_behind_a_first_party_alias_is_sinkholed_unless_the_site_is_allowed() {
+        let worker = FakeWorker::new();
+        FakeWorker::set(&worker.resolve, |_| {
+            ok(
+                r#"{"host":"x","a":["203.0.113.5"],"aaaa":[],"ttl":300,"rcode":0,"cnames":["edge.cloak-test.example"]}"#,
+            )
+        });
+        let resolver = resolver(&worker);
+        sh_adblock::global().replace(sh_adblock::parse_domains("cloak-test.example\n"));
+        let cloaked = build_reply(
+            &resolver,
+            &dns_query("metrics.shop-test.example", dns::TYPE_A).build(),
+            0,
+        )
+        .await;
+        sh_adblock::global().set_allow(&["shop-test.example"]);
+        let allowed = build_reply(
+            &resolver,
+            &dns_query("metrics.shop-test.example", dns::TYPE_A).build(),
+            0,
+        )
+        .await;
+        sh_adblock::global().set_allow(&[] as &[&str]);
+        sh_adblock::global().replace(sh_adblock::DomainSet::new());
+
+        // 0.0.0.0, not the real address.
+        assert_eq!(read16(&cloaked, 6), 1);
+        assert_eq!(&cloaked[cloaked.len() - 4..], &[0, 0, 0, 0]);
+        assert_eq!(&allowed[allowed.len() - 4..], &[203, 0, 113, 5]);
     }
 
     #[tokio::test]

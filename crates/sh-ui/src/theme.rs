@@ -62,10 +62,8 @@ pub fn palette(ui: &Ui) -> Palette {
 
 /// Segoe Fluent Icons code points (Windows 11; empty when the font is absent).
 pub mod icon {
-    pub const STATUS: &str = "\u{E80F}"; // Home
     pub const SHIELD: &str = "\u{EA18}";
     pub const APPS: &str = "\u{E71D}";
-    pub const CHART: &str = "\u{E9D9}"; // Diagnostic
     pub const DOCUMENT: &str = "\u{E8A5}";
     pub const REFRESH: &str = "\u{E72C}";
     pub const REMOVE: &str = "\u{E711}"; // Cancel
@@ -380,55 +378,6 @@ pub fn nav_item(ui: &mut Ui, glyph: &str, label: &str, selected: bool) -> Respon
         );
     }
     response
-}
-
-/// One number on a card: small caption above a large figure.
-pub fn metric(ui: &mut Ui, caption: &str, value: impl ToString, color: Option<Color32>) {
-    let p = palette(ui);
-    card(ui, |ui| {
-        ui.label(RichText::new(caption).size(13.0).color(p.secondary));
-        ui.label(
-            RichText::new(value.to_string())
-                .font(semibold(30.0))
-                .color(color.unwrap_or(p.text)),
-        );
-    });
-}
-
-/// A row of equally wide metric cards.
-pub fn metrics(ui: &mut Ui, items: &[(&str, String, Option<Color32>)]) {
-    ui.columns(items.len(), |columns| {
-        for (column, (caption, value, color)) in columns.iter_mut().zip(items) {
-            metric(column, caption, value, *color);
-        }
-    });
-}
-
-/// A table row inside a card: cells at fixed fractions of the width.
-pub fn table_row(ui: &mut Ui, cells: &[(String, Option<Color32>)], widths: &[f32], header: bool) {
-    let p = palette(ui);
-    let total = ui.available_width();
-    ui.horizontal(|ui| {
-        for ((text, color), width) in cells.iter().zip(widths) {
-            let mut rich = RichText::new(text);
-            rich = if header {
-                rich.size(12.5).color(p.secondary)
-            } else {
-                rich.color(color.unwrap_or(p.text))
-            };
-            ui.allocate_ui_with_layout(
-                vec2(total * width - 10.0, 24.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.set_min_width(total * width - 10.0);
-                    ui.add(egui::Label::new(rich).truncate());
-                },
-            );
-        }
-    });
-    if header {
-        ui.separator();
-    }
 }
 
 /// A macOS-style list: one row per entry with a remove button and an add

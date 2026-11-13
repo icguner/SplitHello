@@ -1,5 +1,5 @@
-//! Engine composition (port of `src/main.cpp`): command line, the
-//! transparent (WinDivert) and manual-proxy engines and one-shot commands.
+//! Engine composition (port of `src/main.cpp`): command line, the WinDivert
+//! engine and one-shot commands.
 
 pub mod adblock_updater;
 pub mod engine;
@@ -39,20 +39,9 @@ pub fn run(options: options::Options) -> i32 {
 }
 
 fn list_strategies() {
-    println!("Parcalama profilleri (deneme sirasiyla):\n");
-    for profile in sh_strategy::PROFILES {
-        let note = if profile.requires_sni {
-            " (SNI gerektirir)"
-        } else {
-            ""
-        };
-        println!("  {:<22}{}{note}", profile.name, profile.description);
-    }
-    if let Some(dir) = config_dir() {
-        println!(
-            "\nCalisan profil ag + alan adi bazinda ogrenilir ve {} dosyasinda saklanir.",
-            dir.join(sh_core::paths::STRATEGY_FILE).display()
-        );
+    println!("Paket profilleri (--strategy <ad>; ilki varsayilan):\n");
+    for (name, _) in sh_proto::packet::PROFILES {
+        println!("  {name}");
     }
 }
 
@@ -119,10 +108,10 @@ fn forget_strategies() -> i32 {
         eprintln!("APPDATA yolu belirlenemedi");
         return 1;
     };
-    let store = sh_strategy::Store::new(dir.join(sh_core::paths::STRATEGY_FILE));
-    store.load();
-    let count = store.len();
-    store.clear();
-    println!("{count} alan adi icin ogrenilen strateji silindi.");
+    let learner = sh_strategy::Learner::new(dir.join(sh_core::paths::STRATEGY_FILE));
+    learner.load();
+    let count = learner.len();
+    learner.clear();
+    println!("{count} site icin ogrenilen profil silindi.");
     0
 }

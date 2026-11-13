@@ -1,18 +1,17 @@
 [package]
 name = "sh-strategy"
-description = "Bypass profiles, differential diagnosis and the learned-profile store"
+description = "Passive per-site learning for the packet engine"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+serde_json = "1"
 sh-core = { path = "../sh-core" }
+sh-flow = { path = "../sh-flow" }
 sh-proto = { path = "../sh-proto" }
 tracing = "0.1"
-
-[dev-dependencies]
-sh-proto = { path = "../sh-proto", features = ["testing"] }
 
 [lints]
 workspace = true

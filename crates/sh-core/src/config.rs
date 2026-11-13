@@ -24,6 +24,47 @@ pub enum DnsMode {
     System,
 }
 
+/// A public DoH resolver reached by IP literal, so no DNS lookup precedes it.
+pub struct DnsProvider {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub host: &'static str,
+    pub json_path: &'static str,
+}
+
+/// Encrypted-DNS providers: the chosen one is asked first, the rest in this order.
+pub const DNS_PROVIDERS: [DnsProvider; 4] = [
+    DnsProvider {
+        id: "cloudflare",
+        name: "Cloudflare",
+        host: "1.1.1.1",
+        json_path: "/dns-query",
+    },
+    DnsProvider {
+        id: "google",
+        name: "Google",
+        host: "8.8.8.8",
+        json_path: "/resolve",
+    },
+    DnsProvider {
+        id: "adguard",
+        name: "AdGuard",
+        host: "94.140.14.14",
+        json_path: "/resolve",
+    },
+    DnsProvider {
+        id: "dnssb",
+        name: "DNS.SB",
+        host: "185.222.222.222",
+        json_path: "/dns-query",
+    },
+];
+
+/// Index of a provider id in `DNS_PROVIDERS`; unknown ids map to the first.
+pub fn dns_provider_index(id: &str) -> usize {
+    DNS_PROVIDERS.iter().position(|p| p.id == id).unwrap_or(0)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// Legacy migration buffer only; never written back.
@@ -35,12 +76,8 @@ pub struct Config {
     /// Bearer secret the Worker requires (DPAPI-encrypted on disk).
     pub shared_secret: String,
     pub dns_mode: DnsMode,
-    /// Pause between fragmented records.
-    pub split_delay_ms: u32,
-    /// How long to wait for a ServerHello.
-    pub probe_timeout_ms: u32,
-    /// Use the Worker /tunnel relay as a last resort.
-    pub tunnel_fallback: bool,
+    /// Id from `DNS_PROVIDERS`; always a known one after load.
+    pub dns_provider: String,
     pub process_include: Vec<String>,
     pub process_exclude: Vec<String>,
     pub ad_block: bool,
@@ -72,9 +109,7 @@ impl Default for Config {
             worker_url: String::new(),
             shared_secret: String::new(),
             dns_mode: DnsMode::Worker,
-            split_delay_ms: 20,
-            probe_timeout_ms: 3000,
-            tunnel_fallback: false,
+            dns_provider: DNS_PROVIDERS[0].id.into(),
             process_include: Vec::new(),
             process_exclude: Vec::new(),
             ad_block: true,
@@ -109,13 +144,6 @@ fn get_string_array(json: &Map<String, Value>, key: &str) -> Vec<String> {
         .iter()
         .map_while(|item| item.as_str().map(str::to_owned))
         .collect()
-}
-
-fn read_unsigned(json: &Map<String, Value>, key: &str, fallback: u32, low: u32, high: u32) -> u32 {
-    match json.get(key).and_then(Value::as_i64) {
-        Some(value) if value >= i64::from(low) && value <= i64::from(high) => value as u32,
-        _ => fallback,
-    }
 }
 
 fn read_process_rules(json: &Map<String, Value>, key: &str) -> Vec<String> {
@@ -214,11 +242,10 @@ impl Config {
         } else {
             DnsMode::Worker
         };
+        self.dns_provider = DNS_PROVIDERS[dns_provider_index(&get_string(&json, "dns_provider"))]
+            .id
+            .into();
 
-        self.split_delay_ms = read_unsigned(&json, "split_delay_ms", self.split_delay_ms, 0, 2000);
-        self.probe_timeout_ms =
-            read_unsigned(&json, "probe_timeout_ms", self.probe_timeout_ms, 250, 30000);
-        self.tunnel_fallback = get_bool(&json, "tunnel_fallback");
         self.process_include = read_process_rules(&json, "process_include");
         self.process_exclude = read_process_rules(&json, "process_exclude");
         // On unless the file says otherwise, so configs from older releases get it.
@@ -265,17 +292,15 @@ impl Config {
         };
         let content = format!(
             "{{\n  \"shared_secret_dpapi\": {},\n  \"account_id\": {},\n  \"worker_name\": {},\n  \
-             \"worker_url\": {},\n  \"dns_mode\": \"{dns_mode}\",\n  \"split_delay_ms\": {},\n  \
-             \"probe_timeout_ms\": {},\n  \"tunnel_fallback\": {},\n  \"process_include\": {},\n  \
+             \"worker_url\": {},\n  \"dns_mode\": \"{dns_mode}\",\n  \"dns_provider\": {},\n  \
+             \"process_include\": {},\n  \
              \"process_exclude\": {},\n  \"ad_block\": {},\n  \"ad_block_allow\": {},\n  \
              \"ad_block_lists\": {}\n}}\n",
             quote(&protected_secret),
             quote(&self.account_id),
             quote(&self.worker_name),
             quote(&self.worker_url),
-            self.split_delay_ms,
-            self.probe_timeout_ms,
-            self.tunnel_fallback,
+            quote(&self.dns_provider),
             string_array(&self.process_include),
             string_array(&self.process_exclude),
             self.ad_block,
@@ -286,10 +311,6 @@ impl Config {
         fsutil::write_atomic(&path, content.as_bytes())?;
         tracing::info!("Config kaydedildi: {}", path.display());
         Ok(())
-    }
-
-    pub fn is_valid(&self) -> bool {
-        self.dns_mode == DnsMode::System || !self.worker_url.is_empty()
     }
 }
 
@@ -333,7 +354,7 @@ mod tests {
         assert_eq!(config.shared_secret_blob, foreign);
 
         // An unrelated change (e.g. the panel saving rules) keeps the blob.
-        config.split_delay_ms = 40;
+        config.ad_block = false;
         config.save_to(&dir).unwrap();
         assert!(
             fs::read_to_string(Config::path_in(&dir))
@@ -436,9 +457,8 @@ mod tests {
         assert_eq!(config.account_id, "acc");
         assert_eq!(config.worker_name, DEFAULT_WORKER_NAME);
         assert_eq!(config.dns_mode, DnsMode::System);
-        assert_eq!(config.split_delay_ms, 20); // out of range falls back
-        assert_eq!(config.probe_timeout_ms, 900);
-        assert!(config.tunnel_fallback);
+        assert_eq!(config.dns_provider, "cloudflare"); // missing: the first provider
+        // Keys of the relay builds (split delay, probe timeout, tunnel) are ignored.
         assert!(config.ad_block); // absent means on
         assert_eq!(config.ad_block_allow, ["a.com"]); // stops at a non-string
         assert_eq!(config.ad_block_lists, ["pro"]);
@@ -447,6 +467,11 @@ mod tests {
         let off = load(&dir);
         assert!(!off.ad_block);
         assert!(off.ad_block_lists.is_empty());
+
+        write(&dir, r#"{"dns_provider": "adguard"}"#);
+        assert_eq!(load(&dir).dns_provider, "adguard");
+        write(&dir, r#"{"dns_provider": "quad9"}"#);
+        assert_eq!(load(&dir).dns_provider, "cloudflare");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -455,6 +480,7 @@ mod tests {
         let dir = scratch("order");
         let config = Config {
             process_include: vec!["chrome.exe".into()],
+            dns_provider: "dnssb".into(),
             ..Config::default()
         };
         config.save_to(&dir).unwrap();
@@ -465,9 +491,7 @@ mod tests {
             "worker_name",
             "worker_url",
             "dns_mode",
-            "split_delay_ms",
-            "probe_timeout_ms",
-            "tunnel_fallback",
+            "dns_provider",
             "process_include",
             "process_exclude",
             "ad_block\"",
@@ -479,13 +503,7 @@ mod tests {
         .collect();
         assert!(keys.windows(2).all(|w| w[0] < w[1]));
         assert!(saved.contains("\"process_include\": [\"chrome.exe\"]"));
-        assert_eq!(
-            load(&dir),
-            Config {
-                process_include: vec!["chrome.exe".into()],
-                ..Config::default()
-            }
-        );
+        assert_eq!(load(&dir), config);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

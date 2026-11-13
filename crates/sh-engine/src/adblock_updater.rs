@@ -22,8 +22,7 @@ const RETRY_MIN: Duration = Duration::from_secs(10 * 60);
 const RETRY_MAX: Duration = Duration::from_secs(60 * 60);
 const TICK: Duration = Duration::from_secs(5);
 const RECENT_PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
-/// A real list has thousands of entries; fewer means an error page or a
-/// truncated body, which must not replace a good list.
+/// Floor for a list that does not declare its size.
 const MIN_PLAUSIBLE_ENTRIES: usize = 1000;
 const MAX_LIST_BYTES: usize = 32 * 1024 * 1024;
 const LIST_HOST: &str = "raw.githubusercontent.com";
@@ -41,7 +40,7 @@ pub struct Route {
     pub http: Arc<HttpClient>,
     /// Resolves the list host (Worker DNS when available).
     pub resolver: Option<Arc<Resolver>>,
-    /// Private connect port; 0 dials 443 directly (manual mode).
+    /// Port dialed at addresses resolved here; 0 leaves resolving to the HTTP client.
     pub connect_port: u16,
 }
 
@@ -93,9 +92,10 @@ async fn download(route: &Route, source: &Source) -> bool {
         );
         return false;
     }
+    let text = String::from_utf8_lossy(&response.body);
     let mut entries = 0;
-    for_each_domain(&String::from_utf8_lossy(&response.body), |_| entries += 1);
-    if entries < MIN_PLAUSIBLE_ENTRIES {
+    for_each_domain(&text, |_| entries += 1);
+    if !plausible(&text, entries) {
         tracing::warn!(
             "Reklam listesi '{}' reddedildi: cok az gecerli girdi",
             source.name
@@ -112,6 +112,26 @@ async fn download(route: &Route, source: &Source) -> bool {
     true
 }
 
+/// An error page or a truncated body must not replace a good list. HaGeZi
+/// lists declare their entry count, so a complete one is recognised whatever
+/// its size (the Windows/Office tracker list has a few hundred names); a list
+/// without that line has to clear a size floor instead.
+fn plausible(text: &str, entries: usize) -> bool {
+    let declared = text
+        .lines()
+        .take_while(|line| line.starts_with('#'))
+        .find_map(|line| {
+            line.strip_prefix("# Number of entries:")?
+                .trim()
+                .parse()
+                .ok()
+        });
+    match declared {
+        Some(declared) => entries != 0 && entries * 10 >= usize::saturating_mul(declared, 9),
+        None => entries >= MIN_PLAUSIBLE_ENTRIES,
+    }
+}
+
 /// One list file at a time is in memory as text; names go straight into the
 /// compact hash set, so peak memory is the largest file plus the set.
 fn rebuild(sources: &[Source]) {
@@ -120,9 +140,10 @@ fn rebuild(sources: &[Source]) {
         let Some(bytes) = sh_core::fsutil::read_all(&source.cache_file) else {
             continue;
         };
+        let text = String::from_utf8_lossy(&bytes);
         let mut parsed = CompactSet::default();
-        for_each_domain(&String::from_utf8_lossy(&bytes), |name| parsed.push(name));
-        if parsed.len() < MIN_PLAUSIBLE_ENTRIES {
+        for_each_domain(&text, |name| parsed.push(name));
+        if !plausible(&text, parsed.len()) {
             continue;
         }
         tracing::info!(
@@ -232,5 +253,39 @@ pub async fn run(
             () = tokio::time::sleep(TICK) => {}
             _ = shutdown.changed() => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list(declared: Option<usize>, names: usize) -> (String, usize) {
+        let mut text = String::from("# Title: test\n");
+        if let Some(declared) = declared {
+            text.push_str(&format!("# Number of entries: {declared}\n#\n"));
+        }
+        for i in 0..names {
+            text.push_str(&format!("host{i}.example\n"));
+        }
+        let mut entries = 0;
+        for_each_domain(&text, |_| entries += 1);
+        (text, entries)
+    }
+
+    #[test]
+    fn a_small_complete_list_is_kept_and_a_truncated_one_is_not() {
+        let (text, entries) = list(Some(365), 365);
+        assert!(plausible(&text, entries));
+        let (text, entries) = list(Some(224_729), 5_000);
+        assert!(!plausible(&text, entries));
+        let (text, entries) = list(Some(365), 0);
+        assert!(!plausible(&text, entries));
+        // No declared size (not a HaGeZi file, or an error page): the floor.
+        let (text, entries) = list(None, 365);
+        assert!(!plausible(&text, entries));
+        let (text, entries) = list(None, MIN_PLAUSIBLE_ENTRIES);
+        assert!(plausible(&text, entries));
+        assert!(!plausible("<html>Not Found</html>", 0));
     }
 }

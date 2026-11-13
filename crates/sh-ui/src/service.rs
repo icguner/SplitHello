@@ -18,14 +18,7 @@ use windows::core::w;
 /// Default service DACL plus start/stop/status/user-control for interactive users.
 const SERVICE_SDDL: &str = "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)\
                             (A;;CCLCSWLOCRRC;;;AU)(A;;CCLCSWRPWPLOCRRC;;;IU)";
-const STATE_FILES: [&str; 6] = [
-    "config.json",
-    "strategies.json",
-    "telemetry.db",
-    "telemetry.db-wal",
-    "telemetry.db-shm",
-    "adblock-allow.txt",
-];
+const STATE_FILES: [&str; 3] = ["config.json", "strategies.json", "adblock-allow.txt"];
 
 fn system_tool(name: &str) -> std::path::PathBuf {
     std::env::var_os("SystemRoot")

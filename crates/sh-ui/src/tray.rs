@@ -45,8 +45,7 @@ const COMMAND_STARTUP: u32 = 1003;
 const COMMAND_OPEN_LOGS: u32 = 1004;
 const COMMAND_EXIT: u32 = 1005;
 const COMMAND_PANEL: u32 = 1006;
-const COMMAND_DNS_WORKER: u32 = 1007;
-const COMMAND_DNS_SYSTEM: u32 = 1008;
+const COMMAND_ENCRYPTED_DNS: u32 = 1007;
 const COMMAND_SETUP: u32 = 1009;
 const COMMAND_ALLOW_BASE: u32 = 2000; // + index into the "recently blocked" submenu
 const RECENT_BLOCKED_CHOICES: usize = 10;
@@ -83,16 +82,12 @@ fn state_text(state: EngineState) -> &'static str {
 /// Turkish reason for an engine exit code, None when it says nothing extra.
 pub fn failure_reason(code: u32) -> Option<&'static str> {
     Some(match code {
-        10 => "Relay portu başka bir uygulama tarafından kullanılıyor.",
         11 => "DNS relay portu başka bir uygulama tarafından kullanılıyor.",
         12 => {
             "WinDivert açılamadı. WinDivert.dll ve WinDivert64.sys exe ile aynı klasörde olmalı; \
              antivirüs sürücüyü engelliyor olabilir."
         }
         13 => "Süreç filtresindeki include kuralları geçersiz. Panelden düzeltin veya boşaltın.",
-        14 => {
-            "Worker kurulumu yok. splithello.exe --setup çalıştırın veya DNS modunu Sistem yapın."
-        }
         15 => "Tray kontrol kanalı açılamadı.",
         16 => "Yapılandırma dosyası okunamadı.",
         ENGINE_KILLED_EXIT_CODE => "Ağ motoru 10 saniye içinde yanıt vermedi ve sonlandırıldı.",
@@ -103,7 +98,7 @@ pub fn failure_reason(code: u32) -> Option<&'static str> {
 
 /// Restarting cannot fix a missing driver or a bad configuration.
 pub fn needs_user_action(code: u32) -> bool {
-    matches!(code, 12 | 13 | 14 | 16 | DLL_NOT_FOUND)
+    matches!(code, 12 | 13 | 16 | DLL_NOT_FOUND)
 }
 
 fn wide<const N: usize>(text: &str) -> [u16; N] {
@@ -174,9 +169,7 @@ struct Tray {
     icon: NOTIFYICONDATAW,
     taskbar_created: u32,
     engine_arguments: Vec<String>,
-    live_stats_name: String,
     recent_blocked: Vec<String>,
-    can_start: bool,
     startup_enabled: bool,
     startup_busy: Arc<AtomicBool>,
     exiting: bool,
@@ -187,7 +180,7 @@ struct Tray {
     budget: RestartBudget,
     state: EngineState,
     engine: Option<Engine>,
-    setup: Option<(Child, bool)>,
+    setup: Option<Child>,
     panel: Option<Child>,
     /// Set when the engine is the SplitHello Windows service: the tray then
     /// runs unelevated and starts/stops it through the SCM.
@@ -208,8 +201,8 @@ fn post(window: HWND, message: u32, wparam: usize, lparam: isize) {
 }
 
 /// Runs the tray until exit. `engine_arguments`: the user's arguments minus
-/// the internal ones; `can_start`: setup exists (or the engine should report why not).
-pub fn run(engine_arguments: Vec<String>, can_start: bool) -> i32 {
+/// the internal ones.
+pub fn run(engine_arguments: Vec<String>) -> i32 {
     // SAFETY: named mutex held for the tray's lifetime (released at exit).
     let mutex = unsafe { CreateMutexW(None, true, w!("Local\\SplitHello-Tray")) };
     let Ok(mutex) = mutex else {
@@ -221,13 +214,13 @@ pub fn run(engine_arguments: Vec<String>, can_start: bool) -> i32 {
         let _ = unsafe { CloseHandle(mutex) };
         return 0;
     }
-    let code = run_window(engine_arguments, can_start);
+    let code = run_window(engine_arguments);
     // SAFETY: owned handle.
     let _ = unsafe { CloseHandle(mutex) };
     code
 }
 
-fn run_window(engine_arguments: Vec<String>, can_start: bool) -> i32 {
+fn run_window(engine_arguments: Vec<String>) -> i32 {
     // SAFETY: standard window-class registration and window creation.
     let window = unsafe {
         let instance = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok();
@@ -265,20 +258,13 @@ fn run_window(engine_arguments: Vec<String>, can_start: bool) -> i32 {
         }
     };
 
-    let service = crate::service::Control::open();
     let mut tray = Tray {
         window,
         icon: NOTIFYICONDATAW::default(),
         // SAFETY: registers (or looks up) a system-wide message id.
         taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
         engine_arguments,
-        live_stats_name: if service.is_some() {
-            sh_core::live_stats::SERVICE_MAPPING.into()
-        } else {
-            unique_name("live-stats")
-        },
         recent_blocked: Vec::new(),
-        can_start,
         startup_enabled: false,
         startup_busy: Arc::new(AtomicBool::new(false)),
         exiting: false,
@@ -291,7 +277,7 @@ fn run_window(engine_arguments: Vec<String>, can_start: bool) -> i32 {
         engine: None,
         setup: None,
         panel: None,
-        service,
+        service: crate::service::Control::open(),
     };
     if !tray.add_icon() {
         // SAFETY: our window.
@@ -301,16 +287,7 @@ fn run_window(engine_arguments: Vec<String>, can_start: bool) -> i32 {
     tray.refresh_startup_async();
     // SAFETY: timer on our window.
     unsafe { SetTimer(Some(window), POLL_TIMER, 250, None) };
-    if tray.can_start {
-        tray.start_engine(false);
-    } else {
-        tray.balloon(
-            "SplitHello kurulumu gerekli",
-            "Cloudflare kurulumu açılıyor; tarayıcıda izin verin.",
-            NIIF_WARNING,
-        );
-        tray.launch_setup(true);
-    }
+    tray.start_engine(false);
     TRAY.with(|cell| *cell.borrow_mut() = Some(tray));
 
     let mut message = MSG::default();
@@ -498,9 +475,8 @@ impl Tray {
                 self.request_stop();
             }
             COMMAND_STARTUP => self.toggle_startup(),
-            COMMAND_DNS_WORKER => self.set_dns_mode(DnsMode::Worker),
-            COMMAND_DNS_SYSTEM => self.set_dns_mode(DnsMode::System),
-            COMMAND_SETUP => self.launch_setup(true),
+            COMMAND_ENCRYPTED_DNS => self.toggle_encrypted_dns(),
+            COMMAND_SETUP => self.launch_setup(),
             COMMAND_OPEN_LOGS => {
                 if let Some(dir) = config_dir() {
                     // SAFETY: opens a folder in Explorer.
@@ -564,31 +540,20 @@ impl Tray {
             separator(menu);
             append(menu, MF_STRING, COMMAND_PANEL as usize, "Paneli aç");
             separator(menu);
-            append(
-                menu,
-                flag(stopped && self.can_start),
-                COMMAND_START as usize,
-                "Başlat",
-            );
+            append(menu, flag(stopped), COMMAND_START as usize, "Başlat");
             append(menu, flag(!stopped), COMMAND_STOP as usize, "Durdur");
             separator(menu);
             append(
                 menu,
                 checked(config.dns_mode == DnsMode::Worker),
-                COMMAND_DNS_WORKER as usize,
-                "DNS: Worker",
-            );
-            append(
-                menu,
-                checked(config.dns_mode == DnsMode::System),
-                COMMAND_DNS_SYSTEM as usize,
-                "DNS: Sistem (Worker'sız)",
+                COMMAND_ENCRYPTED_DNS as usize,
+                "Şifreli DNS",
             );
             append(
                 menu,
                 flag(self.setup.is_none()),
                 COMMAND_SETUP as usize,
-                "Cloudflare Worker kurulumunu çalıştır",
+                "Yedek Worker kur (isteğe bağlı)",
             );
             separator(menu);
 
@@ -690,7 +655,7 @@ impl Tray {
     }
 
     fn start_engine(&mut self, automatic: bool) {
-        if !self.can_start || self.engine.is_some() {
+        if self.engine.is_some() {
             return;
         }
         self.restart_pending = false;
@@ -743,7 +708,6 @@ impl Tray {
                 &ready_name,
             ])
             .args(["--parent-pid", &std::process::id().to_string()])
-            .args(["--live-stats", &self.live_stats_name])
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -820,7 +784,7 @@ impl Tray {
         }
     }
 
-    fn launch_setup(&mut self, want_worker_mode: bool) {
+    fn launch_setup(&mut self) {
         if self.setup.is_some() {
             self.balloon("SplitHello", "Kurulum zaten çalışıyor.", NIIF_INFO);
             return;
@@ -839,7 +803,7 @@ impl Tray {
             .creation_flags(CREATE_NEW_CONSOLE)
             .spawn()
         {
-            Ok(child) => self.setup = Some((child, want_worker_mode)),
+            Ok(child) => self.setup = Some(child),
             Err(error) => {
                 tracing::error!("Kurulum baslatilamadi: {error}");
                 self.balloon(
@@ -852,18 +816,17 @@ impl Tray {
     }
 
     fn poll_setup(&mut self) {
-        let Some((child, want_worker)) = &mut self.setup else {
+        let Some(child) = &mut self.setup else {
             return;
         };
         let Ok(Some(status)) = child.try_wait() else {
             return;
         };
-        let want_worker = *want_worker;
         self.setup = None;
         if self.exiting {
             return;
         }
-        let mut config = load_config();
+        let config = load_config();
         if !status.success() || config.load_failed || config.worker_url.is_empty() {
             self.balloon(
                 "Kurulum tamamlanamadı",
@@ -872,22 +835,7 @@ impl Tray {
             );
             return;
         }
-        if want_worker && config.dns_mode != DnsMode::Worker {
-            config.dns_mode = DnsMode::Worker;
-            if config_dir().is_none_or(|dir| config.save_to(&dir).is_err()) {
-                self.balloon(
-                    "DNS modu değişmedi",
-                    "Yapılandırma kaydedilemedi.",
-                    NIIF_ERROR,
-                );
-                return;
-            }
-        }
-        self.can_start = config.is_valid();
         self.balloon("SplitHello", "Worker kurulumu tamamlandı.", NIIF_INFO);
-        if !self.can_start {
-            return;
-        }
         if self.engine.is_none() && matches!(self.state, EngineState::Stopped | EngineState::Failed)
         {
             self.start_engine(false);
@@ -1005,15 +953,6 @@ impl Tray {
                 self.set_state(EngineState::Stopped);
                 self.balloon("SplitHello", "Koruma durduruldu.", NIIF_INFO);
             }
-        } else if code == recovery::WORKER_UNAVAILABLE_EXIT_CODE as u32 {
-            self.restart_pending = false;
-            self.restart_at_ms = 0;
-            self.set_state(EngineState::Failed);
-            self.balloon(
-                "SplitHello koruması durdu",
-                "Worker erişilemedi. Normal internet yolu açık; yeniden denemek için Başlat seçin.",
-                NIIF_WARNING,
-            );
         } else if needs_user_action(code) {
             self.restart_pending = false;
             self.restart_at_ms = 0;
@@ -1151,7 +1090,7 @@ impl Tray {
             return;
         };
         match Command::new(executable)
-            .args(["--panel", "--live-stats", &self.live_stats_name])
+            .arg("--panel")
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1167,7 +1106,7 @@ impl Tray {
     }
 
     fn restart_engine_for_configuration(&mut self) {
-        if self.exiting || !self.can_start {
+        if self.exiting {
             return;
         }
         match self.state {
@@ -1198,7 +1137,7 @@ impl Tray {
         }
     }
 
-    fn set_dns_mode(&mut self, mode: DnsMode) {
+    fn toggle_encrypted_dns(&mut self) {
         let mut config = load_config();
         if config.load_failed {
             // Saving would replace the unreadable file with defaults.
@@ -1209,19 +1148,9 @@ impl Tray {
             );
             return;
         }
-        if config.dns_mode == mode {
-            return;
-        }
-        if mode == DnsMode::Worker && config.worker_url.is_empty() {
-            self.balloon(
-                "Worker kurulumu gerekli",
-                "Cloudflare kurulumu açılıyor; tarayıcıda izin verin.",
-                NIIF_WARNING,
-            );
-            self.launch_setup(true);
-            return;
-        }
-        config.dns_mode = mode;
+        // DnsMode::Worker means "encrypted DNS on"; the Worker is only a fallback now.
+        let on = config.dns_mode != DnsMode::Worker;
+        config.dns_mode = if on { DnsMode::Worker } else { DnsMode::System };
         if config_dir().is_none_or(|dir| config.save_to(&dir).is_err()) {
             self.balloon(
                 "DNS modu değişmedi",
@@ -1230,15 +1159,7 @@ impl Tray {
             );
             return;
         }
-        self.can_start = config.is_valid();
-        tracing::info!(
-            "DNS modu secildi: {}",
-            if mode == DnsMode::Worker {
-                "Worker"
-            } else {
-                "sistem"
-            }
-        );
+        tracing::info!("Sifreli DNS {}", if on { "acildi" } else { "kapatildi" });
         self.restart_engine_for_configuration();
     }
 }
@@ -1293,11 +1214,11 @@ mod tests {
 
     #[test]
     fn exit_codes_map_like_the_cpp_tray() {
-        for code in [12, 13, 14, 16, DLL_NOT_FOUND] {
+        for code in [12, 13, 16, DLL_NOT_FOUND] {
             assert!(needs_user_action(code), "{code}");
             assert!(failure_reason(code).is_some());
         }
-        for code in [0, 1, 2, 3, 10, 11, 15, ENGINE_KILLED_EXIT_CODE] {
+        for code in [0, 1, 2, 3, 11, 14, 15, ENGINE_KILLED_EXIT_CODE] {
             assert!(!needs_user_action(code), "{code}");
         }
         assert!(failure_reason(2).is_none());

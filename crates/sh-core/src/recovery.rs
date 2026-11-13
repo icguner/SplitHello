@@ -6,13 +6,12 @@ use std::sync::Mutex;
 pub const MAX_WINDIVERT_READ_RETRIES: u32 = 3;
 pub const RESTART_WINDOW_MS: u64 = 10 * 60 * 1000;
 pub const MAX_AUTOMATIC_RESTARTS: u32 = 3;
-pub const WORKER_UNAVAILABLE_EXIT_CODE: i32 = 3;
 
 /// A transport error, 401/403 or 5xx is a failure; HTTP 429 is not (the Worker
 /// is alive and asks us to slow down). The Worker only latches as unavailable
 /// after this many failures with no success in between, each within
 /// `WORKER_FAILURE_GAP_MS` of the previous, spread over `WORKER_MIN_STREAK_MS`:
-/// a burst of timeouts during a short blip must not shut the engine down.
+/// a burst of timeouts during a short blip must not hand DNS back to the system.
 pub const WORKER_FAILURE_THRESHOLD: u32 = 5;
 pub const WORKER_FAILURE_GAP_MS: u64 = 60_000;
 pub const WORKER_MIN_STREAK_MS: u64 = 15_000;
@@ -74,7 +73,7 @@ struct HealthState {
 }
 
 /// Latches after a sustained run of Worker failures; a successful response
-/// clears the streak, so an old failure cannot poison a healthy run.
+/// clears the streak and the latch, so an outage ends when the Worker answers.
 #[derive(Default)]
 pub struct WorkerHealth {
     state: Mutex<HealthState>,
@@ -91,9 +90,6 @@ impl WorkerHealth {
     /// Retry-After of a 429 (0 = absent). Returns whether the Worker is latched.
     pub fn observe(&self, http_status: i32, now_ms: u64, retry_after_seconds: u32) -> bool {
         let mut s = self.lock();
-        if s.unavailable {
-            return true;
-        }
         if http_status == 429 {
             // Alive but rate limiting us: neither a failure nor proof of recovery.
             let requested = if retry_after_seconds != 0 {
@@ -104,13 +100,17 @@ impl WorkerHealth {
             s.backoff_until_ms = s
                 .backoff_until_ms
                 .max(now_ms + requested.min(RATE_LIMIT_MAX_BACKOFF_MS));
-            return false;
+            return s.unavailable;
         }
         let failed =
             http_status < 0 || http_status == 401 || http_status == 403 || http_status >= 500;
         if !failed {
             s.failures = 0;
+            s.unavailable = false;
             return false;
+        }
+        if s.unavailable {
+            return true;
         }
         if s.failures == 0 || now_ms - s.last_failure_ms > WORKER_FAILURE_GAP_MS {
             s.failures = 0;
@@ -215,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_health_trips_on_sustained_failures_and_stays_open() {
+    fn worker_health_trips_on_sustained_failures_until_an_answer() {
         let health = WorkerHealth::default();
         // A burst of failures inside a short blip is not enough...
         for (status, at) in [
@@ -232,7 +232,11 @@ mod tests {
         // ...it has to persist for WORKER_MIN_STREAK_MS without a success.
         assert!(health.observe(-1, 1000 + WORKER_MIN_STREAK_MS, 0));
         assert!(health.unavailable());
-        assert!(health.observe(200, 40_000, 0));
+        // Further failures and a 429 keep it latched; an answer releases it.
+        assert!(health.observe(-1, 30_000, 0));
+        assert!(health.observe(429, 31_000, 0));
+        assert!(!health.observe(200, 40_000, 0));
+        assert!(!health.unavailable());
     }
 
     #[test]

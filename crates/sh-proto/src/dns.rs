@@ -333,6 +333,18 @@ pub fn build_response<S: AsRef<str>>(
     out
 }
 
+/// The answer for a name on a protection list. A sinkhole address makes
+/// connect() fail at once; NXDOMAIN would send some apps to another resolver.
+/// Other types get NOERROR/NODATA.
+pub fn build_blocked(query: &Query) -> Vec<u8> {
+    let sink: &[&str] = match query.qtype {
+        TYPE_A => &["0.0.0.0"],
+        TYPE_AAAA => &["::"],
+        _ => &[],
+    };
+    build_response(query, sink, 30, false, 0)
+}
+
 /// Header-only error reply for a query that failed to parse.
 pub fn build_error(query: &Query, rcode: u8) -> Vec<u8> {
     let mut flags: u16 = 0x8080 | (u16::from(query.opcode & 0x0F) << 11);

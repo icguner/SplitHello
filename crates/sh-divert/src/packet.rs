@@ -270,6 +270,35 @@ pub fn build_variant(
     Some(out)
 }
 
+/// Two resets that end the TCP connection the outbound segment `packet`
+/// belongs to, instead of forwarding it: one for the server in the client's
+/// name, one for the client in the server's name (returned in that order).
+pub fn build_resets(packet: &[u8], p: &Parsed) -> Option<(Vec<u8>, Vec<u8>)> {
+    if p.transport != Some(Transport::Tcp) {
+        return None;
+    }
+    let tcp = p.transport_offset;
+    let payload_len = (packet.len() - p.payload_offset) as u32;
+    let sequence = tcp_sequence(packet, p);
+    let acknowledged = packet[tcp + 8..tcp + 12].to_vec();
+    let (client_port, server_port) = (source_port(packet, p), destination_port(packet, p));
+
+    let mut to_server = build_variant(packet, p, &[], 0, 0, false)?;
+    to_server[tcp + 13] = TCP_RST | TCP_ACK;
+    fix_checksums(&mut to_server, p);
+
+    // The mirror image: it continues the server's sequence (what the client
+    // acknowledged) and acknowledges the segment that was held back.
+    let mut to_client = to_server.clone();
+    swap_addresses(&mut to_client, p);
+    set_source_port(&mut to_client, p, server_port);
+    set_destination_port(&mut to_client, p, client_port);
+    to_client[tcp + 4..tcp + 8].copy_from_slice(&acknowledged);
+    to_client[tcp + 8..tcp + 12].copy_from_slice(&sequence.wrapping_add(payload_len).to_be_bytes());
+    fix_checksums(&mut to_client, p);
+    Some((to_server, to_client))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

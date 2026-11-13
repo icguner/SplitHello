@@ -8,8 +8,6 @@ pub mod startup;
 mod theme;
 pub mod tray;
 
-use sh_engine::options::Options;
-
 /// Arguments the tray passes on to its engine: the user's, minus the
 /// internal ones the tray adds itself.
 fn engine_arguments(args: &[String]) -> Vec<String> {
@@ -17,7 +15,7 @@ fn engine_arguments(args: &[String]) -> Vec<String> {
     let mut iter = args.iter();
     while let Some(argument) = iter.next() {
         match argument.as_str() {
-            "--shutdown-event" | "--ready-event" | "--parent-pid" | "--live-stats" => {
+            "--shutdown-event" | "--ready-event" | "--parent-pid" => {
                 iter.next();
             }
             "--engine" => {}
@@ -36,7 +34,7 @@ pub fn detach_console() {
 
 /// Tray launch (port of the tray branch of `main`): elevate once, refuse a
 /// second instance, then supervise the engine.
-pub fn run_tray(options: &Options, args: &[String]) -> i32 {
+pub fn run_tray(args: &[String]) -> i32 {
     detach_console();
     sh_core::logging::init(false, None);
     // With the service installed the engine already has its rights: the
@@ -63,14 +61,7 @@ pub fn run_tray(options: &Options, args: &[String]) -> i32 {
             1
         });
     }
-    let mut config = sh_core::config::Config::default();
-    if let Some(dir) = sh_core::paths::config_dir() {
-        config.load_from(&dir);
-    }
-    // An unreadable config is not "setup missing": let the engine start and
-    // report the precise reason (exit 16) instead of asking for setup.
-    let configured = !options.worker_url.is_empty() || config.is_valid() || config.load_failed;
-    tray::run(engine_arguments(args), configured)
+    tray::run(engine_arguments(args))
 }
 
 #[cfg(test)]
@@ -80,10 +71,10 @@ mod tests {
     #[test]
     fn engine_arguments_drop_internal_flags() {
         let args: Vec<String> = [
-            "--port",
-            "1081",
+            "--quic-mode",
+            "block",
             "--engine",
-            "--live-stats",
+            "--ready-event",
             "x",
             "--parent-pid",
             "4",
@@ -91,6 +82,6 @@ mod tests {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
-        assert_eq!(engine_arguments(&args), ["--port", "1081"]);
+        assert_eq!(engine_arguments(&args), ["--quic-mode", "block"]);
     }
 }

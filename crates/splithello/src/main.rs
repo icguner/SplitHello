@@ -12,13 +12,32 @@ fn main() {
     let code = match options.action {
         Action::Panel => {
             sh_ui::detach_console();
-            sh_ui::panel::run(&options.live_stats)
+            sh_ui::panel::run()
         }
         Action::EnableStartup => sh_ui::startup::enable_from_command_line(),
         Action::InstallService => sh_ui::service::install(),
         Action::UninstallService => sh_ui::service::uninstall(),
-        Action::Run if options.tray_mode() => sh_ui::run_tray(&options, &args),
-        _ => sh_engine::run(options),
+        Action::Run if options.tray_mode() => sh_ui::run_tray(&args),
+        _ => {
+            let reconfigured = matches!(options.action, Action::SetupOnly | Action::Redeploy);
+            let code = sh_engine::run(options);
+            if code == 0 && reconfigured {
+                reload_running_engine();
+            }
+            code
+        }
     };
     std::process::exit(code);
+}
+
+/// Setup and redeploy rotate the Worker secret: an engine still holding the
+/// old one would be refused until it gave up. The tray restarts the engine it
+/// supervises; without a tray the service is asked directly. A launcher that
+/// reloads again afterwards (tray, panel) only costs one more quick restart.
+fn reload_running_engine() {
+    if !sh_ui::tray::notify_tray_restart()
+        && let Some(service) = sh_ui::service::Control::open()
+    {
+        service.reload();
+    }
 }
