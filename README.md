@@ -8,7 +8,6 @@
 # SplitHello
 
 Türkiye'deki erişim engellerini kendiliğinden aşan, reklam ve izleyicileri engelleyen Windows uygulaması.
-VPN değildir; trafiğin başka bir sunucudan geçmez.
 
 **[SplitHello'yu indir (Windows 10/11)](https://github.com/icguner/SplitHello/releases/latest/download/SplitHello-Setup.exe)**
 
